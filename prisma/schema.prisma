@@ -1,0 +1,57 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  admin
+  operator
+  viewer
+}
+
+enum TransactionStatus {
+  pending             // <-- NOVO: Apenas intenção de compra
+  gateway_confirmed   // <-- ESTÁGIO 1: Dinheiro Real Confirmado pelo Webhook
+  holding_provider    // <-- ESTÁGIO 2
+  fx_in_transit       // <-- ESTÁGIO 3
+  inventory_wallet    // <-- ESTÁGIO 4
+  distributed         // <-- ESTÁGIO 5
+  failed
+}
+
+model User {
+  id                 String   @id @default(cuid())
+  username           String   @unique
+  password_hash      String
+  role               Role     @default(viewer)
+  preferred_provider String   @default("stripe")
+  apiKeys            ApiKey[]
+  created_at         DateTime @default(now())
+}
+
+model Transaction {
+  id              String            @id @default(cuid())
+  amount          Decimal           @db.Decimal(15, 2)
+  currency        String
+  status          TransactionStatus @default(pending) // <-- Começa sempre pendente
+  country_code    String
+  payment_method  String
+  provider_name   String
+  payee_id        String
+  created_at      DateTime          @default(now())
+  updated_at      DateTime          @updatedAt
+}
+
+model ApiKey {
+  id          String   @id @default(cuid())
+  name        String
+  key_hash    String   @unique
+  key_prefix  String
+  user        User     @relation(fields: [user_id], references: [id])
+  user_id     String
+  created_at  DateTime @default(now())
+}
