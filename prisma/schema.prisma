@@ -11,39 +11,44 @@ enum Role {
   admin
   operator
   viewer
+  merchant
 }
 
 enum TransactionStatus {
-  pending             // <-- NOVO: Apenas intenção de compra
-  gateway_confirmed   // <-- ESTÁGIO 1: Dinheiro Real Confirmado pelo Webhook
-  holding_provider    // <-- ESTÁGIO 2
-  fx_in_transit       // <-- ESTÁGIO 3
-  inventory_wallet    // <-- ESTÁGIO 4
-  distributed         // <-- ESTÁGIO 5
+  pending
+  gateway_confirmed
+  holding_provider
+  fx_in_transit
+  inventory_wallet
+  distributed
   failed
 }
 
 model User {
-  id                 String   @id @default(cuid())
-  username           String   @unique
+  id                 String        @id @default(cuid())
+  username           String        @unique
   password_hash      String
-  role               Role     @default(viewer)
-  preferred_provider String   @default("stripe")
+  role               Role          @default(viewer)
+  preferred_provider String        @default("stripe")
+  webhook_url        String?       
+  webhook_secret     String?       
+  transactions       Transaction[] 
   apiKeys            ApiKey[]
-  created_at         DateTime @default(now())
+  created_at         DateTime      @default(now())
 }
 
 model Transaction {
-  id              String            @id @default(cuid())
-  amount          Decimal           @db.Decimal(15, 2)
-  currency        String
-  status          TransactionStatus @default(pending) // <-- Começa sempre pendente
-  country_code    String
-  payment_method  String
-  provider_name   String
-  payee_id        String
-  created_at      DateTime          @default(now())
-  updated_at      DateTime          @updatedAt
+  id             String            @id @default(cuid())
+  amount         Decimal           @db.Decimal(15, 2)
+  currency       String
+  status         TransactionStatus @default(pending)
+  country_code   String
+  payment_method String
+  provider_name  String
+  payee          User              @relation(fields: [payee_id], references: [id])
+  payee_id       String
+  created_at     DateTime          @default(now())
+  updated_at     DateTime          @updatedAt
 }
 
 model ApiKey {
