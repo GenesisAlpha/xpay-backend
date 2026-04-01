@@ -1,25 +1,23 @@
-FROM node:20
+FROM node:20-slim
 
-# 1. Definir diretório de trabalho
+# Instalar dependências necessárias para o binário do Prisma
+RUN apt-get update && apt-get install -y openssl
+
 WORKDIR /app
 
-# 2. Copiar apenas os ficheiros de dependências
+# 1. Copiar os ficheiros de definição de pacotes
 COPY package*.json ./
 
-# 3. COPIAR A PASTA PRISMA ANTES DO INSTALL (Crucial para o postinstall)
+# 2. Copiar a pasta prisma ANTES do npm install (Crucial!)
 COPY prisma ./prisma/
 
-# 4. Instalar dependências (isto vai correr o prisma generate agora com sucesso)
+# 3. Instalar dependências (isto vai correr o 'prisma generate' automaticamente)
 RUN npm install
 
-# 5. Copiar o restante código fonte
+# 4. Copiar o resto do código e compilar o TypeScript
 COPY . .
-
-# 6. Compilar o TypeScript
 RUN npm run build
 
-# 7. Expor a porta da nossa API
 EXPOSE 8080
 
-# 8. Comando para iniciar o motor
-CMD ["npm", "start"]
+CMD ["node", "dist/server.js"]

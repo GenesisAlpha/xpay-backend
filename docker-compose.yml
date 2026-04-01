@@ -3,8 +3,8 @@ services:
   api-v2:
     build: .
     container_name: nexflowx-api-v2
+    restart: always
     ports:
       - "8080:8080"
     env_file:
       - .env
-    restart: unless-stopped
