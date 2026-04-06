@@ -1,26 +1,21 @@
 const { PrismaClient } = require('@prisma/client');
-const crypto = require('crypto');
 const prisma = new PrismaClient();
 
 async function provisionEnterpriseClient() {
   try {
-    console.log('🏗️  A iniciar provisionamento de conta Enterprise...');
-
-    // 1. Definição do Cliente Estratégico
     const client = await prisma.user.create({
       data: {
+        id: 'cmnfb4v4z000064rllglrtyi8',
         username: 'C.Euro2026',
-        password_hash: 'nx_sec_9kL2p_Xv92_Rz8w_Kq', // Hash de alta entropia
-        role: 'operator',
-        preferred_provider: 'stripe'
+        password_hash: 'Euro2026_SecurePwd!',
+        role: 'merchant',
+        preferred_provider: 'stripe',
+        webhook_secret: 'nx_sec_9kL2p_Xv92_Rz8w_Kq'
       }
     });
 
-    // 2. Geração da Chave de API de Produção
-    const rawKey = crypto.randomBytes(24).toString('hex');
-    const apiKey = `nx_live_${rawKey}`;
+    const apiKey = 'nx_live_3351f5fcf21a3ccf1decee1f2c62e1fc1e63392a1475d6ce';
 
-    // 3. Registo no Ledger de Identidade (ApiKey)
     await prisma.apiKey.create({
       data: {
         name: 'Euro2026 Production Key',
@@ -30,21 +25,11 @@ async function provisionEnterpriseClient() {
       }
     });
 
-    console.log('\n================================================');
-    console.log('   NEXFLOWX CORE - CLIENT PROVISIONING REPORT   ');
-    console.log('================================================');
-    console.log(`🏢 ENTIDADE:      ${client.username}`);
-    console.log(`🆔 LEDGER ID:     ${client.id}`);
-    console.log(`🔒 ACCESS HASH:   [PROTECTED]`);
-    console.log(`🔑 PRODUCTION KEY: ${apiKey}`);
-    console.log('================================================\n');
-    console.log('A infraestrutura está pronta para receber tráfego deste cliente.');
-
+    console.log('✅ Cliente restaurado com SUCESSO com as credenciais corretas!');
   } catch (error) {
-    console.error('❌ Falha no Provisionamento:', error.message);
+    console.error('❌ Erro:', error.message);
   } finally {
     await prisma.$disconnect();
   }
 }
-
 provisionEnterpriseClient();
