@@ -2,15 +2,19 @@ import { Router } from 'express';
 import { TransactionController } from '../controllers/transaction.controller';
 import { UserController } from '../controllers/user.controller';
 import { ApiKeyController } from '../controllers/apikey.controller';
+import { DepositController } from '../controllers/deposit.controller';
 import { authenticateUser } from '../middleware/auth.middleware';
 import { validate } from '../middleware/validate.middleware';
 import { swapSchema, payoutSchema } from '../validators/transaction.validator';
 
 const router = Router();
 
-// Rotas de Mutação Financeira (Zod + Ledger)
+// Rotas de Mutação Financeira
 router.post('/swap', authenticateUser, validate(swapSchema), TransactionController.swap);
 router.post('/payout', authenticateUser, validate(payoutSchema), TransactionController.payout);
+
+// NOVO: Rota de Depósito Modular (A porta de entrada)
+router.post('/deposits', authenticateUser, DepositController.requestDeposit);
 
 // Rotas de Utilizador & Definições
 router.get('/users/me', authenticateUser, UserController.getMe);

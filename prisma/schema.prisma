@@ -12,172 +12,159 @@ enum Role {
   operator
   viewer
   merchant
-  customer // NOVO: Cliente particular (sem acesso a chaves API/Webhooks)
+  customer 
 }
 
 enum TransactionStatus {
   pending
   gateway_confirmed
   failed
+  settled
 }
 
 model Currency {
-  code        String   @id
-  type        String   
-  precision   Int      
-  is_active   Boolean  @default(true)
-  wallets       Wallet[]
-  ledgerEntries LedgerEntry[]
-  created_at  DateTime @default(now())
+  code            String        @id
+  type            String
+  precision       Int
+  is_active       Boolean       @default(true)
+  wallets         Wallet[]
+  ledgerEntries   LedgerEntry[]
+  created_at      DateTime      @default(now())
 }
 
 model User {
   id                 String          @id @default(cuid())
   username           String          @unique
   password_hash      String
-  role               Role            @default(customer) 
+  role               Role            @default(customer)
 
   // --- 🔒 SEGURANÇA & ACESSO ---
   email              String?         @unique
   email_verified     Boolean         @default(false)
-  phone              String?
+  phone              String?         @unique
   two_factor_secret  String?
 
   // --- 🛂 KYC & COMPLIANCE ---
   full_name          String?
   country            String?
-  tax_id             String?         // NIF, CPF, etc.
-  kyc_level          Int             @default(0) // 0 = Sem KYC, 1 = Básico, 2 = Completo
+  tax_id             String?         
+  kyc_level          Int             @default(0) 
 
-  // --- ⚙️ PREFERÊNCIAS ---
-  notification_prefs Json?           // Ex: { "email": true, "sms": false, "discord": true }
+  // --- 🤖 INTEGRAÇÃO CRM / CHATWOOT ---
+  chatwoot_contact_id String?        
 
-  // --- CAMPOS DEV/MERCHANT (Mantidos) ---
-  preferred_provider String          @default("stripe")
+  // --- RELAÇÕES ---
   webhook_url        String?
   webhook_secret     String?
-
+  
+  stores             Store[]         
   transactions       Transaction[]
   apiKeys            ApiKey[]
   gateway_configs    GatewayConfig[]
   wallets            Wallet[]
-
-  merchant_tickets   ActionTicket[]  @relation("MerchantTickets")
-  assigned_tickets   ActionTicket[]  @relation("AssignedTickets")
   payouts            Payout[]
-  swaps              Swap[]
-
-  notifications      Notification[]
   created_at         DateTime        @default(now())
 }
 
+// ==========================================
+// 🏪 MODELO SAAS (MULTI-TENANT & MARCAS)
+// ==========================================
+model Store {
+  id                 String          @id @default(cuid())
+  name               String
+  logo_url           String?
+  primary_color      String          @default("#111111")
+  accent_color       String          @default("#00FF41")
+  
+  // Roteamento e Notificações Específicas
+  webhook_url        String?
+  webhook_secret     String?
+  
+  // Atendimento IA / WhatsApp da Marca
+  whatsapp_number    String?         
+  chatwoot_inbox_id  String?         
+
+  user_id            String
+  user               User            @relation(fields: [user_id], references: [id])
+  
+  gateways           GatewayConfig[]
+  transactions       Transaction[]
+  created_at         DateTime        @default(now())
+}
+
+// ==========================================
+// 💳 MOTOR DE GATEWAYS & SMART ROUTING
+// ==========================================
+model GatewayConfig {
+  id               String   @id @default(cuid())
+  provider_name    String   
+  api_key          String   
+  merchant_id      String   
+  is_active        Boolean  @default(true)
+  
+  // Regras de Segmentação
+  routing_rules    Json?    
+
+  // Relacionamento Híbrido
+  user_id          String
+  user             User     @relation(fields: [user_id], references: [id])
+  store_id         String?
+  store            Store?   @relation(fields: [store_id], references: [id])
+
+  created_at       DateTime @default(now())
+  @@unique([user_id, provider_name, store_id])
+}
+
+// ==========================================
+// 🏦 CORE BANK (LEDGER & WALLETS)
+// ==========================================
 model Wallet {
-  id                String   @id @default(cuid())
+  id                String        @id @default(cuid())
   user_id           String
   currency_code     String
-  currency          Currency @relation(fields: [currency_code], references: [code])
-  type              String   @default("merchant") 
-  provider          String?  
-  balance_total     Decimal  @db.Decimal(20, 8) @default(0.0)
-  balance_available Decimal  @db.Decimal(20, 8) @default(0.0)
-  user              User     @relation(fields: [user_id], references: [id])
+  currency          Currency      @relation(fields: [currency_code], references: [code])
+  type              String        @default("merchant") 
+  balance_total     Decimal       @db.Decimal(20, 8) @default(0.0)
+  balance_available Decimal       @db.Decimal(20, 8) @default(0.0)
+  
+  user              User          @relation(fields: [user_id], references: [id])
   entries           LedgerEntry[]
-  created_at        DateTime @default(now())
-  updated_at        DateTime @updatedAt
-  @@unique([user_id, currency_code, type, provider])
+  
+  created_at        DateTime      @default(now())
+  updated_at        DateTime      @updatedAt
+  @@unique([user_id, currency_code, type])
 }
 
 model LedgerTransaction {
-  id             String        @id @default(cuid())
-  type           String        
-  status         String        @default("pending")
-  reference_id   String?
-  description    String?
-  entries        LedgerEntry[]
-  created_at     DateTime      @default(now())
-  cleared_at     DateTime?
+  id              String        @id @default(cuid())
+  type            String        
+  status          String        @default("pending")
+  reference_id    String?       
+  description     String?
+  entries         LedgerEntry[]
+  created_at      DateTime      @default(now())
+  cleared_at      DateTime?
 }
 
 model LedgerEntry {
   id                    String            @id @default(cuid())
   ledger_transaction_id String
   ledger_transaction    LedgerTransaction @relation(fields: [ledger_transaction_id], references: [id])
+  
   wallet_id             String
   wallet                Wallet            @relation(fields: [wallet_id], references: [id])
+  
   direction             String            
   amount                Decimal           @db.Decimal(20, 8)
   currency_code         String
   currency              Currency          @relation(fields: [currency_code], references: [code])
+  
   created_at            DateTime          @default(now())
 }
 
-model Payout {
-  id            String   @id @default(cuid())
-  user_id       String
-  user          User     @relation(fields: [user_id], references: [id])
-  amount        Decimal  @db.Decimal(20, 8)
-  currency_code String
-  method        String   
-  destination   String   
-  status        String   @default("pending") 
-  reference_id  String?  
-  created_at    DateTime @default(now())
-  updated_at    DateTime @updatedAt
-}
-
-model Swap {
-  id              String   @id @default(cuid())
-  user_id         String
-  user            User     @relation(fields: [user_id], references: [id])
-  from_currency   String
-  to_currency     String
-  from_amount     Decimal  @db.Decimal(20, 8)
-  to_amount       Decimal  @db.Decimal(20, 8)
-  exchange_rate   Decimal  @db.Decimal(20, 8)
-  spread_fee      Decimal  @db.Decimal(20, 8) @default(0.0)
-  status          String   @default("pending") 
-  created_at      DateTime @default(now())
-}
-
-model GatewayConfig {
-  id               String   @id @default(cuid())
-  provider_name    String
-  api_key          String
-  merchant_id      String
-  clearing_type    String   @default("instant")
-  clearing_delay   Int      @default(0)
-  user             User     @relation(fields: [user_id], references: [id])
-  user_id          String
-  is_active        Boolean  @default(true)
-  created_at       DateTime @default(now())
-  @@unique([user_id, provider_name])
-}
-
-model ActionTicket {
-  id             String   @id @default(cuid())
-  type           String
-  priority       String   @default("medium")
-  status         String   @default("open")
-  reference_id   String?
-  metadata       Json?
-  merchant_id    String
-  merchant       User     @relation("MerchantTickets", fields: [merchant_id], references: [id])
-  assignee_id    String?
-  assignee       User?    @relation("AssignedTickets", fields: [assignee_id], references: [id])
-  created_at     DateTime @default(now())
-  updated_at     DateTime @updatedAt
-}
-
-model Notification {
-  id          String   @id @default(cuid())
-  user_id     String
-  type        String
-  message     String
-  is_read     Boolean  @default(false)
-  user        User     @relation(fields: [user_id], references: [id])
-  created_at  DateTime @default(now())
-}
-
+// ==========================================
+// 💸 TRANSAÇÕES (CHECKOUT)
+// ==========================================
 model Transaction {
   id                      String            @id @default(cuid())
   amount                  Decimal           @db.Decimal(15, 2)
@@ -186,26 +173,34 @@ model Transaction {
   country_code            String
   payment_method          String
   provider_name           String
+  
   fee_amount              Decimal?          @db.Decimal(15, 2) @default(0.0)
   net_amount              Decimal?          @db.Decimal(15, 2) @default(0.0)
   provider_transaction_id String?           @unique
+  
   customer_email          String?
-  payee                   User              @relation(fields: [payee_id], references: [id])
+  metadata                Json?
+  
   payee_id                String
+  payee                   User              @relation(fields: [payee_id], references: [id])
+  
+  store_id                String?           
+  store                   Store?            @relation(fields: [store_id], references: [id])
+  
   webhook_events          WebhookEvent[]
   created_at              DateTime          @default(now())
   updated_at              DateTime          @updatedAt
 }
 
 model WebhookEvent {
-  id             String      @id @default(cuid())
-  transaction    Transaction @relation(fields: [transaction_id], references: [id])
-  transaction_id String
-  payload        Json
-  status         String      @default("pending")
-  attempts       Int         @default(0)
-  response_code  Int?
-  created_at     DateTime    @default(now())
+  id              String      @id @default(cuid())
+  transaction     Transaction @relation(fields: [transaction_id], references: [id])
+  transaction_id  String
+  payload         Json
+  status          String      @default("pending")
+  attempts        Int         @default(0)
+  response_code   Int?
+  created_at      DateTime    @default(now())
 }
 
 model ApiKey {
@@ -213,7 +208,21 @@ model ApiKey {
   name        String
   key_hash    String   @unique
   key_prefix  String
-  user        User     @relation(fields: [user_id], references: [id])
   user_id     String
+  user        User     @relation(fields: [user_id], references: [id])
   created_at  DateTime @default(now())
+}
+
+model Payout {
+  id            String   @id @default(cuid())
+  user_id       String
+  user          User     @relation(fields: [user_id], references: [id])
+  amount        Decimal  @db.Decimal(20, 8)
+  currency_code String
+  method        String
+  destination   String
+  status        String   @default("pending")
+  reference_id  String?
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
 }
