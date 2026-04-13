@@ -1,15 +1,21 @@
 # Dependências
 node_modules/
 
-# Chaves e Segredos
-.env
-.env.*
-
-# Logs
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# Builds e Prisma
+# Builds e Logs
 dist/
-prisma/migrations/
+*.log
+npm-debug.log*
+
+# Ficheiros de Ambiente (NUNCA SUBIR)
+.env
+.env.local
+.env.development
+.env.production
+
+# Base de Dados Local (se usares SQLite no futuro)
+*.db
+*.sqlite
+*.sqlite3
+
+# OS
+.DS_Store

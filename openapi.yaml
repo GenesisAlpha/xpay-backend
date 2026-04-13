@@ -1,27 +1,11 @@
 openapi: 3.0.3
 info:
   title: NeXFlowX Core Banking API
-  version: 5.3.1-dev
-  description: API Institucional (Fonte Única de Verdade) para gestão de Wallets, Swaps, Payouts e Liquidez.
+  version: 3.1.0
+  description: Motor de Orquestração, Core Bank (In/Pending/Available) e Multi-Tenant SaaS.
 servers:
-  - url: https://api-dev.nexflowx.tech/api/v1
-    description: Sandbox Environment
-
-tags:
-  - name: Auth
-    description: Autenticação de utilizadores
-  - name: Wallets
-    description: Gestão de saldos
-  - name: Trading
-    description: Câmbio e FX
-  - name: Payments
-    description: Entradas de capital
-  - name: Payouts
-    description: Saídas de capital
-  - name: Ledger
-    description: Livro-razão e histórico
-  - name: Admin
-    description: Backoffice e Operações
+  - url: https://api-core.nexflowx.tech/api/v1
+    description: Fintech Core Bank Environment
 
 components:
   securitySchemes:
@@ -29,264 +13,87 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
-    apiKeyAuth:
-      type: apiKey
-      in: header
-      name: x-api-key
-
-security:
-  - bearerAuth: []
 
 paths:
   /auth/login:
     post:
-      tags: [Auth]
-      summary: Autenticação de Utilizador
-      security: []
+      summary: Autenticação (Suporta Legacy plain-text e Bcrypt)
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [username, password]
               properties:
-                username:
-                  type: string
-                  example: "XDeals"
-                password:
-                  type: string
-                  example: "xdeals123"
+                username: { type: string }
+                password: { type: string }
       responses:
         '200':
-          description: Login com sucesso
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  token:
-                    type: string
-                  user:
-                    type: object
-                    properties:
-                      id:
-                        type: string
-                      username:
-                        type: string
-                      role:
-                        type: string
-                        enum: [admin, merchant, customer]
+          description: Retorna Token JWT e role do utilizador
 
   /wallets:
     get:
-      tags: [Wallets]
-      summary: Listar carteiras do utilizador (ou do cofre, se admin)
+      summary: Lista as contas do utilizador com os 3 estágios de liquidação
+      security:
+        - bearerAuth: []
       responses:
         '200':
-          description: Lista detalhada de Wallets
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  data:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        id:
-                          type: string
-                        currency_code:
-                          type: string
-                          example: "EUR"
-                        type:
-                          type: string
-                          enum: [merchant, treasury, fee, fx_pool]
-                        balance_total:
-                          type: number
-                        balance_available:
-                          type: number
+          description: Array de Wallets contendo balance_incoming, balance_pending e balance_available.
 
   /ledger:
     get:
-      tags: [Ledger]
-      summary: Histórico financeiro (Extrato)
+      summary: Histórico de transações imutável
+      security:
+        - bearerAuth: []
       responses:
         '200':
-          description: Lista de movimentos ordenados por data
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  data:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        id:
-                          type: string
-                        type:
-                          type: string
-                          example: "SWAP"
-                        status:
-                          type: string
-                          example: "cleared"
-                        direction:
-                          type: string
-                          example: "CREDIT"
-                        amount:
-                          type: number
-                        currency:
-                          type: string
-                        description:
-                          type: string
-                        created_at:
-                          type: string
-                          format: date-time
+          description: Histórico com datas de previsão de libertação (clears_at)
 
-  /swap:
-    post:
-      tags: [Trading]
-      summary: Conversão FX entre moedas
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [amount, from_currency, to_currency]
-              properties:
-                amount:
-                  oneOf:
-                    - type: number
-                    - type: string
-                  description: Valor a converter (aceita string numérica ou number)
-                  example: 10.50
-                from_currency:
-                  type: string
-                  example: "EUR"
-                to_currency:
-                  type: string
-                  example: "USDT"
-      responses:
-        '200':
-          description: Swap concluído com sucesso
-        '400':
-          description: Saldo insuficiente ou payload inválido
-
-  /payout:
-    post:
-      tags: [Payouts]
-      summary: Pedido de levantamento (Withdrawal)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [amount, currency, method, destination]
-              properties:
-                amount:
-                  oneOf:
-                    - type: number
-                    - type: string
-                  description: Valor a levantar
-                  example: 38.12
-                currency:
-                  type: string
-                  example: "EUR"
-                method:
-                  type: string
-                  enum: [IBAN, CRYPTO, PIX, SEPA, BANK]
-                  description: Método de transferência
-                destination:
-                  type: string
-                  example: "PT50 0000 0000 1234 5678 9012 3"
-      responses:
-        '200':
-          description: Payout trancado e ticket gerado
-
-  /action-tickets:
+  /stores:
     get:
-      tags: [Admin]
-      summary: Listar tickets de operações pendentes (Apenas Admin)
-      responses:
-        '200':
-          description: Lista de tickets
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  data:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        id:
-                          type: string
-                        type:
-                          type: string
-                        priority:
-                          type: string
-                        status:
-                          type: string
-                        merchant:
-                          type: object
-                          properties:
-                            username:
-                              type: string
-                        metadata:
-                          type: object
-
-  /action-tickets/{id}/approve:
+      summary: Lista as lojas (Isolamento Multi-Tenant)
+      security:
+        - bearerAuth: []
     post:
-      tags: [Admin]
-      summary: Aprovar e liquidar um ticket (Apenas Admin)
-      parameters:
-        - in: path
-          name: id
-          required: true
-          schema:
-            type: string
-      responses:
-        '200':
-          description: Ticket aprovado e fundos libertados
+      summary: Cria uma nova loja
+      security:
+        - bearerAuth: []
+
+  /settings/gateways:
+    get:
+      summary: Gateways de pagamento (Stripe, SumUp, Mistic)
+      security:
+        - bearerAuth: []
+    post:
+      summary: Configura gateway (Chaves encriptadas em AES-256)
+      security:
+        - bearerAuth: []
 
   /payment-links:
-    post:
-      tags: [Payments]
-      summary: Gerar link de depósito (Top-up)
+    get:
+      summary: Lista todos os Payment Links ativos do Merchant
       security:
-        - apiKeyAuth: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [amount, currency]
-              properties:
-                amount:
-                  oneOf:
-                    - type: number
-                    - type: string
-                currency:
-                  type: string
+        - bearerAuth: []
+    post:
+      summary: Cria um novo Checkout Link
+      security:
+        - bearerAuth: []
+
+  /admin/users:
+    get:
+      summary: Backoffice - Lista utilizadores por role
+      security:
+        - bearerAuth: []
+  
+  /admin/users/{id}/force-password:
+    post:
+      summary: Backoffice - Forçar reset de password (Operador)
+      security:
+        - bearerAuth: []
+
+  /webhooks/mistic:
+    post:
+      summary: Receção de pagamentos PIX (Público)
       responses:
-        '201':
-          description: Link de checkout gerado
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  data:
-                    type: object
-                    properties:
-                      id:
-                        type: string
-                      shareable_url:
-                        type: string
+        '200':
+          description: OK

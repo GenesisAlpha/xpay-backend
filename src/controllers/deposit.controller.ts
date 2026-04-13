@@ -67,7 +67,7 @@ export class DepositController {
          
          if (providerName === 'mistic' || providerName === 'mercadopago') {
             const providerInstance = PaymentOrchestrator.getProviderForBRL(providerName as any);
-            const pixData = await providerInstance.createPixPayment(amountNum, txId, { 
+            const pixData = await providerInstance.createPixPayment!(amountNum, txId, { 
               email: customer_email, name: metadata?.name || 'Cliente NeXFlowX', document: metadata?.tax_id || '00000000000' 
             });
             responsePayload.type = 'QR_CODE'; responsePayload.provider_data = pixData;

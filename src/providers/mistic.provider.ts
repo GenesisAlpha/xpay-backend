@@ -1,51 +1,68 @@
-import { IPaymentProvider, ProviderResponse } from './ipovider.interface';
+import { PaymentProvider } from './payment-provider.interface';
 
-export class MisticProvider implements IPaymentProvider {
-  providerName = 'mistic';
-  private apiKey = process.env.MISTIC_API_KEY || '';
-  private apiUrl = 'https://api.misticpay.com/v1'; // Base URL da Mistic
+export class MisticProvider implements PaymentProvider {
+  private ci: string;
+  private cs: string;
+  private baseUrl = 'https://api.misticpay.com/api';
 
-  async createPixPayment(amount: number, txId: string, customerData?: any): Promise<ProviderResponse> {
-    try {
-      // Chamada HTTP Real à API da Mistic Pay
-      const response = await fetch(`${this.apiUrl}/pix/qrcode`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${this.apiKey}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          amount: amount,
-          external_reference: txId, // O nosso ID de transação para conciliação
-          description: `NeXFlowX Deposit ${txId}`,
-          payer: {
-            name: customerData?.name || 'Customer',
-            document: customerData?.document || '00000000000' // CPF
-          }
-        })
-      });
-
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.message || 'Erro na Mistic API');
-
-      // Traduzimos a resposta da Mistic para a nossa Língua Universal
-      return {
-        provider_tx_id: data.id_transacao,
-        status: 'pending',
-        qr_code: data.pix_copia_e_cola, 
-        qr_code_base64: data.qr_code_base64
-      };
-    } catch (error: any) {
-      console.error(`[MisticProvider] Erro: ${error.message}`);
-      throw error;
-    }
+  constructor(ci: string, cs: string) {
+    this.ci = ci;
+    this.cs = cs;
   }
 
-  async verifyPayment(providerTxId: string): Promise<boolean> {
-    const response = await fetch(`${this.apiUrl}/pix/${providerTxId}`, {
-      headers: { 'Authorization': `Bearer ${this.apiKey}` }
+  private getHeaders() {
+    return {
+      'ci': this.ci,
+      'cs': this.cs,
+      'Content-Type': 'application/json'
+    };
+  }
+
+  async createPayment(amount: number, currency: string, reference: string, metadata?: any) {
+    if (currency.toUpperCase() === 'BRL') return this.createPixPayment(amount, reference, metadata);
+    throw new Error('Mistic Provider só suporta BRL (PIX) para Cash-in');
+  }
+
+  async createPixPayment(amount: number, reference: string, customer: any) {
+    const payload = {
+      amount: Number(amount.toFixed(2)),
+      payerName: customer?.name || 'Cliente NeXFlowX',
+      payerDocument: customer?.document?.replace(/\D/g, '') || '00000000000',
+      transactionId: reference,
+      description: `NeXFlowX Depósito - ${reference}`
+    };
+
+    const response = await fetch(`${this.baseUrl}/transactions/create`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload)
     });
-    const data = await response.json();
-    return data.status === 'PAID';
+
+    if (!response.ok) {
+      const err = await response.text();
+      console.error("[MISTIC ERROR]", err);
+      throw new Error('Erro ao gerar PIX na MisticPay');
+    }
+
+    const json = await response.json();
+    
+    return {
+      txid: json.data.transactionId,
+      qr_code: json.data.copyPaste,
+      qr_code_base64: json.data.qrCodeBase64,
+      expires_in: 3600 
+    };
+  }
+
+  async verifyPayment(transactionId: string) {
+    const response = await fetch(`${this.baseUrl}/transactions/check`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify({ transactionId })
+    });
+    
+    if (!response.ok) return false;
+    const json = await response.json();
+    return json.transaction?.transactionState === 'COMPLETO';
   }
 }

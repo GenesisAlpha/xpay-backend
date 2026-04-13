@@ -37,6 +37,11 @@ model User {
   username           String          @unique
   password_hash      String
   role               Role            @default(customer)
+  tier          String   @default("NEW") // AAA, A, B, C, NEW
+  overrideFeeInEur Decimal? // Permite taxa personalizada
+  overrideFeeInBrl Decimal?
+  overrideFeeSwap  Decimal?
+  maxVolumeMonthly Decimal @default(10000) // Limite de volume
 
   // --- 🔒 SEGURANÇA & ACESSO ---
   email              String?         @unique
@@ -64,6 +69,7 @@ model User {
   wallets            Wallet[]
   payouts            Payout[]
   created_at         DateTime        @default(now())
+  paymentLinks PaymentLink[]
 }
 
 // ==========================================
@@ -90,6 +96,7 @@ model Store {
   gateways           GatewayConfig[]
   transactions       Transaction[]
   created_at         DateTime        @default(now())
+  paymentLinks PaymentLink[]
 }
 
 // ==========================================
@@ -124,7 +131,8 @@ model Wallet {
   currency_code     String
   currency          Currency      @relation(fields: [currency_code], references: [code])
   type              String        @default("merchant") 
-  balance_total     Decimal       @db.Decimal(20, 8) @default(0.0)
+  balance_incoming  Decimal       @db.Decimal(20, 8) @default(0.0)
+  balance_pending   Decimal       @db.Decimal(20, 8) @default(0.0)
   balance_available Decimal       @db.Decimal(20, 8) @default(0.0)
   
   user              User          @relation(fields: [user_id], references: [id])
@@ -188,6 +196,7 @@ model Transaction {
   store                   Store?            @relation(fields: [store_id], references: [id])
   
   webhook_events          WebhookEvent[]
+  clears_at               DateTime? // Previsão de quando os fundos ficam disponíveis
   created_at              DateTime          @default(now())
   updated_at              DateTime          @updatedAt
 }
@@ -223,6 +232,51 @@ model Payout {
   destination   String
   status        String   @default("pending")
   reference_id  String?
+  is_manual_ticket  Boolean  @default(false)
+  resolved_at       DateTime?
   created_at    DateTime @default(now())
   updated_at    DateTime @updatedAt
+}
+
+model PaymentLink {
+  id          String   @id @default(cuid())
+  amount      Decimal
+  currency    String
+  description String?
+  slug        String   @unique
+  active      Boolean  @default(true)
+  userId      String
+  storeId     String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  store       Store?   @relation(fields: [storeId], references: [id], onDelete: Cascade)
+}
+
+// 💰 CONFIGURAÇÃO GLOBAL DE TIERS (Catálogo de Preços)
+model TierConfig {
+  id             String   @id @default(cuid())
+  name           String   @unique // AAA, A, B, C, NEW
+  feeInEur       Decimal
+  feeInBrl       Decimal
+  feeOut         Decimal  @default(0)
+  feeSwap        Decimal  @default(0)
+  defaultBrlProv String   // Provider BRL por defeito para este Tier
+  defaultEurProv String   // Provider EUR por defeito
+  volLimit       Decimal  // Limite global para o Tier
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+// 🏢 OS PROVEDORES MASTER DA NEXFLOWX (AHub360, NeXTech, etc.)
+model MasterProvider {
+  id             String   @id // Ex: Stripe_001_UK
+  companyName    String   // Ex: AHub360 Ltd UK
+  providerType   String   // stripe, sumup, mistic, nowpayments
+  capabilities   String[] // [CARD, MBWAY, BANCONTACT]
+  settlementDays Int      // Dias de liquidação (Ex: 4, 7, 1)
+  apiKeyEncrypted String? // A chave real da NeXFlowX (Se não for via variável de ambiente)
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
 }
