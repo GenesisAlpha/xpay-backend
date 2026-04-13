@@ -1,90 +1,61 @@
-# 💠 NeXFlow-Core v2.4.5
+# 🏦 NeXFlowX Fintech Core (V2)
 
-> **Orquestrador de Capital Logístico Multi-Provider.**
-> Motor de alta performance para gestão de fluxo de caixa em 5 estágios, integração White-Label e roteamento inteligente (Stripe/Viva Wallet).
+Este é o **Core Bank e Motor de Orquestração** da plataforma NeXFlowX. Construído em Node.js com TypeScript, atua como o sistema nervoso central para processamento de pagamentos, roteamento inteligente de gateways e liquidação de tesouraria.
 
----
+## 🚀 Arquitetura e Funcionalidades
 
-## 📑 1. Dossier Técnico (Arquitetura)
+* **Motor de Tesouraria (Ledger):** Sistema de 3 pools de liquidez (`Incoming`, `Pending`, `Available`) protegido por transações ACID (Prisma).
+* **Smart Routing SaaS:** Roteamento dinâmico de pagamentos Multi-Tenant suportando Stripe, SumUp, NowPayments (Cripto) e Mistic (PIX/MBWay).
+* **Payouts Automatizados:** Motor de saques em USDT integrados e geração de tickets manuais para fluxo FIAT.
+* **Cron de Liquidação:** Motor noturno (`node-cron`) para transição de estado de fundos baseado no D+X de cada provedor.
 
-O NeXFlow-Core não é um simples processador de pagamentos; é uma **Torre de Controlo Financeiro**. Ele isola a complexidade dos provedores (Gateways) e oferece uma visão unificada do "Pipeline de Capital".
+## 🛠️ Stack Tecnológica
 
-### 🏗️ Stack Tecnológica
-- **Runtime:** Node.js 20+ (TypeScript)
-- **Engine:** Express.js
-- **ORM:** Prisma (PostgreSQL / Supabase)
-- **Infra:** Docker & Docker-Compose
-- **Providers:** Stripe (Nativo/Embedded), Viva Wallet (Smart Checkout)
+* **Runtime:** Node.js + Express
+* **Linguagem:** TypeScript
+* **ORM:** Prisma
+* **Base de Dados:** PostgreSQL
+* **Infraestrutura:** Docker & Docker Compose
 
-### 📈 O Pipeline de 5 Estágios (Logística de Capital)
-O sistema ignora intenções de compra (`pending`) e apenas contabiliza dinheiro real nos seguintes estágios:
-1. **Gateway Confirmed:** Capital capturado pelo provedor e confirmado via Webhook.
-2. **Holding Provider:** Dinheiro retido no saldo do provedor, aguardando liquidação.
-3. **FX In Transit:** Capital em processo de conversão ou transferência internacional.
-4. **Inventory Wallet:** Dinheiro disponível na carteira de operações para compra de stock/serviços.
-5. **Distributed:** Capital final liquidado e distribuído aos parceiros/nós.
+## 📦 Como Instalar e Correr (Ambiente Local/Dev)
 
----
+1. Clone o repositório e instale as dependências:
+   ```bash
+   git clone [https://github.com/nexflowx-hub/NeXFlowX-Fintech-Core.git](https://github.com/nexflowx-hub/NeXFlowX-Fintech-Core.git)
+   cd NeXFlowX-Fintech-Core
+   npm install
+Configure as Variáveis de Ambiente:
+Crie um ficheiro .env na raiz (Ver secção Variáveis de Ambiente).
 
-## 💻 2. Contrato API: Frontend (Z.ai Dashboard)
+Inicialize a Base de Dados (Prisma):
 
-Destinado ao consumo do Dashboard administrativo. Requer **Bearer Token (JWT)**.
-
-| Endpoint | Método | Descrição |
-| :--- | :--- | :--- |
-| `/api/v1/auth/login` | `POST` | Autenticação Admin. Devolve JWT. |
-| `/api/v1/pipeline` | `GET` | Resumo financeiro consolidado pelos 5 estágios. |
-| `/api/v1/transactions` | `GET` | Listagem completa de fluxos com filtros de status. |
-| `/api/v1/transactions/:id/status` | `PATCH` | Movimentação manual de capital entre estágios (Admin). |
-
----
-
-## 📦 3. Contrato API: Merchant (Lojista)
-
-Destinado à integração em lojas externas. Requer **X-API-KEY**.
-
-### Geração de Pagamento
-`POST /api/v1/payment-links`
-**Payload:**
-```json
-{
-  "amount": 15.50,
-  "currency": "EUR",
-  "description": "Sapatilhas XPTO",
-  "ui_mode": "embedded" 
-}
-Resposta:
-
-shareable_url: Link direto para o Smart Checkout NeXFlowX.
-
-client_secret: Chave para renderização nativa (se modo embedded).
-
-provider_used: O motor decide automaticamente (Stripe ou Viva).
-
-NeXFlowX JS SDK
-O lojista deve apenas importar:
-<script src="https://api.nexflowx.tech/sdk.js"></script>
-
-Uso:
-
-JavaScript
-const nex = NexFlowX('nx_live_key');
-const pedido = await nex.checkout({ amount: 10, currency: 'EUR' });
-pedido.mount('#div-do-site');
-🛡️ 4. Segurança e Webhooks
-O Core utiliza Webhooks Ativos para garantir a integridade dos dados.
-
-Stripe: /api/v1/webhooks/stripe (Validação via Assinatura HMAC).
-
-O sistema converte automaticamente eventos de checkout.session.completed em transações de Estágio 1 no Pipeline.
-
-🚀 5. Instalação (DevOps)
-Clonar repositório.
-
-Configurar .env (Stripe Keys, Viva Keys, Database URL).
-
-docker-compose up -d --build
-
+Bash
+npx prisma generate
 npx prisma db push
+Suba os contentores Docker:
 
-© 2026 NeXFlowX Hub. Sistemas de Fluxo de Capital de Próxima Geração.
+Bash
+docker-compose up -d --build
+A API ficará disponível em http://localhost:8080/api/v1.
+
+🔐 Variáveis de Ambiente Críticas (.env)
+Fragmento do código
+DATABASE_URL="postgresql://user:password@localhost:5432/nexflowx_v2"
+JWT_SECRET="sua_chave_jwt_secreta"
+SUPABASE_JWT_SECRET="chave_do_supabase_para_sso"
+NEXFLOWX_MASTER_KEY="chave_hex_32_bytes_para_encriptacao_de_api_keys"
+
+# Gateways Master
+STRIPE_SECRET_KEY="sk_live_..."
+STRIPE_WEBHOOK_SECRET="whsec_..."
+NOWPAYMENTS_API_KEY="xxx"
+NOWPAYMENTS_EMAIL="xxx"
+NOWPAYMENTS_PASSWORD="xxx"
+⚙️ Scripts de Operação (/ops)
+O diretório /ops contém scripts cirúrgicos para gestão da base de dados e tesouraria:
+
+node ops/create_admin.js - Gera um utilizador administrador de emergência.
+
+node ops/fix_treasury.js - Força a reconciliação e verificação de integridade do Ledger.
+
+node ops/sync_headless_api.js - Sincroniza configurações de Gateways.

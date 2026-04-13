@@ -1,4 +1,4 @@
-import { PaymentProvider } from './payment-provider.interface';
+import { PaymentProvider } from '../interfaces/payment-provider.interface';
 
 export class MisticProvider implements PaymentProvider {
   private ci: string;

@@ -1,4 +1,4 @@
-import { PaymentProvider } from './payment-provider.interface';
+import { PaymentProvider } from '../interfaces/payment-provider.interface';
 
 export class NowPaymentsProvider implements PaymentProvider {
   private apiKey: string;
