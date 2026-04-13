@@ -1,4 +1,4 @@
-import { PaymentProvider } from '../providers/payment-provider.interface';
+import { PaymentProvider } from '../interfaces/payment-provider.interface';
 
 // Mocks provisórios para garantir a compilação.
 // Numa Fase 2, estes vão ler as chaves dinâmicas da base de dados.
