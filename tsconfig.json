@@ -1,13 +1,17 @@
 {
   "compilerOptions": {
-    "target": "es2022",
     "module": "commonjs",
+    "target": "ES2021",
     "outDir": "./dist",
     "rootDir": "./src",
-    "strict": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true
+    "declaration": true,
+    "sourceMap": true,
+    "removeComments": true,
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true,
+    "strict": false,
+    "skipLibCheck": true
   },
-  "include": ["src/**/*"]
+  "include": ["src/**/*"],   
+  "exclude": ["node_modules", "dist"]
 }
