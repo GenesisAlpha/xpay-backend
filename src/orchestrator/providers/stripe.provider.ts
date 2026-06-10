@@ -39,7 +39,7 @@ export class StripeProvider {
 
         const paymentMethodTypes = this.getPaymentMethodTypes(method);
 
-        const isWallet = ['apple_pay', 'google_pay'].includes(method);
+        const isWallet = ['apple_pay', 'google_pay', 'link'].includes(method);
 
         let intent: any = {
             amount,
@@ -66,6 +66,14 @@ export class StripeProvider {
             intent.payment_method = paymentData.payment_method;
             intent.confirm = true;
             intent.return_url = returnUrl;
+
+            // Habilita 3DS automaticamente quando o emissor exigir
+            intent.payment_method_options = {
+                ...intent.payment_method_options,
+                card: {
+                    request_three_d_secure: 'automatic',
+                },
+            };
         }
 
         // Antes do paymentIntents.create, garante o PaymentMethod pra multibanco
@@ -90,7 +98,13 @@ export class StripeProvider {
             };
         }
 
-     
+        if (isWallet) {
+            intent = {
+                amount,
+                currency,
+            };
+        }
+
         console.log(intent)
 
         // ── Chama proxy nexflowx ────────────────────────────────────────────
@@ -169,6 +183,7 @@ export class StripeProvider {
                 status: 'pending',
                 redirectUrl: res.next_action.redirect_to_url?.url,
                 transactionId: res.id,
+                next_action: res.next_action
             };
         }
 
@@ -187,15 +202,16 @@ export class StripeProvider {
             status: 'requires_action',
             clientSecret: res.client_secret,
             transactionId: res.id,
+            next_action: res?.next_action
         };
     }
 
     private getPaymentMethodTypes(method: string): string[] {
         const map: Record<string, string[]> = {
             card: ['card'],
-            apple_pay: ['card'],      
-            google_pay: ['card'],    
-            link: ['link', 'card'],  
+            apple_pay: ['card'],
+            google_pay: ['card'],
+            link: ['link', 'card'],
             amazon_pay: ['amazon_pay'],
             paypal: ['paypal'],
             klarna: ['klarna'],

@@ -7,3 +7,4 @@ import { SettlementCronService } from './settlement.cron';
   exports: [WalletService],
 })
 export class WalletModule {}
+

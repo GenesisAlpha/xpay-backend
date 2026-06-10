@@ -34,21 +34,21 @@ const STRIPE_EXPRESS_METHODS = new Set(['apple_pay', 'google_pay', 'link'])
 type Flow = 'client' | 'redirect' | 'server' | 'hosted'
 
 const GRANULAR_FLOW_MAP: Record<string, Flow> = {
-  card:        'client',
-  apple_pay:   'client',
-  google_pay:  'client',
-  pix:         'server',
-  mbway:       'server',
-  multibanco:  'server',
-  ideal:       'redirect',
-  bancontact:  'redirect',
-  swish:       'redirect',
-  twint:       'redirect',
-  mobile_pay:  'redirect',
-  eps:         'redirect',
-  klarna:      'redirect',
-  p24:         'redirect',
-  blik:        'redirect',
+  card: 'client',
+  apple_pay: 'client',
+  google_pay: 'client',
+  pix: 'server',
+  mbway: 'server',
+  multibanco: 'server',
+  ideal: 'redirect',
+  bancontact: 'redirect',
+  swish: 'redirect',
+  twint: 'redirect',
+  mobile_pay: 'redirect',
+  eps: 'redirect',
+  klarna: 'redirect',
+  p24: 'redirect',
+  blik: 'redirect',
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -94,10 +94,10 @@ export class CheckoutService {
 
   async createSession(dto: {
     sellerId: string
-    country:  string
+    country: string
     currency: string
-    amount:   number | string
-    method?:  string
+    amount: number | string
+    method?: string
     metadata?: any
   }) {
     const { sellerId, country, currency, method, metadata } = dto
@@ -112,6 +112,7 @@ export class CheckoutService {
         sellerId,
         provider: seller.provider_default,
         seller,
+        customerCountry: country,
       })
 
       return this.persistAndReturn({
@@ -139,8 +140,8 @@ export class CheckoutService {
     const payload = isHosted
       ? this.buildHostedSession(account, providerName)
       : this.buildGranularSession({
-          method: method!, account, providerName, candidates,
-        })
+        method: method!, account, providerName, candidates,
+      })
 
     return this.persistAndReturn({
       sellerId, amount, currency, country, metadata, payload,
@@ -152,11 +153,13 @@ export class CheckoutService {
   private async buildFixedProviderSession(args: {
     sellerId: string
     provider: string
-    seller:   any
+    seller: any
+    customerCountry: string
   }): Promise<{ methods: any[]; routing: Record<string, any> }> {
     const account = await this.router.getAccountByProvider({
       sellerId: args.sellerId,
       provider: args.provider,
+      customerCountry: args.customerCountry,  // 🆕
     })
 
     if (!account) {
@@ -203,13 +206,13 @@ export class CheckoutService {
     }
 
     const methods = [{
-      type:              'crypto',
-      flow:              'hosted',
-      provider:          'stripe_crypto',
+      type: 'crypto',
+      flow: 'hosted',
+      provider: 'stripe_crypto',
       providerAccountId: account.id,
-      publishableKey:    publishable_key,
+      publishableKey: publishable_key,
       cryptoDestination: {
-        wallet:   wallet_address,
+        wallet: wallet_address,
         network,
         currency: cryptoCurrency,
       },
@@ -218,7 +221,7 @@ export class CheckoutService {
     const routing = {
       crypto: {
         provider_account_id: account.id,
-        provider:            'stripe_crypto',
+        provider: 'stripe_crypto',
       },
     }
 
@@ -271,19 +274,20 @@ export class CheckoutService {
 
     // methods[]: 1 método sintético "stripe" — frontend reconhece e expande
     const methods = [{
-      type:              'stripe',
-      flow:              'client',
-      provider:          'stripe',
+      type: 'stripe',
+      flow: 'client',
+      provider: 'stripe',
       providerAccountId: account.id,
-      publishableKey:    publishable_key,
+      publishableKey: publishable_key,
     }]
 
+    console.log(methods)
     // routing: ENTRADA POR MÉTODO — todas apontam pra mesma provider_account
     const routing: Record<string, any> = {}
     for (const methodType of enabledMethods) {
       routing[methodType] = {
         provider_account_id: account.id,
-        provider:            'stripe',
+        provider: 'stripe',
       }
     }
 
@@ -300,31 +304,31 @@ export class CheckoutService {
   // seller (raiz, metadata, config) pra não depender de schema fixo.
 
   private collectStripeEnabledMethods(seller: any): string[] {
-  const enabledMethods =
-    seller?.enabled_methods
-    ?? seller?.metadata?.enabled_methods
-    ?? seller?.config?.enabled_methods
-    ?? null
+    const enabledMethods =
+      seller?.enabled_methods
+      ?? seller?.metadata?.enabled_methods
+      ?? seller?.config?.enabled_methods
+      ?? null
 
-  if (!Array.isArray(enabledMethods) || enabledMethods.length === 0) {
-    console.warn(
-      `[buildStripeSession] seller ${seller?.id} sem enabled_methods — ` +
-      `fallback ['card']`,
-    )
-    return ['card']
+    if (!Array.isArray(enabledMethods) || enabledMethods.length === 0) {
+      console.warn(
+        `[buildStripeSession] seller ${seller?.id} sem enabled_methods — ` +
+        `fallback ['card']`,
+      )
+      return ['card']
+    }
+
+    return enabledMethods
+      .filter((m: any) => typeof m === 'string')
+      .filter((m: string) => !STRIPE_EXPRESS_METHODS.has(m))
   }
-
-  return enabledMethods
-    .filter((m: any) => typeof m === 'string')
-    .filter((m: string) => !STRIPE_EXPRESS_METHODS.has(m))
-}
   // ─── Resolução hosted (Viva) por país ─────────────────────────────────────
 
   private async resolveHostedByCountry(ctx: {
-    sellerId:  string
-    country:   string
-    currency:  string
-    amount:    number
+    sellerId: string
+    country: string
+    currency: string
+    amount: number
     riskLevel: string
   }) {
     // Stripe Crypto e Stripe não competem por país — são fixos via provider_default.
@@ -332,19 +336,21 @@ export class CheckoutService {
       .filter(p => !FIXED_PROVIDERS.has(p))
 
     const candidates = await this.router.getHostedCandidates({
-      sellerId:        ctx.sellerId,
-      country:         ctx.country,
-      currency:        ctx.currency,
-      amount:          ctx.amount,
-      riskLevel:       ctx.riskLevel,
+      sellerId: ctx.sellerId,
+      country: ctx.country,
+      currency: ctx.currency,
+      amount: ctx.amount,
+      riskLevel: ctx.riskLevel,
       hostedProviders: competitiveHosted,
     })
+
+    console.log(candidates)
 
     if (!candidates.length) return null
 
     const winner = candidates[0]
     return {
-      account:      winner,
+      account: winner,
       providerName: this.normalizeProviderName(winner.provider),
       candidates,
     }
@@ -354,16 +360,16 @@ export class CheckoutService {
 
   private buildHostedSession(account: any, providerName: string) {
     const methods = [{
-      type:              'hosted',
-      flow:              'hosted',
-      provider:          providerName,
+      type: 'hosted',
+      flow: 'hosted',
+      provider: providerName,
       providerAccountId: account.id,
     }]
 
     const routing = {
       hosted: {
         provider_account_id: account.id,
-        provider:            providerName,
+        provider: providerName,
       },
     }
 
@@ -373,18 +379,18 @@ export class CheckoutService {
   // ─── Build granular session (mantida igual) ───────────────────────────────
 
   private buildGranularSession(args: {
-    method:       string
-    account:      any
+    method: string
+    account: any
     providerName: string
-    candidates:   any[]
+    candidates: any[]
   }) {
     const { method, account, providerName, candidates } = args
     const flow = GRANULAR_FLOW_MAP[method] ?? 'server'
 
     const config: any = {
-      type:              method,
+      type: method,
       flow,
-      provider:          providerName,
+      provider: providerName,
       providerAccountId: account.id,
     }
 
@@ -400,7 +406,7 @@ export class CheckoutService {
     const routing = {
       [method]: {
         provider_account_id: account.id,
-        provider:            providerName,
+        provider: providerName,
         candidates: candidates.slice(0, 3).map(c => ({ id: c.id })),
       },
     }
@@ -412,23 +418,23 @@ export class CheckoutService {
 
   private async persistAndReturn(args: {
     sellerId: string
-    amount:   number
+    amount: number
     currency: string
-    country:  string
+    country: string
     metadata: any
-    payload:  { methods: any[]; routing: Record<string, any> }
+    payload: { methods: any[]; routing: Record<string, any> }
   }) {
     const sessionId = `cs_${uuidv4()}`
 
     const { error } = await supabase.from('checkout_sessions').insert({
-      id:         sessionId,
-      seller_id:  args.sellerId,
-      amount:     args.amount,
-      currency:   args.currency,
-      country:    args.country,
-      status:     'created',
-      routing:    args.payload.routing,
-      metadata:   args.metadata || {},
+      id: sessionId,
+      seller_id: args.sellerId,
+      amount: args.amount,
+      currency: args.currency,
+      country: args.country,
+      status: 'created',
+      routing: args.payload.routing,
+      metadata: args.metadata || {},
       created_at: new Date().toISOString(),
     })
 
@@ -436,10 +442,10 @@ export class CheckoutService {
 
     return {
       sessionId,
-      amount:   args.amount,
+      amount: args.amount,
       currency: args.currency,
-      country:  args.country,
-      methods:  args.payload.methods,
+      country: args.country,
+      methods: args.payload.methods,
     }
   }
 

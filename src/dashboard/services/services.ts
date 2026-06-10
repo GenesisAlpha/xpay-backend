@@ -3,11 +3,13 @@
 // Transactions | Wallet | Disputes | Transfers | PaymentMethods | Settings
 // ============================================================
 
-import { Injectable, BadRequestException, NotFoundException, UnauthorizedException, InternalServerErrorException } from '@nestjs/common'
+import { Injectable, BadRequestException, NotFoundException, UnauthorizedException, InternalServerErrorException, Logger } from '@nestjs/common'
 import { supabase } from '../../lib/supabase.client'
 import * as bcrypt from 'bcrypt';
 import { generateKey, hashKey } from '../../utils/apikeys.utils';
 import * as crypto from 'crypto';
+import { RequestPayoutDto, RequestPayoutResult } from '../dto/request-payout.dto';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -70,7 +72,7 @@ export class TransactionsService {
       amount: fromCents(tx.amount),
       currency: tx.currency,
       // 🔥 amount_usd_gross_cents → USD
-      amountUSD: fromCents(tx.amount_usd_gross_cents),
+      amountUSD: fromCents(tx.amount_usd_net_cents),
       status: tx.status,
       provider: tx.provider,
       providerTransactionId: tx.provider_transaction_id,
@@ -138,6 +140,7 @@ export class TransactionsService {
 
 @Injectable()
 export class WalletService {
+  private readonly logger = new Logger(WalletService.name)
 
   async getBalance(sellerId: string) {
     const { data: balance, error } = await supabase
@@ -149,7 +152,7 @@ export class WalletService {
 
     const { data: nextPayout, error: Error } = await supabase
       .from('wallet_ledger')
-      .select('amount, available_at')
+      .select('amount, available_at, metadata')
       .eq('seller_id', sellerId)
       .eq('type', 'debit_payout')
       .eq('status', 'pending')
@@ -173,7 +176,7 @@ export class WalletService {
       nextPayout: nextPayout ? {
         amount: fromCents(nextPayout.amount),
         date: new Date(nextPayout.available_at).toLocaleDateString('pt-BR'),
-        method: 'Banco',
+        method: nextPayout.metadata.method,
       } : null,
     }
   }
@@ -338,7 +341,109 @@ export class WalletService {
     }
     return map[type] ?? type
   }
+
+  private usdToCents(usd: number): number {
+    return Math.round(usd * 100)
+  }
+
+  // ── Monta o objeto `destination` conforme o método ─────────────────────────
+  private buildDestination(dto: RequestPayoutDto): Record<string, string> {
+    if (dto.method === 'pix') {
+      const pixKey = (dto.pixKey ?? '').trim()
+      const pixHolder = (dto.pixHolder ?? '').trim()
+      const pixKeyType = (dto.pixKeyType ?? '').trim()
+      const pixBankName = (dto.pixBankName ?? '').trim()
+
+      if (!pixKey) throw new BadRequestException('Chave PIX é obrigatória.')
+      if (!pixHolder) {
+        throw new BadRequestException('Nome do titular é obrigatório.')
+      }
+
+      return {
+        pixKey,
+        pixKeyType,
+        pixHolder,
+        ...(pixBankName ? { pixBankName } : {}),
+      }
+    }
+
+    // crypto
+    const cryptoAddress = (dto.cryptoAddress ?? '').trim()
+    const cryptoNetwork = (dto.cryptoNetwork ?? '').trim()
+
+    if (cryptoAddress.length < 20) {
+      throw new BadRequestException('Endereço de carteira inválido.')
+    }
+
+    return { cryptoAddress, cryptoNetwork }
+  }
+
+
+  // ── Caso de uso principal ──────────────────────────────────────────────────
+  async requestPayout(
+    dto: RequestPayoutDto,
+  ): Promise<RequestPayoutResult> {
+    // 1. Converte para centavos (formato do banco).
+    //    O DTO já garantiu amount > 0 e >= mínimo via class-validator.
+    const amountCents = this.usdToCents(dto.amount)
+
+    // 2. Monta os dados de destino (valida campos obrigatórios do método).
+    const destination = this.buildDestination(dto)
+
+    // 3. 2FA — TODO.
+    //    Ainda não implementado. Quando for, validar dto.twoFactorCode aqui
+    //    (antes da RPC) ou dentro da própria função SQL.
+    /* if (!dto.twoFactorCode) {
+       this.logger.warn(
+         'Saque solicitado sem código 2FA. 2FA não implementado.',
+       )
+     }*/
+
+    // 4. Chama a RPC — toda a lógica de saldo (ler, travar, debitar
+    //    available→pending, inserir no ledger) roda atômica no banco.
+    const { data, error } = await supabase.rpc('request_payout', {
+      p_seller_id: dto.sellerId,
+      p_amount_cents: amountCents,
+      p_method: dto.method,
+      p_destination: destination,
+    })
+
+    // 5. Tratamento de erro.
+    if (error) {
+      // Exceptions da função SQL (saldo insuficiente, valor mínimo, etc.)
+      // chegam com a mensagem em error.message — erros de negócio
+      // esperados → 400 com a mensagem original (a modal já exibe).
+      this.logger.warn(
+        `request_payout falhou: ${error.message} (code=${error.code})`,
+      )
+
+      if (error.code === '28000') {
+        throw new UnauthorizedException(error.message)
+      }
+      throw new BadRequestException(
+        error.message || 'Não foi possível processar o saque.',
+      )
+    }
+
+    // A função retorna `table(...)` → array com uma linha.
+    const row = Array.isArray(data) ? data[0] : data
+    if (!row?.payout_id) {
+      this.logger.error('request_payout não retornou payout_id.')
+      throw new BadRequestException('Não foi possível processar o saque.')
+    }
+
+    this.logger.log(
+      `Saque criado: payoutId=${row.payout_id} method=${dto.method} amountCents=${amountCents}`,
+    )
+
+    // 6. Resposta — mantém o shape que a modal espera.
+    return {
+      payoutId: row.payout_id,
+      status: 'processing', // exibido como "Em Processamento" na modal
+    }
+  }
 }
+
 
 // ============================================================
 // DISPUTES SERVICE

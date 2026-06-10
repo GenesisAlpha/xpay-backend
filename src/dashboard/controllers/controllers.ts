@@ -29,7 +29,7 @@ async function getSellerId(userId: string): Promise<string> {
 }
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
- 
+
 @Controller('dashboard')
 @JwtOnly()
 export class DashboardController {
@@ -99,7 +99,6 @@ export class WalletController {
   }
 
   @Get('payouts')
-  @JwtOnly()
   async payouts(@Req() req: any, @Query() q: any) {
     const sellerId = await getSellerId(req.user.sub)
     return this.svc.getPayouts(sellerId, {
@@ -110,8 +109,9 @@ export class WalletController {
 
   @Post('payout')
   async requestPayout(@Req() req: any, @Body() body: any) {
-    // TODO: implementar lógica de saque com 2FA
-    return { payoutId: `WD-${Date.now()}`, status: 'processing' }
+    const sellerId = await getSellerId(req.user.sub)
+    body.sellerId = sellerId;
+    return this.svc.requestPayout(body)
   }
 }
 

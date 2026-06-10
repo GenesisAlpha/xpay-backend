@@ -8,7 +8,7 @@ import { SellersModule } from './sellers/sellers.module';
 import { ScheduleModule } from '@nestjs/schedule';
 import { AuthModule } from './auth/auth.module';
 import { CheckoutModule } from './checkout-session/  checkout-session.module';
-import { ApiKeysModule, DashboardModule, DisputesModule, PaymentMethodsModule, SettingsModule, TransactionsModule, TransfersModule } from './dashboard/modules/dashboard.module';
+import { ApiKeysModule, DashboardModule, DisputesModule, PaymentMethodsModule, SettingsModule, TransactionsModule, TransfersModule, WalletDashModule } from './dashboard/modules/dashboard.module';
 import { CurrencyModule } from './currency/currency.module';
 import { CryptoModule } from './crypto/crypto.module';
 import { OnboardingModule } from './onboarding/onboarding.module';
@@ -35,6 +35,7 @@ import { AppController } from './app.controller';
     // Dashboard
     DashboardModule,
     TransactionsModule,
+    WalletDashModule,
     DisputesModule,
     TransfersModule,
     PaymentMethodsModule,

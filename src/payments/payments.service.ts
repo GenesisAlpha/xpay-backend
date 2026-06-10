@@ -8,7 +8,6 @@ import { AccountRouterService } from '../orchestrator/router/account-router.serv
 import { getSellerFees, calculateFees } from '../shared/fee.calculator'
 import { validateMbwayPhone } from '../utils/mbway.validator'
 import { RetrieveResponse } from '../orchestrator/providers/viva.provider'
-import { response } from 'express'
 
 export interface ExternalFeeInput {
     recipient_id: string
@@ -31,6 +30,7 @@ const KOOPFY_PLATFORM_WALLET_REF = process.env.KOOPFY_PLATFORM_WALLET_REF
 // ─── Resolve qual wallet recebe o platform_fee ────────────────────────────────
 
 type RiskLevel = 'WHITE' | 'GRAY' | 'HIGH' | string
+
 
 function resolvePlatformWallet(riskLevel: RiskLevel): {
     walletRef: string
@@ -86,6 +86,11 @@ export class PaymentService {
 
     private static readonly REDIRECT_PROVIDERS = new Set(['viva'])
 
+    private resolvePlatformWalletRef(partner: string): string {
+        if (partner === 'koopfy') return KOOPFY_PLATFORM_WALLET_REF
+        return NEXOR_PLATFORM_WALLET_REF
+    }
+
     // ─── createPayment ────────────────────────────────────────────────────────
 
     async createPayment(dto: any) {
@@ -103,6 +108,8 @@ export class PaymentService {
 
             session = data
 
+            console.log(session)
+
             await supabase.from('checkout_sessions')
                 .update({ status: 'completed', consumed_at: new Date().toISOString() })
                 .eq('id', session.id)
@@ -117,6 +124,7 @@ export class PaymentService {
                 { id: routing.provider_account_id },
                 ...(routing.candidates || []).map((c: any) => ({ id: c.id })),
             ]
+
 
         } else {
             seller = await this.getSellerById(dto.sellerId)
@@ -254,7 +262,7 @@ export class PaymentService {
 
         const sellerFees = await getSellerFees(effectiveSellerId)
         const baseFee = sellerFees
-            ? calculateFees(netUSDcents / 100, sellerFees)
+            ? calculateFees(netUSDcents / 100, sellerFees, {paymentMethod: dto.method})
             : this.defaultFeeResult(netUSDcents)
 
         const platformFeeCents = Math.round(baseFee.platformFee * 100)
@@ -342,7 +350,6 @@ export class PaymentService {
         }
 
         // ─── Falha total ───────────────────────────────────────────────────────
-
         if (!result?.success) {
             const now = new Date().toISOString()
             await supabase.from('transactions').update({
@@ -366,7 +373,6 @@ export class PaymentService {
         }
 
         // ─── Atualiza transação ────────────────────────────────────────────────
-
         const now = new Date().toISOString()
         const finalStatus = result.status === 'requires_action'
             ? 'requires_action'
@@ -554,6 +560,14 @@ export class PaymentService {
                 externalFee: updated.external_fee_cents
                     ? { amount: updated.external_fee_cents, recipientId: updated.external_fee_recipient_id }
                     : null,
+                // 🔥 NOVO
+                platformFee: updated.fee > 0
+                    ? {
+                        amount: updated.fee,
+                        walletRef: this.resolvePlatformWalletRef(updated.platform_partner),
+                        partner: updated.platform_partner,
+                    }
+                    : null,
             })
         }
 
@@ -602,18 +616,37 @@ export class PaymentService {
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────────────
-
     private buildResponse(result: any, transactionId: string, status: string) {
-        const body: any = { success: true, status, transactionId }
+        // success é true SÓ quando a transação está aprovada/concluída.
+        // requires_action, pending, processing NÃO são sucesso final —
+        // o frontend precisa fazer algo (3DS, mostrar QR/boleto, esperar webhook).
+        const isFinalSuccess = status === 'approved' || status === 'succeeded'
+
+        const body: any = {
+            success: isFinalSuccess,
+            status,
+            transactionId,
+        }
+
+        // Flag explícita pro frontend não precisar adivinhar pelo status string
+        if (status === 'requires_action') {
+            body.requires_action = true
+        }
+
         if (result.gateway_id) body.gateway_id = result.gateway_id
         if (result.checkout_url) body.checkout_url = result.checkout_url
-        if (result.client_secret) body.client_secret = result.client_secret  // ← snake_case pro frontend
-        if (result.clientSecret) body.client_secret = result.clientSecret   // ← compat
+        if (result.client_secret) body.client_secret = result.client_secret
+        if (result.clientSecret) body.client_secret = result.clientSecret  // compat camelCase
         if (result.provider) body.provider = result.provider
-        if (result.reference && result.entity) { body.reference = result.reference; body.entity = result.entity }
+        if (result.reference && result.entity) {
+            body.reference = result.reference
+            body.entity = result.entity
+        }
         if (result.redirectUrl) body.redirectUrl = result.redirectUrl
         if (result.referenceData) body.referenceData = result.referenceData
         if (result.next_action) body.next_action = result.next_action
+
+        console.log('[buildResponse] →', JSON.stringify(body))
         return body
     }
 
@@ -660,5 +693,57 @@ export class PaymentService {
             p_amount: data.amount, p_fee: data.fee, p_status: data.status,
         })
         if (error) console.error('[PaymentService] KPI error:', error)
+    }
+
+    async uploadToNexor(
+        input: any,
+    ): Promise<any> {
+        const { payment_id, tracking_number, tracking_carrier, tracking_url } = input;
+
+        if (!payment_id) {
+            return { success: false, message: 'Nexor: gatewayPaymentId (payment_id) ausente.' };
+        }
+
+        // objeto de tracking gravado na transação
+        const trackingPayload = {
+            status: 'synced',
+            number: tracking_number,
+            carrier: tracking_carrier || null,
+            url: tracking_url,
+            synced_at: new Date().toISOString(),
+        };
+
+        try {
+            const { data, error } = await supabase
+                .from('transactions')
+                .update({ tracking: trackingPayload })
+                .eq('id', payment_id)
+                .select('id');
+
+            if (error) {
+                console.error(`[nexor] erro ao atualizar transaction: ${error.message}`);
+                return { success: false, message: error.message };
+            }
+
+            // nenhuma transação encontrada para esse payment_id
+            if (!data || data.length === 0) {
+                console.warn(
+                    `[nexor] nenhuma transaction com payment_id=${payment_id}`,
+                );
+                return {
+                    success: false,
+                    message: `Transação não encontrada (payment_id=${payment_id}).`,
+                };
+            }
+
+            console.log(
+                `[nexor] tracking atualizado em ${data.length} transaction(s) ` +
+                `para payment_id=${payment_id}`,
+            );
+            return { success: true, raw: data };
+        } catch (e: any) {
+            console.error(`[nexor] upload falhou: ${e?.message ?? e}`);
+            return { success: false, message: e?.message ?? 'erro desconhecido' };
+        }
     }
 }

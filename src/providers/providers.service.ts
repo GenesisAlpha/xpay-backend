@@ -1,14 +1,15 @@
 // provider.service.ts
 
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { supabase } from '../lib/supabase.client';
 import { CryptoService } from '../crypto/crypto.service';
 
 @Injectable()
 export class ProviderService {
+
     constructor(
         private readonly cryptoService: CryptoService
-    ) {}
+    ) { }
 
     async createProvider(dto: {
         provider: string;
@@ -43,4 +44,6 @@ export class ProviderService {
 
         return data;
     }
+
+  
 }

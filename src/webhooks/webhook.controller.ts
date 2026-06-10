@@ -11,8 +11,5 @@ export class WebhookController {
         return this.webhookService.handleWebhookProvider(req.body);
     }
 
-        @Post('teste')
-    async handleNexfloTeste(@Req() req: any) {
-        return this.webhookService.replayWaylinxWebhooks();
-    }
+
 }

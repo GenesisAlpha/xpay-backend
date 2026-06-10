@@ -32,12 +32,17 @@ type ProviderAccount = {
   public_key: string;
   encrypted_secret_key: string;
 
+  // 🆕 Country da conta (ISO-2). No caso da Stripe, é o country da Connected
+  // Account / Account.country. Pode estar em coluna raiz ou em metadata.
+  country?: string;
+
   countries?: string[];
   risk_levels?: string[];
   min_amount?: number;
   max_amount?: number;
 
   config?: Record<string, any>;
+  metadata?: Record<string, any>;
 
   // Acumulados — leitura apenas; updates via RPC.
   total_volume_processed?: number;
@@ -45,23 +50,41 @@ type ProviderAccount = {
 };
 
 // ─────────────────────────────────────────────
+// PROVIDER COUNTRY PRIORITY
+//
+// Quando seller tem múltiplas contas do mesmo provider em países
+// diferentes, priorizamos por país do cliente.
+//
+// Hoje aplicado APENAS pra Stripe (Payment Element) em getAccountByProvider.
+// Pra adicionar outro provider, é só estender PROVIDER_COUNTRY_PRIORITY.
+//
+// Regras Stripe:
+//   Cliente PT  → conta com country=PT
+//   Cliente US  → conta com country=GB (Stripe usa GB pro Reino Unido)
+//
+// Comportamento de fallback:
+//   - Se houver regra pro país do cliente mas nenhuma conta com o country
+//     preferido, cai pro pool completo (não bloqueia o pagamento).
+//   - Se houver match, o balanceamento por déficit roda APENAS entre as
+//     contas do país preferido (preserva o balanceamento intra-país).
+// ─────────────────────────────────────────────
+
+const PROVIDER_COUNTRY_PRIORITY: Record<string, Record<string, string>> = {
+  stripe: {
+    PT: 'PT',
+    US: 'GB',
+  },
+};
+
+// ─────────────────────────────────────────────
 // METRICS
-//
-// Volume DIÁRIO: persistido em Supabase + cache in-memory read-through.
-// Source of truth = tabela `account_daily_metrics`.
-// Usado para BALANCEAMENTO (déficit proporcional).
-//
-// Volume ACUMULADO: persistido em provider_accounts.total_volume_processed.
-// Usado para DASHBOARDS — não entra no balanceamento.
-//
-// Health (circuit breaker): in-memory, janela curta. Perder em restart é OK.
 // ─────────────────────────────────────────────
 
 interface DailyMetric {
-  volume: number;     // centavos pagos hoje
-  paidCount: number;  // nº de pagamentos confirmados hoje
-  day: string;        // YYYY-MM-DD UTC
-  hydratedAt: number; // timestamp da última hidratação do cache
+  volume: number;
+  paidCount: number;
+  day: string;
+  hydratedAt: number;
 }
 
 interface HealthMetric {
@@ -142,10 +165,6 @@ export class AccountRouterService implements OnModuleInit {
     return metric;
   }
 
-  /**
-   * Pré-hidrata várias contas de uma vez. Usado no rankCandidates pra
-   * evitar N round-trips ao Supabase quando há muitas contas elegíveis.
-   */
   private async hydrateMany(ids: string[]): Promise<Map<string, DailyMetric>> {
     const today = this.today();
     const stale: string[] = [];
@@ -286,8 +305,6 @@ export class AccountRouterService implements OnModuleInit {
 
   // ─────────────────────────────────────────────
   // LAYER 4 — BALANCING (déficit proporcional)
-  //
-  // ⚠️ Volume aqui = volume PAGO hoje (vendas aprovadas), não autorizadas.
   // ─────────────────────────────────────────────
 
   private computeDeficit(
@@ -433,13 +450,7 @@ export class AccountRouterService implements OnModuleInit {
   }
 
   // ─────────────────────────────────────────────
-  // 🔥 markPaid — chamado pelo webhook quando pagamento é APROVADO
-  //
-  // Atualiza atomicamente:
-  //   - account_daily_metrics (volume diário — usado no balanceamento)
-  //   - provider_accounts.total_volume_processed (acumulado lifetime)
-  //
-  // RPC garante atomicidade. Cache local é atualizado com o valor canônico.
+  // markPaid
   // ─────────────────────────────────────────────
 
   async markPaid(accountId: string, amount: number) {
@@ -466,9 +477,6 @@ export class AccountRouterService implements OnModuleInit {
         day,
         hydratedAt: Date.now(),
       });
-      // Os campos total_volume / total_count também voltam da RPC, mas
-      // não os cacheamos in-memory (são lidos direto do banco quando
-      // necessário, ex: dashboard).
     }
   }
 
@@ -500,38 +508,67 @@ export class AccountRouterService implements OnModuleInit {
   }
 
   // ─────────────────────────────────────────────
+  // Helper: extrai country (ISO-2) da provider_account
+  //
+  // Defensivo: aceita em vários lugares. Para Stripe, a fonte oficial é
+  // o campo `country` retornado pelo Stripe Account API quando salvamos
+  // a conta — costuma ir pra coluna `country` ou pra metadata.country.
+  // ─────────────────────────────────────────────
+
+  private extractAccountCountry(acc: ProviderAccount): string | null {
+    const raw =
+      acc.country
+      ?? acc.metadata?.country
+      ?? acc.metadata?.account_country
+      ?? acc.config?.country
+      ?? null;
+
+    return typeof raw === 'string' ? raw.toUpperCase() : null;
+  }
+
+  // ─────────────────────────────────────────────
   // 🎯 PROVIDER FIXO — getAccountByProvider
   //
   // Usado quando seller.provider_default está set (stripe, stripe_crypto).
   //
-  // Antes: ordenava por weight e pegava a maior — uma única conta levava
-  // tudo até o weight mudar.
-  //
-  // Agora: aplica déficit proporcional entre TODAS as contas ativas do
-  // seller naquele provider. "Encher todos os potes ao mesmo tempo".
+  // NOVO: aceita customerCountry opcional. Quando passado E existe regra
+  // em PROVIDER_COUNTRY_PRIORITY[provider][customerCountry], filtra o pool
+  // pra apenas contas com country=preferred ANTES do balanceamento por
+  // déficit. Se nenhuma conta matchar o preferred, cai pro pool completo
+  // (não bloqueia pagamento).
   //
   // Pipeline:
   //   1) Filtra: provider match + seller match + healthy
-  //   2) Se 0 → null. Se 1 → atalho (sem hidratação à toa).
-  //   3) Hidrata métricas diárias em uma única query
-  //   4) Ranking por déficit; tiebreaker = random
+  //   2) Aplica priorização por país (se houver regra + match)
+  //   3) Se 0 → null. Se 1 → atalho.
+  //   4) Balanceamento por déficit no subset resultante.
   // ─────────────────────────────────────────────
 
   async getAccountByProvider(args: {
     sellerId: string;
     provider: string;
+    customerCountry?: string;
   }): Promise<ProviderAccount | null> {
     const accounts = await this.getAccounts();
 
-    const pool = accounts.filter(acc =>
+    const basePool = accounts.filter(acc =>
       String(acc.provider).toLowerCase() === args.provider.toLowerCase()
       && this.isHealthy(acc),
     );
 
-    if (pool.length === 0) return null;
+    if (basePool.length === 0) return null;
+
+    // ── Aplica priorização por país, se houver regra ──
+    const pool = this.applyCountryPriority({
+      provider:        args.provider,
+      customerCountry: args.customerCountry,
+      basePool,
+    });
+
+    console.log(pool)
     if (pool.length === 1) return pool[0];
 
-    // Balanceamento por déficit diário entre as contas do mesmo provider
+    // Balanceamento por déficit diário entre o subset filtrado
     const metrics = await this.hydrateMany(pool.map(a => a.id));
 
     const ranked = pool
@@ -546,5 +583,46 @@ export class AccountRouterService implements OnModuleInit {
       });
 
     return ranked[0].acc;
+  }
+
+  // ─────────────────────────────────────────────
+  // Aplica filtro de país preferido sobre o pool base.
+  // Retorna o pool filtrado se houver match, senão o pool original.
+  // ─────────────────────────────────────────────
+
+  private applyCountryPriority(args: {
+    provider:        string;
+    customerCountry?: string;
+    basePool:        ProviderAccount[];
+  }): ProviderAccount[] {
+    const { provider, customerCountry, basePool } = args;
+
+    if (!customerCountry) return basePool;
+
+    const rules = PROVIDER_COUNTRY_PRIORITY[provider.toLowerCase()];
+    if (!rules) return basePool;
+
+    const preferredCC = rules[customerCountry.toUpperCase()];
+    if (!preferredCC) return basePool;
+
+    const filtered = basePool.filter(
+      acc => this.extractAccountCountry(acc) === preferredCC,
+    );
+
+    if (filtered.length > 0) {
+      console.log(
+        `[AccountRouter] country priority match: provider=${provider} ` +
+        `customer=${customerCountry} → preferred=${preferredCC} ` +
+        `(${filtered.length}/${basePool.length} accounts)`,
+      );
+      return filtered;
+    }
+
+    console.warn(
+      `[AccountRouter] country priority miss: provider=${provider} ` +
+      `customer=${customerCountry} wanted=${preferredCC} mas seller não tem ` +
+      `conta nesse país — fallback pra pool completo (${basePool.length} accounts).`,
+    );
+    return basePool;
   }
 }

@@ -18,5 +18,10 @@ export class PaymentController {
     });
   }
 
+  @Post('tracking')
+  async syncTracking(@Body() body: any) {
+    return this.paymentService.uploadToNexor(body);
+  }
+
 }
 

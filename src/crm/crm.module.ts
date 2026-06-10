@@ -44,6 +44,8 @@ import { Module } from '@nestjs/common'
 import { JwtModule } from '@nestjs/jwt'
 import { CrmController } from './crm.controller'
 import { CrmService }    from './crm.service'
+import { CrmAdminController } from './crm-admin.controller'
+import { CrmAdminService } from './crm-admin.service'
 
 @Module({
   imports: [
@@ -52,8 +54,8 @@ import { CrmService }    from './crm.service'
       signOptions:  { expiresIn: '8h' },
     }),
   ],
-  controllers: [CrmController],
-  providers:   [CrmService, CrmAuthGuard],
-  exports:     [CrmService],
+  controllers: [CrmController, CrmAdminController],
+  providers:   [CrmService, CrmAdminService, CrmAuthGuard],
+  exports:     [CrmService, CrmAdminService],
 })
 export class CrmModule {}

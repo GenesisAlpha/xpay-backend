@@ -4,8 +4,14 @@ import { Injectable } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
 
 interface ExternalFeeArgs {
-  amount:      number
+  amount: number
   recipientId: string
+}
+
+interface PlatformFeeArgs {
+  amount: number
+  walletRef: string
+  partner: string
 }
 
 @Injectable()
@@ -22,15 +28,17 @@ export class WalletService {
     availableAt,
     reserveUntil,
     externalFee = null,
+    platformFee = null,
   }: {
-    sellerId:      string
+    sellerId: string
     transactionId: string
-    amount:        number
-    fee:           number
+    amount: number
+    fee: number
     reserveAmount: number
-    availableAt:   Date | string | null
-    reserveUntil:  Date | string | null
-    externalFee?:  ExternalFeeArgs | null
+    availableAt: Date | string | null
+    reserveUntil: Date | string | null
+    externalFee?: ExternalFeeArgs | null
+    platformFee?: PlatformFeeArgs | null
   }) {
     const toISO = (d: Date | string | null): string => {
       if (!d) return new Date().toISOString()
@@ -38,45 +46,59 @@ export class WalletService {
       return d
     }
 
-    const availableAtISO  = toISO(availableAt)
+    const availableAtISO = toISO(availableAt)
     const reserveUntilISO = toISO(reserveUntil)
-    const now             = new Date().toISOString()
+    const now = new Date().toISOString()
 
     // ── 1. Linhas no ledger do seller ────────────────────────────────────────
     const ledgerRows: any[] = [
       {
-        seller_id:      sellerId,
+        seller_id: sellerId,
         transaction_id: transactionId,
-        type:           'credit_pending',
+        type: 'credit_pending',
         amount,
-        currency:       'USD',
-        available_at:   availableAtISO,
-        status:         'pending',
-        created_at:     now,
+        currency: 'USD',
+        available_at: availableAtISO,
+        status: 'pending',
+        created_at: now,
       },
     ]
 
     if (reserveAmount > 0) {
       ledgerRows.push({
-        seller_id:      sellerId,
+        seller_id: sellerId,
         transaction_id: transactionId,
-        type:           'reserve_hold',
-        amount:         reserveAmount,
-        currency:       'USD',
-        available_at:   reserveUntilISO,
-        status:         'hold',
-        created_at:     now,
+        type: 'reserve_hold',
+        amount: reserveAmount,
+        currency: 'USD',
+        available_at: reserveUntilISO,
+        status: 'hold',
+        created_at: now,
       })
     }
 
-    if (fee > 0) {
+    if (platformFee && platformFee.amount > 0) {
+      // Saída contábil do seller (registro do quanto saiu como fee)
       ledgerRows.push({
-        seller_id:      sellerId,
+        seller_id: sellerId,
         transaction_id: transactionId,
-        type:           'fee_platform',
-        amount:         fee,
-        currency:       'USD',
-        created_at:     now,
+        type: 'debit_platform_fee',
+        amount: platformFee.amount,
+        currency: 'USD',
+        created_at: now,
+        metadata: { platform_wallet_ref: platformFee.walletRef, partner: platformFee.partner },
+      })
+
+      // Entrada na wallet da plataforma — disponível imediatamente
+      ledgerRows.push({
+        seller_id: platformFee.walletRef,
+        transaction_id: transactionId,
+        type: 'credit_platform_fee',
+        amount: platformFee.amount,
+        currency: 'USD',
+        status: 'completed',
+        created_at: now,
+        metadata: { source_seller_id: sellerId, partner: platformFee.partner },
       })
     }
 
@@ -84,25 +106,25 @@ export class WalletService {
     if (externalFee && externalFee.amount > 0) {
       // Saída contábil do seller (o net já foi descontado antes no PaymentService)
       ledgerRows.push({
-        seller_id:      sellerId,
+        seller_id: sellerId,
         transaction_id: transactionId,
-        type:           'debit_external_fee',
-        amount:         externalFee.amount,
-        currency:       'USD',
-        created_at:     now,
-        metadata:       { recipient_id: externalFee.recipientId },
+        type: 'debit_external_fee',
+        amount: externalFee.amount,
+        currency: 'USD',
+        created_at: now,
+        metadata: { recipient_id: externalFee.recipientId },
       })
 
       // Entrada no recipient — disponível imediatamente (não segue D+3 do seller)
       ledgerRows.push({
-        seller_id:      externalFee.recipientId,
+        seller_id: externalFee.recipientId,
         transaction_id: transactionId,
-        type:           'credit_external_fee',
-        amount:         externalFee.amount,
-        currency:       'USD',
-        status:         'completed',
-        created_at:     now,
-        metadata:       { source_seller_id: sellerId },
+        type: 'credit_external_fee',
+        amount: externalFee.amount,
+        currency: 'USD',
+        status: 'completed',
+        created_at: now,
+        metadata: { source_seller_id: sellerId },
       })
     }
 
@@ -119,7 +141,7 @@ export class WalletService {
     // ── 2. Atualiza pending balance do seller ────────────────────────────────
     const { error: balanceError } = await supabase.rpc('add_pending_balance', {
       p_seller_id: sellerId,
-      p_amount:    amount,  
+      p_amount: amount,
     })
 
     if (balanceError) {
@@ -127,11 +149,27 @@ export class WalletService {
       throw new Error('Failed to update pending balance: ' + balanceError.message)
     }
 
+    if (platformFee && platformFee.amount > 0) {
+      const { error: platBalanceError } = await supabase.rpc('add_available_balance', {
+        p_seller_id: platformFee.walletRef,
+        p_amount: platformFee.amount,
+      })
+
+      if (platBalanceError) {
+        console.error(
+          '[WalletService] platform_fee balance error (reconciliation needed):',
+          platBalanceError,
+          { transactionId, partner: platformFee.partner, walletRef: platformFee.walletRef },
+        )
+      }
+    }
+
+
     // 🔥 3. Atualiza available balance do recipient (external_fee)
     if (externalFee && externalFee.amount > 0) {
       const { error: extBalanceError } = await supabase.rpc('add_available_balance', {
         p_seller_id: externalFee.recipientId,
-        p_amount:    externalFee.amount,  
+        p_amount: externalFee.amount,
       })
 
       if (extBalanceError) {
@@ -145,11 +183,11 @@ export class WalletService {
     }
 
     return {
-      success:            true,
-      availableAt:        availableAtISO,
-      reserveUntil:       reserveUntilISO,
+      success: true,
+      availableAt: availableAtISO,
+      reserveUntil: reserveUntilISO,
       reserveAmount,
-      pendingAmount:      amount,
+      pendingAmount: amount,
       externalFeeApplied: externalFee?.amount ?? 0,
     }
   }
@@ -161,9 +199,9 @@ export class WalletService {
     transactionId,
     amount,
   }: {
-    sellerId:      string
+    sellerId: string
     transactionId: string
-    amount:        number
+    amount: number
   }) {
     const { data: existing } = await supabase
       .from('wallet_ledger')
@@ -177,12 +215,12 @@ export class WalletService {
     const { error: insertError } = await supabase
       .from('wallet_ledger')
       .insert({
-        seller_id:      sellerId,
+        seller_id: sellerId,
         transaction_id: transactionId,
-        type:           'release_to_available',
+        type: 'release_to_available',
         amount,
-        currency:       'USD',
-        created_at:     new Date().toISOString(),
+        currency: 'USD',
+        created_at: new Date().toISOString(),
       })
 
     if (insertError) {
@@ -192,7 +230,7 @@ export class WalletService {
 
     const { error: balanceError } = await supabase.rpc('move_pending_to_available', {
       p_seller_id: sellerId,
-      p_amount:    amount,
+      p_amount: amount,
     })
 
     if (balanceError) {
@@ -211,7 +249,7 @@ export class WalletService {
     payoutId,
   }: {
     sellerId: string
-    amount:   number
+    amount: number
     payoutId: string
   }) {
     const balance = await this.getBalance(sellerId)
@@ -221,12 +259,12 @@ export class WalletService {
     }
 
     const { error } = await supabase.from('wallet_ledger').insert({
-      seller_id:      sellerId,
+      seller_id: sellerId,
       transaction_id: payoutId,
-      type:           'debit_payout',
+      type: 'debit_payout',
       amount,
-      currency:       'USD',
-      created_at:     new Date().toISOString(),
+      currency: 'USD',
+      created_at: new Date().toISOString(),
     })
 
     if (error) {
@@ -236,7 +274,7 @@ export class WalletService {
 
     const { error: balanceError } = await supabase.rpc('debit_available_balance', {
       p_seller_id: sellerId,
-      p_amount:    amount,
+      p_amount: amount,
       p_payout_id: payoutId,
     })
 

@@ -4,7 +4,19 @@
 
 import { supabase } from '../lib/supabase.client'
 
+// ─── Constantes ───────────────────────────────────────────────────────────────
+
+// Taxa adicional cobrada quando o método de pagamento é Klarna
+const KLARNA_EXTRA_FEE_PCT = 5
+
 // ─── Tipos ────────────────────────────────────────────────────────────────────
+
+export type PaymentMethod =
+  | 'CARD'
+  | 'PIX'
+  | 'BOLETO'
+  | 'KLARNA'
+  // adicione outros métodos conforme necessário
 
 export interface SellerFees {
   sellerId:           string
@@ -20,10 +32,12 @@ export interface SellerFees {
 export interface TransactionFeeResult {
   grossAmount:      number   // valor bruto (USD)
   platformFee:      number   // taxa da plataforma (% + fixo)
+  paymentMethodFee: number   // taxa adicional por método de pagamento (ex: Klarna)
   reserveAmount:    number   // valor retido como reserva
   netAmount:        number   // valor líquido para o seller
   availableAt:      Date     // data de disponibilização (D+settlementDays)
   reserveUntil:     Date     // data de liberação da reserva
+  paymentMethod:    PaymentMethod
   // Antecipação (se solicitada)
   anticipationFee?: number   // taxa cobrada pela antecipação
   netIfAnticipated?: number  // líquido caso antecipe
@@ -52,29 +66,49 @@ export async function getSellerFees(sellerId: string): Promise<SellerFees | null
   }
 }
 
+// ─── Retorna a taxa extra (%) cobrada por método de pagamento ─────────────────
+
+export function getPaymentMethodFeePct(method: PaymentMethod): number {
+  switch (method) {
+    case 'KLARNA': return KLARNA_EXTRA_FEE_PCT
+    default:       return 0
+  }
+}
+
 // ─── Calcula todas as taxas para uma transação ────────────────────────────────
 
 export function calculateFees(
   grossAmountUsd: number,
   fees: SellerFees,
-  options?: { anticipate?: boolean },
+  options?: {
+    anticipate?:    boolean
+    paymentMethod?: PaymentMethod
+  },
 ): TransactionFeeResult {
+
+  const paymentMethod = options?.paymentMethod ?? 'CARD'
 
   // Taxa da plataforma: % + fixo
   const platformFee =
     (grossAmountUsd * fees.feePercentage) / 100
     + fees.feeFixedUsd
 
-  // Valor após taxa da plataforma
-  const afterPlatformFee = grossAmountUsd - platformFee
+  // Taxa adicional por método de pagamento (ex: +5% para Klarna)
+  const paymentMethodFeePct = getPaymentMethodFeePct(paymentMethod)
+  const paymentMethodFee    = paymentMethodFeePct > 0
+    ? (grossAmountUsd * paymentMethodFeePct) / 100
+    : 0
 
-  // Reserva (% sobre o líquido após taxa)
+  // Valor após todas as taxas de processamento
+  const afterAllFees = grossAmountUsd - platformFee - paymentMethodFee
+
+  // Reserva (% sobre o líquido após taxas)
   const reserveAmount = fees.reservePercentage > 0
-    ? (afterPlatformFee * fees.reservePercentage) / 100
+    ? (afterAllFees * fees.reservePercentage) / 100
     : 0
 
   // Valor líquido disponível
-  const netAmount = afterPlatformFee - reserveAmount
+  const netAmount = afterAllFees - reserveAmount
 
   // Datas
   const now          = new Date()
@@ -93,35 +127,44 @@ export function calculateFees(
   }
 
   return {
-    grossAmount:     round(grossAmountUsd),
-    platformFee:     round(platformFee),
-    reserveAmount:   round(reserveAmount),
-    netAmount:       round(netAmount),
+    grossAmount:      round(grossAmountUsd),
+    platformFee:      round(platformFee),
+    paymentMethodFee: round(paymentMethodFee),
+    reserveAmount:    round(reserveAmount),
+    netAmount:        round(netAmount),
     availableAt,
     reserveUntil,
-    anticipationFee:     anticipationFee   !== undefined ? round(anticipationFee)   : undefined,
-    netIfAnticipated:    netIfAnticipated  !== undefined ? round(netIfAnticipated)  : undefined,
+    paymentMethod,
+    anticipationFee:  anticipationFee  !== undefined ? round(anticipationFee)  : undefined,
+    netIfAnticipated: netIfAnticipated !== undefined ? round(netIfAnticipated) : undefined,
   }
 }
 
 // ─── Calcula breakdown para exibição no frontend ──────────────────────────────
 
-export function feeBreakdown(grossUsd: number, fees: SellerFees) {
-  const result = calculateFees(grossUsd, fees)
+export function feeBreakdown(
+  grossUsd: number,
+  fees: SellerFees,
+  paymentMethod: PaymentMethod = 'CARD',
+) {
+  const result = calculateFees(grossUsd, fees, { paymentMethod })
   return {
-    grossAmount:       result.grossAmount,
-    platformFee:       result.platformFee,
-    platformFeePct:    fees.feePercentage,
-    platformFeeFixed:  fees.feeFixedUsd,
-    reserveAmount:     result.reserveAmount,
-    reservePct:        fees.reservePercentage,
-    netAmount:         result.netAmount,
-    settlementDays:    fees.settlementDays,
-    availableAt:       result.availableAt.toLocaleDateString('pt-BR'),
-    anticipationFee:   round((result.netAmount * fees.anticipationFeePct) / 100),
-    netIfAnticipated:  round(result.netAmount - (result.netAmount * fees.anticipationFeePct) / 100),
-    anticipationPct:   fees.anticipationFeePct,
-    riskLevel:         fees.riskLevel,
+    grossAmount:          result.grossAmount,
+    platformFee:          result.platformFee,
+    platformFeePct:       fees.feePercentage,
+    platformFeeFixed:     fees.feeFixedUsd,
+    paymentMethod:        result.paymentMethod,
+    paymentMethodFee:     result.paymentMethodFee,
+    paymentMethodFeePct:  getPaymentMethodFeePct(paymentMethod),
+    reserveAmount:        result.reserveAmount,
+    reservePct:           fees.reservePercentage,
+    netAmount:            result.netAmount,
+    settlementDays:       fees.settlementDays,
+    availableAt:          result.availableAt.toLocaleDateString('pt-BR'),
+    anticipationFee:      round((result.netAmount * fees.anticipationFeePct) / 100),
+    netIfAnticipated:     round(result.netAmount - (result.netAmount * fees.anticipationFeePct) / 100),
+    anticipationPct:      fees.anticipationFeePct,
+    riskLevel:            fees.riskLevel,
   }
 }
 

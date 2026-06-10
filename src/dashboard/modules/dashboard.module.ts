@@ -70,7 +70,7 @@ export class TransactionsModule {}
   providers:   [WalletService],
   exports:     [WalletService],   // exportado para PaymentModule usar creditPending()
 })
-export class WalletModule {}
+export class WalletDashModule {}
 
 // ============================================================
 // DISPUTES MODULE
@@ -118,7 +118,7 @@ export class SettingsModule {}
 
 @Module({
   imports: [
-    WalletModule,
+    WalletDashModule,
     CurrencyModule,
     CryptoModule,
   ],

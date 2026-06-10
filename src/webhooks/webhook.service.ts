@@ -16,6 +16,8 @@ export class WebhookService {
 
   async handleWebhookProvider(body: any) {
 
+    console.log(body);
+
     const transactionId = body?.reference
       ?? body.data?.reference
       ?? null
@@ -28,12 +30,8 @@ export class WebhookService {
       ?? body.data?.type
       ?? null
 
-    const method = body?.method?.toLowerCase()
-      ?? body?.method?.toLowerCase()
-      ?? null
 
-    const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-    if (!transactionId || !UUID_REGEX.test(transactionId)) {
+    if (!transactionId) {
       console.warn('[WebhookService] transactionId inválido:', transactionId)
       return { ignored: true, reason: 'invalid transactionId' }
     }
@@ -50,11 +48,10 @@ export class WebhookService {
     // ── Pagamento aprovado ────────────────────────────────────────────────
     if (status === 'PAID' && type === 'TRANSACTION') {
 
-      const { data: updated, error: updateError } = await supabase
+      const { error: updateError } = await supabase
         .from('transactions')
         .update({
           status: 'approved',
-          method: method || tx.method,
           provider_status: 'completed',
           approved_at: now,
           processed_at: now,
@@ -71,10 +68,6 @@ export class WebhookService {
         throw updateError
       }
 
-      if (!updated || updated.length === 0) {
-        return { alreadyProcessed: true }
-      }
-
       // ── Side effects ─────────────────────────────────────────────────
 
       // 1) Crédito pendente na wallet (com external_fee se houver)
@@ -87,9 +80,16 @@ export class WebhookService {
         availableAt: tx.available_at,
         reserveUntil: tx.reserve_until,
         externalFee: tx.external_fee_cents
+          ? { amount: tx.external_fee_cents, recipientId: tx.external_fee_recipient_id }
+          : null,
+        // 🔥 NOVO
+        platformFee: tx.fee > 0 && tx.platform_partner
           ? {
-            amount: tx.external_fee_cents,
-            recipientId: tx.external_fee_recipient_id,
+            amount: tx.fee,
+            walletRef: tx.platform_partner === 'koopfy'
+              ? process.env.KOOPFY_PLATFORM_WALLET_REF!
+              : process.env.NEXOR_PLATFORM_WALLET_REF!,
+            partner: tx.platform_partner,
           }
           : null,
       })
@@ -116,10 +116,10 @@ export class WebhookService {
       // 3) KPI de aprovação (seller principal)
       const { error: kpiError } = await supabase.rpc('increment_kpi_safe', {
         p_seller_id: tx.seller_id,
-        p_method: method || tx.method,
         p_amount: tx.amount_usd_net_cents,
         p_fee: tx.fee ?? 0,
         p_status: 'approved',
+        p_method: tx.method,
       })
       if (kpiError) console.error('[WebhookService] KPI error:', kpiError)
 
@@ -146,7 +146,6 @@ export class WebhookService {
         amountUsd: tx.amount_usd_net_cents,
         netAmount: tx.net_amount,
         fee: tx.fee,
-        method: method || tx.method,
         availableAt: tx.available_at,
         ...(tx.external_fee_cents
           ? {
@@ -166,16 +165,14 @@ export class WebhookService {
       const { data: updated, error: updateError } = await supabase
         .from('transactions')
         .update({
-          status: 'requires_action',
+          status: 'pending',
           provider_status: 'pending',
-          method: method || tx.method,
-          pending_at: now,
           webhook_sent: true,
           last_webhook_at: now,
           updated_at: new Date(),
         })
         .eq('id', tx.id)
-        .not('status', 'in', '(approved,requires_action)')
+        .not('status', 'in', '(approved)')
         .select()
 
       if (updateError) {
@@ -201,7 +198,6 @@ export class WebhookService {
         .update({
           status: 'failed',
           provider_status: 'failed',
-          method: method || tx.method,
           failure_code: failureCode,
           failure_message: failureMessage,
           error_message: failureMessage,
@@ -226,10 +222,11 @@ export class WebhookService {
 
       const { error: kpiError } = await supabase.rpc('increment_kpi_safe', {
         p_seller_id: tx.seller_id,
-        p_method: method || tx.method,
         p_amount: tx.amount_usd_net_cents,
         p_fee: 0,
         p_status: 'failed',
+        p_method: tx.method,
+
       })
       if (kpiError) console.error('[WebhookService] KPI error:', kpiError)
 
@@ -241,7 +238,6 @@ export class WebhookService {
         transactionId: tx.id,
         amount: tx.amount,
         currency: tx.currency,
-        method: method || tx.method,
         failureCode,
         failureMessage,
       })
