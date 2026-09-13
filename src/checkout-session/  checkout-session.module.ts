@@ -3,7 +3,7 @@
 import { Module } from '@nestjs/common';
 import { CheckoutSessionController } from './  checkout-session.controller';
 import { CheckoutService } from './  checkout-session.service';
-import { AccountRouterService } from '../orchestrator/router/account-router.service';
+import { PaymentModule } from '../payments/payments.module';
 import { OrchestratorModule } from '../orchestrator/orchestrator.module';
 
 @Module({
@@ -11,6 +11,6 @@ import { OrchestratorModule } from '../orchestrator/orchestrator.module';
   providers: [
     CheckoutService,
   ],
-  imports: [OrchestratorModule]
+  imports: [OrchestratorModule, PaymentModule]
 })
 export class CheckoutModule {}

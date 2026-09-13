@@ -45,16 +45,16 @@ class OfferDto {
     @IsUrl({}, { message: 'URL da página de vendas inválida' })
     salesPageUrl!: string;
 
-    @IsIn(['WHITE', 'GRAY', 'BLACK'])
-    riskLevel!: 'WHITE' | 'GRAY' | 'BLACK';
+    @IsIn(['WHITE', 'GRAY'])
+    riskLevel!: 'WHITE' | 'GRAY';
 }
 
 export class OperationDto {
     @IsOptional() @IsString() @MaxLength(1000)
     description: string;
 
-    @IsIn(['WHITE', 'GRAY', 'BLACK'])
-    overallRiskLevel!: 'WHITE' | 'GRAY' | 'BLACK';
+    @IsIn(['WHITE', 'GRAY'])
+    overallRiskLevel!: 'WHITE' | 'GRAY';
 
     @IsBoolean()
     termsAccepted!: boolean;
@@ -66,4 +66,39 @@ export class OperationDto {
     @ValidateNested({ each: true })
     @Type(() => OfferDto)
     offers!: OfferDto[];
+}
+
+// ─── DOCUMENTOS ───────────────────────────────────────────────────────────────
+export class DocumentFileDto {
+    @IsString() @IsNotEmpty()
+    base64!: string;
+
+    @IsString() @IsNotEmpty()
+    mime!: string;
+
+    @IsOptional() @IsString() @MaxLength(255)
+    name?: string;
+}
+
+export class DocumentsDto {
+    @IsIn(['BR', 'US'])
+    companyType!: 'BR' | 'US';
+
+    // BR
+    @IsOptional() @ValidateNested() @Type(() => DocumentFileDto)
+    contratoSocial?: DocumentFileDto;
+
+    @IsOptional() @ValidateNested() @Type(() => DocumentFileDto)
+    cartaoCnpj?: DocumentFileDto;
+
+    // US
+    @IsOptional() @ValidateNested() @Type(() => DocumentFileDto)
+    einDocument?: DocumentFileDto;
+
+    // Sempre
+    @ValidateNested() @Type(() => DocumentFileDto)
+    identityDocument!: DocumentFileDto;
+
+    @ValidateNested() @Type(() => DocumentFileDto)
+    proofOfResidence!: DocumentFileDto;
 }

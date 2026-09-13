@@ -4,20 +4,126 @@ import {
 } from '@nestjs/common'
 import { JwtService } from '@nestjs/jwt'
 import { supabase } from '../lib/supabase.client'
+import { StorageService } from '../lib/storage.service'
+import { CryptoService } from '../crypto/crypto.service'
+import { WhopAccountsService } from '../orchestrator/whop/whop-accounts.service'
+import { WhopProvider } from '../orchestrator/providers/whop.provider'
+import { ClipAccountsService } from '../orchestrator/clip/clip-accounts.service'
+import { WebhookService } from '../webhooks/webhook.service'
 import * as bcrypt from 'bcrypt'
 
 const FEE_TABLE = {
-  WHITE: { fee_percentage: 9.99, fee_fixed_usd: 0.30, settlement_days: 3, reserve_percentage: 5.00, reserve_hold_days: 90, anticipation_fee_pct: 4.99 },
-  GRAY: { fee_percentage: 14.99, fee_fixed_usd: 0.30, settlement_days: 3, reserve_percentage: 0.00, reserve_hold_days: 0, anticipation_fee_pct: 4.99 },
-  BLACK: { fee_percentage: 24.99, fee_fixed_usd: 0.30, settlement_days: 3, reserve_percentage: 0.00, reserve_hold_days: 0, anticipation_fee_pct: 4.99 },
+  WHITE: { fee_percentage: 9.99, fee_fixed_usd: 0.59, settlement_days: 3, reserve_percentage: 10.00, reserve_hold_days: 90, anticipation_fee_pct: 4.99 },
+  GRAY: { fee_percentage: 14.99, fee_fixed_usd: 0.59, settlement_days: 3, reserve_percentage: 10.00, reserve_hold_days: 90, anticipation_fee_pct: 4.99 },
 } as const
 
-const VALID_PROVIDERS = ['stripe', 'viva', 'sibs', 'stripe_crypto', 'onramp'] as const
+const VALID_PROVIDERS = ['stripe', 'viva', 'sibs', 'stripe_crypto', 'onramp', 'setinel_gate', 'approvebly', 'coinflow', 'rox_pay', 'whop', 'clip', 'simulator'] as const
 type ProviderDefault = typeof VALID_PROVIDERS[number] | null
+
+/** Hosts de WhatsApp aceitos no grupo da operação logística. */
+const WHATSAPP_HOSTS = ['chat.whatsapp.com', 'wa.me', 'api.whatsapp.com', 'web.whatsapp.com']
+
+// ─── Canal interno com o checkout ─────────────────────────────────────────────
+//
+// A esteira logística (produtos, fila, carteira do parceiro) vive no banco do
+// CHECKOUT. O CRM é a TELA onde o gestor decide, mas não é o dono do dado —
+// guardar aqui obrigaria o painel da DSB a uma chamada cross-service por linha.
+//
+// Por isso: o CRM grava lá, via segredo compartilhado.
+
+const CHECKOUT_API_BASE = process.env.CHECKOUT_API_BASE ?? 'http://127.0.0.1:3006'
+const CHECKOUT_INTERNAL_KEY = process.env.CHECKOUT_INTERNAL_KEY ?? ''
+
+// Último motivo REAL de falha, para a tela não culpar a chave quando o problema
+// é outro. O helper continua devolvendo null (as telas do CRM não podem cair
+// quando o checkout oscila), mas agora dá pra dizer o que aconteceu.
+let lastCheckoutFailure: string | null = null
+
+/** Mensagem de erro que aponta a causa provável, não um palpite fixo. */
+function checkoutFailureMessage(acao: string): string {
+  const causa = lastCheckoutFailure ?? 'motivo desconhecido'
+  return `Não foi possível ${acao}: ${causa} (checkout em ${CHECKOUT_API_BASE}).`
+}
+
+async function checkoutInternal<T>(path: string, body?: any): Promise<T | null> {
+  if (!CHECKOUT_INTERNAL_KEY) {
+    lastCheckoutFailure = 'CHECKOUT_INTERNAL_KEY não configurada no serviço de pagamentos'
+    console.error('[CrmService] CHECKOUT_INTERNAL_KEY não configurada')
+    return null
+  }
+  try {
+    const res = await fetch(`${CHECKOUT_API_BASE}/internal/${path}`, {
+      method: body === undefined ? 'GET' : 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-internal-key': CHECKOUT_INTERNAL_KEY,
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(8000),
+    })
+    if (!res.ok) {
+      const corpo = await res.text()
+      lastCheckoutFailure = res.status === 401 || res.status === 403
+        ? `o checkout recusou a chave interna (HTTP ${res.status}) — confira CHECKOUT_INTERNAL_KEY aqui e INTERNAL_API_KEY lá`
+        : `o checkout respondeu HTTP ${res.status}`
+      console.error(`[CrmService] checkout ${path}: ${res.status} ${corpo}`)
+      return null
+    }
+    lastCheckoutFailure = null
+    return (await res.json()) as T
+  } catch (e: any) {
+    // Falha de comunicação não pode derrubar a ficha do seller no CRM.
+    const msg = String(e?.message ?? e)
+    lastCheckoutFailure = /timeout|abort/i.test(msg)
+      ? 'o checkout não respondeu a tempo (8s)'
+      : `não foi possível conectar ao checkout (${msg})`
+    console.error(`[CrmService] checkout ${path}:`, msg)
+    return null
+  }
+}
+
+/**
+ * Valida e normaliza a URL do grupo logístico.
+ *
+ * Vazio/nulo → null (remove o vínculo). Qualquer outra coisa precisa ser uma
+ * URL https de WhatsApp: a URL vai para o dash do seller, que a abre numa aba
+ * nova — deixar passar um host arbitrário aqui viraria redirect aberto.
+ */
+function normalizeWhatsappUrl(raw?: string | null): string | null {
+  const value = (raw ?? '').trim()
+  if (!value) return null
+
+  let parsed: URL
+  try {
+    parsed = new URL(value)
+  } catch {
+    throw new BadRequestException('URL do grupo inválida.')
+  }
+
+  if (parsed.protocol !== 'https:') {
+    throw new BadRequestException('A URL do grupo precisa ser https.')
+  }
+
+  const host = parsed.hostname.replace(/^www\./, '')
+  if (!WHATSAPP_HOSTS.includes(host)) {
+    throw new BadRequestException(
+      `A URL do grupo precisa ser do WhatsApp (${WHATSAPP_HOSTS.join(', ')}).`,
+    )
+  }
+
+  return parsed.toString()
+}
 
 @Injectable()
 export class CrmService {
-  constructor(private readonly jwtService: JwtService) { }
+  constructor(
+    private readonly jwtService: JwtService,
+    private readonly storageService: StorageService,
+    private readonly crypto: CryptoService,
+    private readonly whopAccounts: WhopAccountsService,
+    private readonly clipAccounts: ClipAccountsService,
+    private readonly webhookService: WebhookService,
+  ) { }
 
   // =========================================
   // AUTH
@@ -177,14 +283,14 @@ export class CrmService {
 
     if (!seller) throw new NotFoundException('Seller não encontrado')
 
-    // 🔥 Busca user_id separado para o KYC
+    // 🔥 Busca user_id separado para o KYC + provider_mid + config (não vem na view)
     const { data: sp } = await supabase
       .from('seller_profiles')
-      .select('user_id')
+      .select('user_id, provider_mid, config')
       .eq('id', sellerId)
       .single()
 
-    const [offersRes, feesRes, notesRes, logRes, kycRes] = await Promise.all([
+    const [offersRes, feesRes, notesRes, logRes, kycRes, docsRes] = await Promise.all([
       supabase.from('offers').select('*').eq('seller_id', sellerId).order('created_at', { ascending: false }),
       supabase.from('seller_fees').select('*').eq('seller_id', sellerId).maybeSingle(),
       supabase.from('crm_notes').select('*, crm_managers(name, avatar_url)').eq('seller_id', sellerId).order('is_pinned', { ascending: false }).order('created_at', { ascending: false }),
@@ -192,15 +298,60 @@ export class CrmService {
       sp?.user_id
         ? supabase.from('kyc_info').select('*').eq('user_id', sp.user_id).maybeSingle()
         : Promise.resolve({ data: null }),
+      sp?.user_id
+        ? supabase.from('seller_documents').select('*').eq('user_id', sp.user_id).maybeSingle()
+        : Promise.resolve({ data: null }),
     ])
 
     return {
-      seller,
+      seller: {
+        ...seller,
+        provider_mid: sp?.provider_mid ?? null,
+        // merchantId da Coinflow (guardado em config) — usado no dialog do CRM.
+        coinflow_merchant_id: sp?.config?.coinflow_merchant_id ?? null,
+        // Store Reference da Rox Pay (guardado em config) — usado no dialog do CRM.
+        rox_pay_store_reference: sp?.config?.rox_pay_store_reference ?? null,
+        // Grupo de WhatsApp da operação logística deste merchant — o dash do
+        // seller usa no botão "Solicitar Homologação" da tela de Produtos.
+        logistics_group_url: sp?.config?.logistics_group_url ?? null,
+        logistics_partner: sp?.config?.logistics_partner ?? null,
+      },
       offers: offersRes.data ?? [],
       fees: feesRes.data,
       notes: notesRes.data ?? [],
       log: logRes.data ?? [],
       kyc: kycRes.data,
+      documents: await this.buildDocumentsPayload(docsRes.data),
+    }
+  }
+
+  // Monta a resposta de documentos com signed URLs (bucket privado).
+  private async buildDocumentsPayload(doc: any) {
+    if (!doc) return null
+
+    const [
+      contrato_social_url,
+      cartao_cnpj_url,
+      ein_document_url,
+      identity_document_url,
+      proof_of_residence_url,
+    ] = await Promise.all([
+      this.storageService.getSignedDocumentUrl(doc.contrato_social_path),
+      this.storageService.getSignedDocumentUrl(doc.cartao_cnpj_path),
+      this.storageService.getSignedDocumentUrl(doc.ein_document_path),
+      this.storageService.getSignedDocumentUrl(doc.identity_document_path),
+      this.storageService.getSignedDocumentUrl(doc.proof_of_residence_path),
+    ])
+
+    return {
+      company_type:  doc.company_type,
+      review_status: doc.review_status,
+      submitted_at:  doc.submitted_at,
+      contrato_social_url,
+      cartao_cnpj_url,
+      ein_document_url,
+      identity_document_url,
+      proof_of_residence_url,
     }
   }
 
@@ -278,17 +429,25 @@ export class CrmService {
       anticipation_fee_pct?: number
     }
     notes?: string
+    /**
+     * Grupo de WhatsApp da operação logística deste merchant. O grupo já existe
+     * quando o merchant é aprovado, então capturamos a URL aqui — é o momento
+     * natural. Editável depois em PATCH sellers/:id/logistics-group.
+     */
+    logisticsGroupUrl?: string | null
   }) {
     await this.assertAssigned(sellerId, managerId)
 
     const { data: seller, error: sellerError } = await supabase
       .from('seller_profiles')
-      .select('user_id, status')
+      .select('user_id, status, config')
       .eq('id', sellerId)
       .single()
 
     if (sellerError || !seller) throw new NotFoundException('Seller não encontrado')
     if (seller.status === 'active') throw new BadRequestException('Seller já está ativo')
+
+    const logisticsGroupUrl = normalizeWhatsappUrl(dto.logisticsGroupUrl)
 
     const baseFees = FEE_TABLE[dto.riskLevel]
     const fees = { ...baseFees, ...(dto.feeOverride ?? {}) }
@@ -303,6 +462,11 @@ export class CrmService {
         reviewed_at: new Date(),
         reviewed_by: managerId,
         rejection_reason: null,
+        // Só toca em `config` se veio URL — aprovar sem informar o grupo não
+        // apaga um valor que já estivesse lá.
+        ...(logisticsGroupUrl
+          ? { config: { ...(seller.config ?? {}), logistics_group_url: logisticsGroupUrl } }
+          : {}),
       })
       .eq('id', sellerId)
 
@@ -350,9 +514,130 @@ export class CrmService {
       enabledMethods: dto.enabledMethods,
       feeOverride: dto.feeOverride,
       notes: dto.notes,
+      logisticsGroupUrl,
     })
 
-    return { message: 'Seller aprovado', fees }
+    return { message: 'Seller aprovado', fees, logisticsGroupUrl }
+  }
+
+  // =========================================
+  // GRUPO DA OPERAÇÃO LOGÍSTICA
+  // =========================================
+  //
+  // URL do grupo/conversa de WhatsApp por onde este merchant fala com a
+  // operação logística. Fica em `config` (jsonb), mesmo lugar de
+  // coinflow_merchant_id e rox_pay_store_reference.
+  //
+  // O dash do seller lê isto via /integration/koopfy/logistics-channel e usa no
+  // botão "Solicitar Homologação" da tela de Produtos.
+
+  async updateLogisticsGroup(
+    sellerId: string,
+    managerId: string,
+    dto: { url?: string | null; notes?: string; partner?: string | null },
+  ) {
+    await this.assertAssigned(sellerId, managerId)
+
+    const { data: current } = await supabase
+      .from('seller_profiles')
+      .select('config, email')
+      .eq('id', sellerId)
+      .single()
+
+    if (!current) throw new NotFoundException('Seller não encontrado')
+
+    const url = dto.url === undefined ? undefined : normalizeWhatsappUrl(dto.url)
+
+    // A fonte da verdade é o CHECKOUT — é lá que a esteira consulta. O `config`
+    // daqui vira só eco, para a ficha do CRM não depender de round-trip.
+    const applied = await checkoutInternal<{ workspaceId: string }>('logistics/assign', {
+      email: current.email,
+      ...(url !== undefined ? { groupUrl: url } : {}),
+      ...(dto.partner !== undefined ? { partner: dto.partner } : {}),
+    })
+
+    if (!applied) {
+      throw new BadRequestException(checkoutFailureMessage('gravar a logística no checkout'))
+    }
+
+    const config = { ...(current.config ?? {}) }
+    if (url !== undefined) {
+      if (url) config.logistics_group_url = url
+      else delete config.logistics_group_url
+    }
+    if (dto.partner !== undefined) {
+      if (dto.partner) config.logistics_partner = dto.partner
+      else delete config.logistics_partner
+    }
+
+    await supabase.from('seller_profiles').update({ config }).eq('id', sellerId)
+
+    await this.log(sellerId, managerId, 'logistics_group_changed', {
+      from: {
+        url: current.config?.logistics_group_url ?? null,
+        partner: current.config?.logistics_partner ?? null,
+      },
+      to: { url: url ?? null, partner: dto.partner ?? null },
+      notes: dto.notes,
+    })
+
+    return { message: 'Logística atualizada', url, partner: dto.partner }
+  }
+
+  // =========================================
+  // RADAR DE RISCO DE CHARGEBACK
+  // =========================================
+  //
+  // Os pedidos vivem no checkout. O CRM é a tela onde o time de risco trabalha,
+  // ao lado de chargebacks e disputas — uma chamada por página, não por linha.
+
+  async listOrderRisk(params: {
+    page?: number; level?: string; workspaceId?: string; search?: string; since?: string
+  }) {
+    const qs = new URLSearchParams()
+    if (params.page) qs.set('page', String(params.page))
+    if (params.level && params.level !== 'all') qs.set('level', params.level)
+    if (params.workspaceId) qs.set('workspaceId', params.workspaceId)
+    if (params.search) qs.set('search', params.search)
+    if (params.since) qs.set('since', params.since)
+
+    const res = await checkoutInternal<any>(`orders/risk?${qs.toString()}`)
+    if (!res) {
+      throw new BadRequestException(checkoutFailureMessage('consultar os pedidos'))
+    }
+    return res
+  }
+
+  async getOrderRisk(orderId: string) {
+    const res = await checkoutInternal<any>(`orders/risk/${orderId}`)
+    if (!res) throw new NotFoundException('Pedido não encontrado.')
+    return res
+  }
+
+  /**
+   * Dispara a notificação faltante de um pedido.
+   *
+   * O checkout é idempotente: se o email já saiu, devolve `skipped`. O CRM
+   * repassa a resposta crua para a tela dizer a verdade ao gestor.
+   */
+  async notifyOrder(orderId: string, managerId: string, type: 'confirmation' | 'tracking') {
+    const res = await checkoutInternal<any>(`orders/risk/${orderId}/notify`, { type })
+    if (!res) throw new BadRequestException('Não foi possível acionar o envio no checkout.')
+
+    await supabase.from('crm_action_log').insert({
+      seller_id: null,
+      manager_id: managerId,
+      action: 'order_notification_sent',
+      metadata: { orderId, type, result: res },
+    })
+
+    return res
+  }
+
+  /** Catálogo de parceiros logísticos — alimenta o seletor do CRM. */
+  async listLogisticsPartners() {
+    const res = await checkoutInternal<{ partners: any[] }>('logistics/partners')
+    return { partners: res?.partners ?? [] }
   }
 
   // =========================================
@@ -656,5 +941,618 @@ export class CrmService {
     return { message: 'Provider atualizado', provider: dto.provider }
   }
 
+  // =========================================
+  // WHOP — pool de contas
+  // -----------------------------------------
+  // Diferente do Sentinel/Coinflow/Rox, a Whop NÃO tem "conta do seller": o
+  // seller aponta pra `whop` e o AccountRouter escolhe a company a cada pedido
+  // (déficit + tetos + saúde), fixando-a por pedido. Por isso o CRM administra o
+  // POOL, não uma associação seller→conta. Setar um MID aqui seria justamente
+  // desligar a divisão de volume que é o motivo da integração existir.
+  // =========================================
+
+  // Lista o pool com o volume do dia — sem segredos.
+  async listWhopAccounts() {
+    const { data, error } = await supabase
+      .from('whop_accounts')
+      .select(
+        'id, label, company_id, product_id, status, weight, currency, countries, country, ' +
+        'daily_cap_amount, min_ticket, max_ticket, cooldown_until, legal_name, descriptor, ' +
+        'webhook_id, created_at',
+      )
+      .order('created_at', { ascending: false })
+
+    if (error) throw new BadRequestException('Erro ao listar contas Whop: ' + error.message)
+
+    // `whop_accounts` não está nos tipos gerados do Supabase — cast explícito.
+    const rows = (data ?? []) as unknown as Array<Record<string, any>>
+    if (rows.length === 0) return []
+
+    // Volume de HOJE por conta — é o que diz se o split está saindo como
+    // configurado. Sem isso o gestor mexe no weight às cegas.
+    const day = new Date().toISOString().slice(0, 10)
+    const { data: metrics } = await supabase
+      .from('account_daily_metrics')
+      .select('account_id, volume, paid_count')
+      .in('account_id', rows.map(r => r.id))
+      .eq('day', day)
+
+    const byId = new Map((metrics ?? []).map(m => [m.account_id, m]))
+
+    return rows.map(r => ({
+      ...r,
+      // Segredos nunca saem daqui — só o fato de existirem.
+      has_api_key: true,
+      has_webhook_secret: Boolean(r.webhook_id),
+      today_volume_usd_cents: Number(byId.get(r.id)?.volume ?? 0),
+      today_paid_count: Number(byId.get(r.id)?.paid_count ?? 0),
+    }))
+  }
+
+  // Provisiona uma conta nova a partir da API KEY, e só dela.
+  //
+  // O que uma company precisa pra entrar no pool é: company_id, credencial e
+  // webhook com segredo. Os três saem da própria chave:
+  //   • company_id  → GET /api/v5/company (a chave já está amarrada a uma)
+  //   • webhook     → POST /api/v1/webhooks com a URL /webhook/whop/<id>
+  //   • segredo     → vem na resposta do webhook
+  //
+  // Produto NÃO é necessário: o plano inline usa `external_identifier`, que
+  // deduplica — N compras viram N planos sob UM produto, criado na primeira.
+  //
+  // Isto existe porque cadastrar company_id e colar `ws_...` na mão, vezes N
+  // titulares, é onde se erra — e webhook errado só aparece horas depois, como
+  // "pagamento que não confirma".
+  async provisionWhopAccount(managerId: string, dto: {
+    id: string
+    apiKey: string
+    label?: string
+    weight?: number
+    dailyCapAmount?: number | null
+    legalName?: string
+  }) {
+    if (!dto.id?.trim() || !dto.apiKey?.trim()) {
+      throw new BadRequestException('id e apiKey são obrigatórios.')
+    }
+
+    const provider = new WhopProvider()
+
+    let company: { id: string; title: string | null }
+    try {
+      company = await provider.discoverCompany(dto.apiKey.trim())
+    } catch (e: any) {
+      throw new BadRequestException(`Chave inválida ou sem permissão: ${e?.message ?? 'erro'}`)
+    }
+
+    let webhook: { webhookId: string; webhookSecret: string }
+    try {
+      webhook = await provider.registerWebhook({
+        apiKey: dto.apiKey.trim(),
+        companyId: company.id,
+        accountId: dto.id.trim(),
+      })
+    } catch (e: any) {
+      // Sem webhook a conta cobraria e nunca confirmaria — não vale gravar
+      // "meio provisionada" e deixar alguém ativá-la sem perceber.
+      throw new BadRequestException(`Conta não provisionada — falha ao registrar o webhook: ${e?.message ?? 'erro'}`)
+    }
+
+    await this.upsertWhopAccount(managerId, {
+      id: dto.id.trim(),
+      label: dto.label ?? company.title ?? undefined,
+      companyId: company.id,
+      apiKey: dto.apiKey.trim(),
+      webhookSecret: webhook.webhookSecret,
+      webhookId: webhook.webhookId,
+      weight: dto.weight,
+      dailyCapAmount: dto.dailyCapAmount ?? null,
+      legalName: dto.legalName,
+      // Entra FORA do pool. Conta nova recebendo volume no primeiro minuto é o
+      // caminho mais curto pra revisão — quem ativa é uma decisão humana.
+      status: 'inactive',
+    })
+
+    return {
+      message: 'Conta provisionada',
+      id: dto.id.trim(),
+      company_id: company.id,
+      company_title: company.title,
+      webhook_id: webhook.webhookId,
+    }
+  }
+
+  // Cria/atualiza uma conta do pool (admin). Upsert por id.
+  //
+  // Credenciais só são gravadas quando enviadas — assim dá pra editar peso e
+  // teto sem ter que recolar a API key (e sem apagá-la por omissão).
+  async upsertWhopAccount(managerId: string, dto: {
+    id: string
+    label?: string
+    companyId: string
+    productId?: string
+    apiKey?: string
+    webhookSecret?: string
+    webhookId?: string
+    apiUrl?: string
+    status?: 'active' | 'inactive'
+    weight?: number
+    currency?: string
+    countries?: string[]
+    country?: string
+    dailyCapAmount?: number | null
+    minTicket?: number | null
+    maxTicket?: number | null
+    legalName?: string
+    descriptor?: string
+  }) {
+    if (!dto.id || !dto.companyId) {
+      throw new BadRequestException('id e companyId são obrigatórios.')
+    }
+
+    const { data: current } = await supabase
+      .from('whop_accounts').select('id').eq('id', dto.id).maybeSingle()
+
+    if (!current && !dto.apiKey) {
+      throw new BadRequestException('apiKey é obrigatória ao criar uma conta Whop.')
+    }
+
+    const row: Record<string, any> = {
+      id: dto.id,
+      label: dto.label ?? null,
+      company_id: dto.companyId,
+      product_id: dto.productId ?? null,
+      api_url: dto.apiUrl ?? null,
+      status: dto.status ?? (current ? undefined : 'inactive'),
+      weight: dto.weight ?? undefined,
+      currency: dto.currency ?? null,
+      countries: dto.countries ?? null,
+      country: dto.country ?? null,
+      daily_cap_amount: dto.dailyCapAmount ?? null,
+      min_ticket: dto.minTicket ?? null,
+      max_ticket: dto.maxTicket ?? null,
+      legal_name: dto.legalName ?? null,
+      descriptor: dto.descriptor ?? null,
+      updated_at: new Date().toISOString(),
+    }
+
+    // Cifradas em repouso — o WhopAccountsService decifra na leitura.
+    if (dto.apiKey) row.api_key = this.crypto.encrypt(dto.apiKey)
+    if (dto.webhookSecret) row.webhook_secret = this.crypto.encrypt(dto.webhookSecret)
+    if (dto.webhookId) row.webhook_id = dto.webhookId
+
+    for (const k of Object.keys(row)) if (row[k] === undefined) delete row[k]
+
+    const { error } = await supabase
+      .from('whop_accounts')
+      .upsert(row, { onConflict: 'id' })
+
+    if (error) throw new BadRequestException('Erro ao salvar conta Whop: ' + error.message)
+
+    this.whopAccounts.invalidate()
+
+    await this.log(null as any, managerId, 'whop_account_upserted', {
+      account_id: dto.id,
+      created: !current,
+      // Nunca logar credencial — só se veio.
+      credentials_updated: Boolean(dto.apiKey || dto.webhookSecret),
+    })
+
+    return { message: 'Conta Whop salva', id: dto.id }
+  }
+
+  // Controles operacionais: é isto que precisa ser instantâneo quando uma conta
+  // começa a dar problema. Por isso invalida o cache do pool na hora, em vez de
+  // esperar o TTL de 30s do WhopAccountsService.
+  async updateWhopAccountRouting(id: string, managerId: string, dto: {
+    status?: 'active' | 'inactive'
+    weight?: number
+    dailyCapAmount?: number | null
+    minTicket?: number | null
+    maxTicket?: number | null
+    cooldownUntil?: string | null
+    notes?: string
+  }) {
+    const { data: current } = await supabase
+      .from('whop_accounts')
+      .select('status, weight, daily_cap_amount, min_ticket, max_ticket, cooldown_until')
+      .eq('id', id).maybeSingle()
+
+    if (!current) throw new NotFoundException('Conta Whop não encontrada')
+
+    const patch: Record<string, any> = { updated_at: new Date().toISOString() }
+    if (dto.status !== undefined) patch.status = dto.status
+    if (dto.weight !== undefined) patch.weight = dto.weight
+    if (dto.dailyCapAmount !== undefined) patch.daily_cap_amount = dto.dailyCapAmount
+    if (dto.minTicket !== undefined) patch.min_ticket = dto.minTicket
+    if (dto.maxTicket !== undefined) patch.max_ticket = dto.maxTicket
+    if (dto.cooldownUntil !== undefined) patch.cooldown_until = dto.cooldownUntil
+
+    const { error } = await supabase.from('whop_accounts').update(patch).eq('id', id)
+    if (error) throw new BadRequestException('Erro ao atualizar conta Whop: ' + error.message)
+
+    this.whopAccounts.invalidate()
+
+    await this.log(null as any, managerId, 'whop_account_routing_changed', {
+      account_id: id, from: current, to: patch, notes: dto.notes,
+    })
+
+    return { message: 'Conta Whop atualizada', id }
+  }
+
+  // =========================================
+  // SENTINEL — MIDs
+  // =========================================
+
+  // Lista os MIDs do Sentinel disponíveis (sem expor segredos) p/ o CRM
+  // escolher qual atribuir ao seller.
+  async listSentinelMids() {
+    const { data, error } = await supabase
+      .from('sentinel_mids')
+      .select('mid, label, api_url, status, created_at')
+      .order('created_at', { ascending: false })
+
+    if (error) throw new BadRequestException('Erro ao listar MIDs: ' + error.message)
+    return data ?? []
+  }
+
+  // Registra/atualiza um MID e suas credenciais (admin). Upsert por mid.
+  async upsertSentinelMid(managerId: string, dto: {
+    mid: string
+    label?: string
+    apiKey: string
+    apiSecret: string
+    mbwayApiKey?: string
+    apiUrl?: string
+    status?: 'active' | 'inactive'
+  }) {
+    if (!dto.mid || !dto.apiKey || !dto.apiSecret) {
+      throw new BadRequestException('mid, apiKey e apiSecret são obrigatórios.')
+    }
+
+    const { error } = await supabase
+      .from('sentinel_mids')
+      .upsert({
+        mid: dto.mid,
+        label: dto.label ?? null,
+        api_key: dto.apiKey,
+        api_secret: dto.apiSecret,
+        mbway_api_key: dto.mbwayApiKey ?? null,
+        api_url: dto.apiUrl ?? null,
+        status: dto.status ?? 'active',
+      }, { onConflict: 'mid' })
+
+    if (error) throw new BadRequestException('Erro ao salvar MID: ' + error.message)
+
+    return { message: 'MID salvo', mid: dto.mid }
+  }
+
+  // Atribui um MID do Sentinel ao seller (ou limpa com null → usa env default).
+  async updateSellerMid(sellerId: string, managerId: string, dto: {
+    mid: string | null
+    notes?: string
+  }) {
+    const { data: current } = await supabase
+      .from('seller_profiles')
+      .select('provider_mid, provider_default, config')
+      .eq('id', sellerId)
+      .single()
+
+    if (!current) throw new NotFoundException('Seller não encontrado')
+
+    // Coinflow: o merchantId é texto livre (ex.: koopfy-sandbox) e vai no jsonb
+    // `config` — NÃO no provider_mid, que tem FK pra tabela de MIDs do Sentinel.
+    if (current.provider_default === 'coinflow') {
+      const config = { ...(current.config ?? {}) }
+      if (dto.mid) config.coinflow_merchant_id = dto.mid
+      else delete config.coinflow_merchant_id
+
+      const { error } = await supabase
+        .from('seller_profiles')
+        .update({ config })
+        .eq('id', sellerId)
+
+      if (error) throw new BadRequestException('Erro ao atualizar Merchant ID: ' + error.message)
+
+      await this.log(sellerId, managerId, 'coinflow_merchant_id_changed', {
+        from: current.config?.coinflow_merchant_id ?? null,
+        to: dto.mid ?? null,
+        notes: dto.notes,
+      })
+
+      return { message: 'Merchant ID atualizado', mid: dto.mid }
+    }
+
+    // Rox Pay: Store Reference é texto livre (ex.: STR-20260722-G9BLUAKAC0, criada
+    // manualmente no painel deles) — mesmo padrão da Coinflow, vai no jsonb `config`.
+    if (current.provider_default === 'rox_pay') {
+      const config = { ...(current.config ?? {}) }
+      if (dto.mid) config.rox_pay_store_reference = dto.mid
+      else delete config.rox_pay_store_reference
+
+      const { error } = await supabase
+        .from('seller_profiles')
+        .update({ config })
+        .eq('id', sellerId)
+
+      if (error) throw new BadRequestException('Erro ao atualizar Store Reference: ' + error.message)
+
+      await this.log(sellerId, managerId, 'rox_pay_store_reference_changed', {
+        from: current.config?.rox_pay_store_reference ?? null,
+        to: dto.mid ?? null,
+        notes: dto.notes,
+      })
+
+      return { message: 'Store Reference atualizada', mid: dto.mid }
+    }
+
+    // Sentinel: valida contra sentinel_mids e grava no provider_mid (FK).
+    if (dto.mid && current.provider_default === 'setinel_gate') {
+      const { data: mid } = await supabase
+        .from('sentinel_mids')
+        .select('mid, status')
+        .eq('mid', dto.mid)
+        .maybeSingle()
+
+      if (!mid) throw new BadRequestException(`MID "${dto.mid}" não encontrado.`)
+      if (mid.status !== 'active') throw new BadRequestException(`MID "${dto.mid}" está inativo.`)
+    }
+
+    const { error } = await supabase
+      .from('seller_profiles')
+      .update({ provider_mid: dto.mid })
+      .eq('id', sellerId)
+
+    if (error) throw new BadRequestException('Erro ao atualizar MID: ' + error.message)
+
+    await this.log(sellerId, managerId, 'sentinel_mid_changed', {
+      from: current.provider_mid ?? null,
+      to: dto.mid,
+      notes: dto.notes,
+    })
+
+    return { message: 'MID atualizado', mid: dto.mid }
+  }
+
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // SPEI — contas e saque
+  // ──────────────────────────────────────────────────────────────────────────
+  // ⚠️ O TETO DO SPEI É ESTOQUE, NÃO VAZÃO — E É POR ISSO QUE ESTA TELA EXISTE.
+  // O do cartão repõe sozinho à meia-noite. O do SPEI só volta quando ALGUÉM
+  // SACA: enquanto o dinheiro está parado na conta Clip, ele ocupa espaço, e
+  // com a conta cheia o roteador simplesmente para de oferecer SPEI. Sem esta
+  // tela, a única forma de destravar seria UPDATE na mão no banco.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  async listSpeiAccounts() {
+    const [{ data: capacidade }, { data: confianca }, { data: contas }] = await Promise.all([
+      supabase.from('gw_capacity').select('*').eq('method', 'spei'),
+      supabase.from('gw_spei_confidence').select('*'),
+      supabase.from('gw_spei_accounts')
+        .select('id, label, clabe, banco, beneficiario, currency, balance_cap_minor, buffer_pct, reserved_minor, occupied_minor, status'),
+    ]);
+
+    const porId = (arr: any[] | null, k = 'id') =>
+      Object.fromEntries((arr ?? []).map(r => [r[k], r]));
+    const cap = porId(capacidade);
+    const conf = porId(confianca, 'account_id');
+
+    const itens = await Promise.all((contas ?? []).map(async (c: any) => {
+      // Últimos saques: é o histórico que mostra se a deriva é pontual ou
+      // sistemática. Uma deriva positiva isolada é ruído; três seguidas são
+      // pagamento fantasma recorrente, e o colchão precisa subir.
+      const { data: ledger } = await supabase
+        .from('gw_spei_ledger')
+        .select('saldo_previsto_minor, held_aberto_minor, saldo_observado_minor, drift_minor, valor_sacado_minor, saldo_apos_minor, nota, created_by, created_at')
+        .eq('account_id', c.id)
+        .order('created_at', { ascending: false })
+        .limit(5);
+
+      return {
+        ...c,
+        // Teto COM colchão — o que o roteador de fato respeita.
+        capOperacionalMinor: cap[c.id]?.cap_minor ?? null,
+        emVooMinor: cap[c.id]?.em_voo_minor ?? 0,
+        livreMinor: cap[c.id]?.livre_minor ?? 0,
+        // Quanto do que está parado veio de leitura de imagem e nunca foi
+        // conferido contra extrato. É o número que diz o quanto confiar no saldo.
+        naoVerificadoMinor: conf[c.id]?.nao_verificado_minor ?? 0,
+        confirmadoMinor: conf[c.id]?.confirmado_minor ?? 0,
+        ultimosSaques: ledger ?? [],
+      };
+    }));
+
+    return { itens };
+  }
+
+  /**
+   * Registra um saque e libera o teto.
+   *
+   * ⚠️ EXIGE OS DOIS VALORES, E NÃO É BUROCRACIA.
+   * `valorSacadoMinor` sozinho diria quanto saiu, e o contador continuaria
+   * sendo uma crença acumulada — errando um pouco a cada mês até o teto virar
+   * ficção. `saldoObservadoMinor` é o saldo REAL que a pessoa vê no app naquele
+   * instante, e é ele que:
+   *
+   *   • zera a deriva acumulada (o novo occupied vem do observado, não de
+   *     aritmética sobre o valor anterior);
+   *   • acusa PAGAMENTO FANTASMA — dinheiro que entrou pela CLABE sem passar
+   *     pelo checkout, de comprador antigo que ainda tem a conta salva;
+   *   • acusa COMPROVANTE FALSO APROVADO — se a IA liberou pedido cuja
+   *     transferência não existiu, falta dinheiro aqui, e é o ÚNICO lugar
+   *     onde isso aparece.
+   */
+  async withdrawSpei(
+    accountId: string,
+    managerId: string,
+    body: { saldo_observado_minor?: number; valor_sacado_minor?: number; nota?: string },
+  ) {
+    const observado = Math.round(Number(body?.saldo_observado_minor));
+    const sacado = Math.round(Number(body?.valor_sacado_minor));
+
+    if (!Number.isFinite(observado) || observado < 0) {
+      throw new BadRequestException('Informe o saldo observado na conta (em centavos).');
+    }
+    if (!Number.isFinite(sacado) || sacado < 0) {
+      throw new BadRequestException('Informe o valor sacado (em centavos).');
+    }
+    if (sacado > observado) {
+      throw new BadRequestException('O valor sacado não pode ser maior que o saldo observado.');
+    }
+
+    const r = await this.clipAccounts.withdrawSpei({
+      accountId,
+      saldoObservadoMinor: observado,
+      valorSacadoMinor: sacado,
+      createdBy: `human:${managerId}`,
+      nota: body?.nota ?? null,
+    });
+
+    return {
+      driftMinor: r?.drift_minor ?? 0,
+      saldoPrevistoMinor: r?.saldo_previsto_minor ?? 0,
+      saldoAposMinor: r?.saldo_apos_minor ?? 0,
+      occupiedMinor: r?.occupied_minor ?? 0,
+    };
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // SPEI — fila de comprovantes para revisão humana
+  // ──────────────────────────────────────────────────────────────────────────
+  // Cai aqui tudo que a análise automática não liberou: comprovante fora da
+  // janela de 24h, transferência agendada, valor que não bate nos centavos,
+  // leitura ruim. Não é recusa — é "não tenho certeza".
+  //
+  // ⚠️ APROVAR OLHANDO O PRINT NÃO É CONFERIR O DINHEIRO.
+  // Um gestor lendo o comprovante tem exatamente a mesma limitação do modelo:
+  // ele não vê o extrato. Por isso a aprovação tem DUAS formas distintas, e a
+  // diferença fica gravada na origem da captura:
+  //
+  //   'human-comprovante'  → li o comprovante e achei convincente.
+  //                          Continua NÃO VERIFICADO (ver gw_source_verificada).
+  //   'manual-conciliado'  → abri o extrato da Clip e o dinheiro está lá.
+  //                          Isto sim conta como confirmado.
+  //
+  // Fundir as duas num botão só faria o clique de um humano promover a
+  // confiança do número sem que ninguém tenha visto dinheiro nenhum — e o
+  // relatório de saldo voltaria a mentir, que é o problema que a separação
+  // entre validado-por-imagem e confirmado existe para resolver.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  async listSpeiProofs(args: { page?: number; status?: string } = {}) {
+    const page = Math.max(1, args.page ?? 1);
+    const porPagina = 25;
+    const status = args.status ?? 'manual_review';
+
+    const { data, error, count } = await supabase
+      .from('transactions')
+      .select('id, seller_id, amount, currency, status, provider_status, metadata, created_at', { count: 'exact' })
+      .eq('provider', 'clip')
+      .eq('metadata->>spei_proof_status', status)
+      .order('created_at', { ascending: false })
+      .range((page - 1) * porPagina, page * porPagina - 1);
+
+    if (error) throw new BadRequestException(`Falha ao listar comprovantes: ${error.message}`);
+
+    const itens = await Promise.all((data ?? []).map(async (tx: any) => {
+      const md = tx.metadata ?? {};
+      // URL assinada curta, gerada no momento da leitura. O bucket é privado e
+      // o caminho é o que fica gravado — link assinado guardado morre sozinho.
+      const proofUrl = await this.storageService.getSignedSpeiReceiptUrl(md.spei_proof_path, 900);
+
+      // Histórico de decisões daquele pedido: o que a IA leu e por que não
+      // liberou. É isto que o gestor precisa ver ANTES de decidir, senão ele
+      // está só olhando a mesma imagem sem o trabalho já feito.
+      const { data: receipts } = md.spei_reservation_id
+        ? await supabase
+            .from('gw_spei_receipts')
+            .select('id, verdict, confidence, checks, reasons, extracted, decided_by, created_at')
+            .eq('reservation_id', md.spei_reservation_id)
+            .order('created_at', { ascending: false })
+        : { data: [] as any[] };
+
+      return {
+        transactionId: tx.id,
+        sellerId: tx.seller_id,
+        amount: tx.amount,
+        currency: tx.currency,
+        status: tx.status,
+        providerStatus: tx.provider_status,
+        createdAt: tx.created_at,
+        reservationId: md.spei_reservation_id ?? null,
+        // Valor que o comprador DEVIA transferir, com os centavos únicos.
+        chargeMinor: md.spei_charge_minor ?? null,
+        proofUrl,
+        proofMime: md.spei_proof_mime ?? null,
+        proofUploadedAt: md.spei_proof_uploaded_at ?? null,
+        analise: md.spei_proof_analysis ?? null,
+        historico: receipts ?? [],
+      };
+    }));
+
+    return { itens, page, total: count ?? 0 };
+  }
+
+  async decideSpeiProof(
+    transactionId: string,
+    managerId: string,
+    body: { decision: 'approve' | 'reject'; conferido_no_extrato?: boolean; nota?: string },
+  ) {
+    const { data: tx, error } = await supabase
+      .from('transactions')
+      .select('id, status, currency, metadata')
+      .eq('id', transactionId)
+      .maybeSingle();
+
+    if (error || !tx) throw new NotFoundException('Transação não encontrada.');
+
+    const md = tx.metadata ?? {};
+    const reservationId = md.spei_reservation_id;
+    if (!reservationId) throw new BadRequestException('Transação sem reserva SPEI.');
+
+    if (body.decision === 'reject') {
+      await supabase.from('transactions').update({
+        provider_status: 'proof_rejected',
+        metadata: { ...md, spei_proof_status: 'rejected', spei_proof_decided_by: `human:${managerId}`, spei_proof_note: body.nota ?? null },
+      }).eq('id', transactionId);
+      // Devolve o espaço reservado agora, em vez de esperar o TTL.
+      await this.clipAccounts.release(reservationId, `rejeitado por human:${managerId}`);
+      return { status: 'rejected' };
+    }
+
+    // ⚠️ Só quem abriu o extrato pode marcar como conferido. O default é a
+    // opção honesta: aprovado olhando o comprovante, portanto não verificado.
+    const source = body.conferido_no_extrato ? 'manual-conciliado' : 'human-comprovante';
+
+    // Idempotente: se já foi capturado (dois cliques, ou a análise automática
+    // aprovou antes), capture() devolve false e nada é contado duas vezes.
+    const capturou = await this.clipAccounts.capture({
+      reservationId,
+      amountMinor: Number(md.spei_charge_minor),
+      kind: 'base',
+      source,
+    });
+
+    await supabase.from('transactions').update({
+      metadata: {
+        ...md,
+        spei_proof_status: 'approved',
+        spei_proof_decided_by: `human:${managerId}`,
+        spei_proof_source: source,
+        spei_proof_note: body.nota ?? null,
+      },
+    }).eq('id', transactionId);
+
+    // Reusa o pipeline canônico de PAID: credita carteira, KPI e postback.
+    // Atualizar `status` direto aqui pularia todos esses efeitos, e o pedido
+    // ficaria pago no CRM e pendente em todo o resto do sistema.
+    if (tx.status === 'pending') {
+      await this.webhookService.handleWebhookProvider({
+        reference: transactionId, status: 'PAID', type: 'TRANSACTION',
+      } as any);
+    }
+
+    return { status: 'approved', source, capturou };
+  }
 
 }

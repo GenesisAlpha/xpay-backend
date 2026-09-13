@@ -12,6 +12,9 @@ npm-debug.log*
 .env.development
 .env.production
 
+# Pacotes de deploy — levam o .env de produção dentro (NUNCA SUBIR)
+*.zip
+
 # Base de Dados Local (se usares SQLite no futuro)
 *.db
 *.sqlite
@@ -19,3 +22,5 @@ npm-debug.log*
 
 # OS
 .DS_Store
+dist-test/
+ops/fixtures-spei/

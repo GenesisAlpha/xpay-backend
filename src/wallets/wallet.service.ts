@@ -85,6 +85,8 @@ export class WalletService {
         type: 'debit_platform_fee',
         amount: platformFee.amount,
         currency: 'USD',
+        // wallet_ledger.status é NOT NULL — débito contábil já efetivado.
+        status: 'completed',
         created_at: now,
         metadata: { platform_wallet_ref: platformFee.walletRef, partner: platformFee.partner },
       })
@@ -111,6 +113,8 @@ export class WalletService {
         type: 'debit_external_fee',
         amount: externalFee.amount,
         currency: 'USD',
+        // wallet_ledger.status é NOT NULL — débito contábil já efetivado.
+        status: 'completed',
         created_at: now,
         metadata: { recipient_id: externalFee.recipientId },
       })

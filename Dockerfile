@@ -1,7 +1,7 @@
-FROM node:20-slim
+FROM node:22-slim
 
 # Instalar dependências necessárias para o binário do Prisma
-RUN apt-get update && apt-get install -y openssl
+RUN apt-get update && apt-get install -y openssl && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -18,6 +18,9 @@ RUN npm install
 COPY . .
 RUN npm run build
 
-EXPOSE 8080
+# pay escuta na 3007 (ver src/main.ts)
+ENV PORT=3007
+EXPOSE 3007
 
-CMD ["node", "dist/server.js"]
+# entrypoint compilado é dist/main.js (corrigido: antes apontava p/ dist/server.js, que não existe)
+CMD ["node", "dist/main.js"]

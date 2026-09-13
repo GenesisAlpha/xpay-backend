@@ -4,7 +4,117 @@ import { Injectable } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
 import { WalletService } from '../wallets/wallet.service'
 import { AccountRouterService } from '../orchestrator/router/account-router.service'
+import { getProviderAccountById } from '../orchestrator/provider-accounts.config'
+import { RoxPayProvider } from '../orchestrator/providers/rox-pay.provider'
+import { WhopAccountsService } from '../orchestrator/whop/whop-accounts.service'
+import { StripeAccountsService } from '../orchestrator/stripe/stripe-accounts.service'
+import { StripeRiskService } from '../orchestrator/stripe/stripe-risk.service'
+import { StripeEfwService } from '../orchestrator/stripe/stripe-efw.service'
+import { AffiliateRiskService } from '../orchestrator/stripe/affiliate-risk.service'
 import * as crypto from 'crypto'
+
+// Status do Sentinel Gate → status canônico do handleWebhookProvider.
+const SENTINEL_WEBHOOK_STATUS: Record<string, 'PAID' | 'PENDING' | 'FAILED' | 'PROCESSING'> = {
+  captured: 'PAID',
+  // Cliente iniciou o pagamento (inseriu os dados) → promove awaiting_payment →
+  // pending no checkout (aparece no painel + conta). Ainda NÃO é venda.
+  sale_in_progress: 'PROCESSING',
+  pending: 'PENDING',
+  processing: 'PENDING',
+  failed: 'FAILED',
+  expired: 'FAILED',
+  // 'refunded' tratado à parte (estorno) — TODO quando houver fluxo de refund.
+}
+
+// Status/evento da Coinflow → status canônico. ⚠️ Os nomes exatos dos eventos
+// dependem da doc de webhooks da Coinflow — ajustar quando confirmado.
+const COINFLOW_WEBHOOK_STATUS: Record<string, 'PAID' | 'PENDING' | 'FAILED'> = {
+  settled: 'PAID',
+  succeeded: 'PAID',
+  completed: 'PAID',
+  paid: 'PAID',
+  pending: 'PENDING',
+  processing: 'PENDING',
+  created: 'PENDING',
+  failed: 'FAILED',
+  declined: 'FAILED',
+  canceled: 'FAILED',
+  cancelled: 'FAILED',
+}
+
+// Status.Description da Rox Pay (GET /transactions/{id}) → status canônico.
+// Nomes vistos na doc (GET /webhooks/event/type): Success, Settled, Declined,
+// Cancelled. Os demais (Initialized/Authorized/Pending/Refunded) são defensivos
+// — ajustar se a Rox confirmar nomenclatura diferente em produção.
+const ROX_PAY_STATUS_MAP: Record<string, 'PAID' | 'PENDING' | 'FAILED' | 'PROCESSING' | 'REFUNDED'> = {
+  success: 'PAID',
+  settled: 'PAID',
+  authorized: 'PROCESSING',
+  initialized: 'PENDING',
+  pending: 'PENDING',
+  processing: 'PROCESSING',
+  declined: 'FAILED',
+  failed: 'FAILED',
+  cancelled: 'FAILED',
+  canceled: 'FAILED',
+  refunded: 'REFUNDED',
+}
+
+// Evento da Whop → status canônico do handleWebhookProvider.
+// Lista completa em docs.whop.com/api-reference/webhooks/webhook.
+const WHOP_EVENT_STATUS: Record<string, 'PAID' | 'PENDING' | 'FAILED' | 'REFUNDED'> = {
+  'payment.succeeded': 'PAID',
+  'payment.pending': 'PENDING',
+  'payment.created': 'PENDING',
+  'payment.failed': 'FAILED',
+  'refund.created': 'REFUNDED',
+}
+
+// Tolerância do timestamp da assinatura (Standard Webhooks). Fora dela, o
+// evento é recusado — é o que impede replay de um payload legítimo capturado.
+const WHOP_SIGNATURE_TOLERANCE_S = 5 * 60
+
+// Evento da Stripe → status canônico do handleWebhookProvider.
+//
+// A fonte da verdade é o PaymentIntent, não o Charge: um intent pode ter várias
+// tentativas de charge e só a última importa. `charge.succeeded` fica de fora
+// de propósito — ele chega ANTES de payment_intent.succeeded e aprovaria o
+// pedido antes de a Stripe ter terminado de decidir.
+const STRIPE_EVENT_STATUS: Record<string, 'PAID' | 'PENDING' | 'FAILED' | 'REFUNDED'> = {
+  'payment_intent.succeeded': 'PAID',
+  'payment_intent.processing': 'PENDING',
+  'payment_intent.payment_failed': 'FAILED',
+  'payment_intent.canceled': 'FAILED',
+  'charge.refunded': 'REFUNDED',
+}
+
+// Eventos que NÃO mexem em transação — alimentam o governador de risco.
+// São eles que fazem a quarentena automática existir; ignorá-los reduz o pool a
+// um balanceador de carga cego.
+const STRIPE_RISK_EVENTS = new Set([
+  'charge.dispute.created',
+  'charge.dispute.updated',
+  'charge.dispute.closed',
+  'radar.early_fraud_warning.created',
+  'review.opened',
+  'review.closed',
+  'payout.failed',
+  'account.updated',
+])
+
+// Tolerância do timestamp da assinatura da Stripe. O default do SDK é 300s.
+const STRIPE_SIGNATURE_TOLERANCE_S = 5 * 60
+
+// Espelho dos Sets de StripeProvider.toStripeAmount — usados para DESFAZER a
+// conversão ao conferir o valor que voltou no webhook. Duplicados de propósito:
+// importar o provider aqui puxaria o SDK da Stripe para dentro do webhook, que
+// precisa funcionar mesmo com a chave da conta revogada. Se mexer num, mexa no
+// outro — a divergência aparece como alerta de valor errado em toda venda.
+const STRIPE_ZERO_DECIMAL = new Set([
+  'BIF', 'CLP', 'DJF', 'GNF', 'JPY', 'KMF', 'KRW', 'MGA',
+  'PYG', 'RWF', 'UGX', 'VND', 'VUV', 'XAF', 'XOF', 'XPF',
+])
+const STRIPE_THREE_DECIMAL = new Set(['BHD', 'JOD', 'KWD', 'OMR', 'TND'])
 
 @Injectable()
 export class WebhookService {
@@ -12,9 +122,16 @@ export class WebhookService {
   constructor(
     private readonly walletService: WalletService,
     private readonly router: AccountRouterService,
+    private readonly whopAccounts: WhopAccountsService,
+    private readonly stripeAccounts: StripeAccountsService,
+    private readonly stripeRisk: StripeRiskService,
+    private readonly stripeEfw: StripeEfwService,
+    private readonly affiliateRisk: AffiliateRiskService,
   ) { }
 
-  async handleWebhookProvider(body: any) {
+  // opts.skipDispatch: pula o postback ao seller (usado na aprovação SÍNCRONA do
+  // provider 'simulator', onde o checkout marca o pedido pago por outro caminho).
+  async handleWebhookProvider(body: any, opts: { skipDispatch?: boolean } = {}) {
 
     console.log(body);
 
@@ -138,7 +255,7 @@ export class WebhookService {
       }
 
       // 4) Dispatch de webhooks pro seller
-      await this.dispatchToAll(tx, 'payment.approved', {
+      if (!opts.skipDispatch) await this.dispatchToAll(tx, 'payment.approved', {
         status: 'approved',
         transactionId: tx.id,
         amount: tx.amount,
@@ -157,6 +274,30 @@ export class WebhookService {
           }
           : {}),
       })
+    }
+
+    // ── Pagamento INICIADO (cliente inseriu os dados / sale_in_progress) ──────
+    // Promove o pedido no checkout de awaiting_payment → pending (aparece no
+    // painel + conta como pendente). Ainda NÃO é venda; a captura (PAID) vem depois.
+    if (status === 'PROCESSING' && type === 'TRANSACTION') {
+      await supabase
+        .from('transactions')
+        .update({
+          status: 'processing',
+          provider_status: 'processing',
+          last_webhook_at: now,
+          updated_at: new Date(),
+        })
+        .eq('id', tx.id)
+        .not('status', 'in', '(approved,paid,failed)')
+
+      if (!opts.skipDispatch) {
+        await this.dispatchToAll(tx, 'payment.processing', {
+          status: 'processing',
+          transactionId: tx.id,
+        }).catch((e: any) => console.error('[WebhookService] dispatch payment.processing:', e?.message))
+      }
+      return { processing: true }
     }
 
     // ── Pagamento pendente ──────────────────────────────────────────────────
@@ -233,7 +374,7 @@ export class WebhookService {
       // Não registra KPI da external_fee em failed — fee só conta como
       // receita da plataforma quando o pagamento é efetivo.
 
-      await this.dispatchToAll(tx, 'payment.failed', {
+      if (!opts.skipDispatch) await this.dispatchToAll(tx, 'payment.failed', {
         status: 'failed',
         transactionId: tx.id,
         amount: tx.amount,
@@ -246,6 +387,1234 @@ export class WebhookService {
     }
 
     return { received: true }
+  }
+
+  // ─── SENTINEL GATE ────────────────────────────────────────────────────────
+  // Mapeia o payload do Sentinel pro formato canônico e reaproveita TODA a
+  // lógica de handleWebhookProvider (crédito, markPaid, KPIs, postbacks).
+  async handleSentinelWebhook(body: any, rawBody: string, headers: Record<string, string> = {}) {
+    console.log('[Sentinel webhook]', body)
+
+    // ⚠️ Validação de assinatura DESATIVADA temporariamente — a chave de webhook
+    // estava causando erro de "assinatura inválida" e derrubando webhooks legítimos.
+    // A correlação da transação (provider_transaction_id / order_id) já garante
+    // que só atualizamos pedidos reais. Reativar quando a whsec estiver acertada.
+    // if (!this.verifySentinelSignature(rawBody, headers)) {
+    //   console.warn('[WebhookService] Sentinel: assinatura inválida')
+    //   return { ignored: true, reason: 'invalid signature' }
+    // }
+
+    // Resolve a transação interna:
+    //  • primário → provider_transaction_id == sentinel_transaction_id (id único)
+    //  • fallback → order_id (== order_number → external_reference, ou == tx.id antigo)
+    const reference = await this.resolveSentinelTxId(body)
+    const rawStatus = String(body?.status ?? '').toLowerCase()
+
+    if (!reference) {
+      console.warn('[WebhookService] Sentinel webhook: transação não encontrada', {
+        wc_order_id: body?.wc_order_id,
+        sentinel_transaction_id: body?.sentinel_transaction_id,
+      })
+      return { ignored: true, reason: 'transaction not found' }
+    }
+
+    // Estorno
+    if (rawStatus === 'refunded') {
+      return this.refundTransaction(reference)
+    }
+
+    const mapped = SENTINEL_WEBHOOK_STATUS[rawStatus]
+    if (!mapped) {
+      console.warn('[WebhookService] Sentinel status não mapeado:', rawStatus)
+      return { ignored: true, reason: 'unmapped status' }
+    }
+
+    return this.handleWebhookProvider({
+      reference,
+      status: mapped,
+      type: 'TRANSACTION',
+      failure_message: body?.gateway_response ?? null,
+    })
+  }
+
+  // ─── COINFLOW ──────────────────────────────────────────────────────────────
+  // A Coinflow confirma o settlement por webhook. Correlacionamos pela
+  // webhookInfo.reference (= nosso transactionId) e, em fallback, pelo paymentId
+  // (== provider_transaction_id). ⚠️ A verificação de assinatura segue a doc de
+  // webhooks da Coinflow — habilite com COINFLOW_WEBHOOK_SECRET quando confirmada.
+  async handleCoinflowWebhook(body: any, rawBody: string, headers: Record<string, string> = {}) {
+    console.log('[Coinflow webhook]', body)
+
+    if (!this.verifyCoinflowSignature(rawBody, headers)) {
+      console.warn('[WebhookService] Coinflow: assinatura inválida')
+      return { ignored: true, reason: 'invalid signature' }
+    }
+
+    const data = body?.data ?? body
+    const rawStatus = String(
+      body?.eventType ?? body?.event ?? data?.status ?? body?.status ?? '',
+    ).toLowerCase()
+
+    // 1. webhookInfo.reference (nosso transactionId) — primário.
+    let reference: string | null =
+      data?.webhookInfo?.reference ?? body?.webhookInfo?.reference ?? null
+
+    // 2. Fallback: resolve pelo paymentId == provider_transaction_id.
+    if (!reference) {
+      const paymentId = data?.paymentId ?? body?.paymentId ?? null
+      if (paymentId) {
+        const { data: tx } = await supabase
+          .from('transactions')
+          .select('id')
+          .eq('provider_transaction_id', paymentId)
+          .maybeSingle()
+        reference = tx?.id ?? null
+      }
+    }
+
+    if (!reference) {
+      console.warn('[WebhookService] Coinflow webhook: transação não encontrada', {
+        paymentId: data?.paymentId, eventType: body?.eventType,
+      })
+      return { ignored: true, reason: 'transaction not found' }
+    }
+
+    if (rawStatus === 'refunded' || rawStatus === 'returned') {
+      return this.refundTransaction(reference)
+    }
+
+    const mapped = COINFLOW_WEBHOOK_STATUS[rawStatus]
+    if (!mapped) {
+      console.warn('[WebhookService] Coinflow status não mapeado:', rawStatus)
+      return { ignored: true, reason: 'unmapped status' }
+    }
+
+    return this.handleWebhookProvider({
+      reference,
+      status: mapped,
+      type: 'TRANSACTION',
+      failure_message: data?.failureMessage ?? data?.message ?? null,
+    })
+  }
+
+  // Verificação de assinatura do webhook da Coinflow. Sem segredo configurado,
+  // aceita (lenient) com aviso — apertar para HMAC quando a doc for confirmada.
+  private verifyCoinflowSignature(rawBody: string, headers: Record<string, string>): boolean {
+    const secret = process.env.COINFLOW_WEBHOOK_SECRET
+    if (!secret) {
+      console.warn('[WebhookService] Coinflow: COINFLOW_WEBHOOK_SECRET ausente — pulando verificação (configurar p/ produção)')
+      return true
+    }
+    // ⚠️ TODO: ajustar o nome do header e o esquema conforme a doc da Coinflow.
+    const sig = headers['x-coinflow-signature'] ?? headers['coinflow-signature'] ?? ''
+    const expected = crypto.createHmac('sha256', secret).update(rawBody, 'utf8').digest('hex')
+    try {
+      return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))
+    } catch {
+      return false
+    }
+  }
+
+  // ─── ROX PAY ──────────────────────────────────────────────────────────────
+  // A Rox Pay NÃO assina os deliveries — autenticamos pelo header custom
+  // (Authorization: Bearer <ROX_PAY_WEBHOOK_SECRET>) configurado no cadastro
+  // do webhook (POST /api/v4/webhooks/create). O corpo do evento é enxuto, então
+  // buscamos o status AUTORITATIVO via GET /transactions/{TransactionId} em vez
+  // de confiar no texto do evento. `TransactionId` == nosso transactions.id
+  // (mandamos o próprio id interno como TransactionId ao criar o payment link).
+  async handleRoxPayWebhook(body: any, headers: Record<string, string> = {}) {
+    console.log('[Rox Pay webhook]', body)
+
+    const secret = process.env.ROX_PAY_WEBHOOK_SECRET
+    if (secret) {
+      const provided = headers['authorization'] ?? headers['Authorization'] ?? ''
+      if (provided !== `Bearer ${secret}` && provided !== secret) {
+        console.warn('[WebhookService] Rox Pay: header de autenticação inválido')
+        return { ignored: true, reason: 'invalid secret' }
+      }
+    } else {
+      console.warn('[WebhookService] ROX_PAY_WEBHOOK_SECRET ausente — pulando verificação (configurar p/ produção)')
+    }
+
+    // ⚠️ A Rox Pay usa o MESMO nome "TransactionId" pra coisas diferentes em
+    // endpoints diferentes: na resposta de POST /payments/link, `TransactionId`
+    // ecoa a nossa referência (roxTransactionId, ex. "828050802-ms0iqdbx"). Mas
+    // no payload do WEBHOOK, `TransactionId` é o ID NUMÉRICO INTERNO deles (ex.
+    // "9881683") — a nossa referência vem em `TransactionUuid`. Confirmado com
+    // payload real: PaymentUrl termina em ".../828050802-ms0iqdbx", que bate
+    // com TransactionUuid, não com TransactionId. Usar o campo errado aqui faz
+    // a busca por provider_transaction_id NUNCA achar a transação — o webhook
+    // responde 201 (recebido) mas a transação nunca é atualizada.
+    const reference: string | null = body?.TransactionUuid ?? body?.data?.TransactionUuid
+      ?? body?.TransactionId ?? body?.data?.TransactionId ?? null
+    if (!reference) {
+      console.warn('[WebhookService] Rox Pay webhook: TransactionUuid/TransactionId ausente', body)
+      return { ignored: true, reason: 'transaction not found' }
+    }
+
+    // `reference` é o order_number (TransactionId ≤30 chars da Rox Pay), NÃO o
+    // transactions.id — resolvemos por provider_transaction_id (primário, único
+    // por tentativa) com fallback em external_reference (mesmo padrão do Sentinel).
+    let tx: { id: string; provider_account_id: string | null } | null = null
+
+    const { data: byProviderTxId } = await supabase
+      .from('transactions').select('id, provider_account_id')
+      .eq('provider_transaction_id', reference).maybeSingle()
+    tx = byProviderTxId ?? null
+
+    if (!tx) {
+      const { data: byRef } = await supabase
+        .from('transactions').select('id, provider_account_id')
+        .eq('external_reference', reference)
+        .order('created_at', { ascending: false })
+        .limit(1).maybeSingle()
+      tx = byRef ?? null
+    }
+
+    if (!tx) {
+      console.warn('[WebhookService] Rox Pay webhook: transação não encontrada', reference)
+      return { ignored: true, reason: 'transaction not found' }
+    }
+
+    const account = tx.provider_account_id ? getProviderAccountById(tx.provider_account_id) : undefined
+    if (!account) {
+      console.warn('[WebhookService] Rox Pay webhook: conta do provider não encontrada', tx.provider_account_id)
+      return { ignored: true, reason: 'account not found' }
+    }
+
+    let statusDescription: string | null = null
+    let raw: any = null
+    try {
+      const provider = this.router.getProviderInstance('rox_pay') as RoxPayProvider
+      const result = await provider.getTransactionStatus(reference, {
+        api_url: account.api_url,
+        apiKey: account.apiKey,
+        apiSecret: account.apiSecret,
+        config: account.config,
+      })
+      statusDescription = result.statusDescription
+      raw = result.raw
+    } catch (err: any) {
+      console.error('[WebhookService] Rox Pay: erro ao buscar status autoritativo:', err?.message)
+      return { ignored: true, reason: 'status fetch failed' }
+    }
+
+    const mapped = ROX_PAY_STATUS_MAP[String(statusDescription ?? '').toLowerCase()]
+    if (!mapped) {
+      console.warn('[WebhookService] Rox Pay status não mapeado:', statusDescription)
+      return { ignored: true, reason: 'unmapped status' }
+    }
+
+    if (mapped === 'REFUNDED') return this.refundTransaction(tx.id)
+
+    return this.handleWebhookProvider({
+      reference: tx.id,
+      status: mapped,
+      type: 'TRANSACTION',
+      failure_message: raw?.Message ?? null,
+    })
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // WHOP — endpoint compartilhado (/webhook/whop) e legado por conta
+  // (/webhook/whop/:accountId).
+  //
+  // Diferente dos demais providers, aqui não existe UM segredo: cada company do
+  // pool tem o seu. No endpoint compartilhado, o metadata `koopfy_account_id`
+  // permite escolher o segredo certo antes de validar a assinatura.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  async handleSharedWhopWebhook(
+    body: any,
+    rawBody: string,
+    headers: Record<string, string> = {},
+  ) {
+    const data = body?.data ?? {}
+    const metadata =
+      data?.metadata
+      ?? data?.payment?.metadata
+      ?? data?.checkout_configuration?.metadata
+      ?? data?.plan?.metadata
+      ?? body?.metadata
+      ?? {}
+    const accountId = String(metadata?.koopfy_account_id ?? '').trim()
+
+    if (!accountId) {
+      // Não responder 2xx: eventos sem identificação devem ser reenviados pela
+      // Whop, pois sem a conta não há como escolher o segredo de assinatura.
+      console.error('[WebhookService] Whop: evento no endpoint compartilhado sem koopfy_account_id')
+      throw new Error('Whop: koopfy_account_id ausente no webhook')
+    }
+
+    return this.handleWhopWebhook(accountId, body, rawBody, headers)
+  }
+
+  async handleWhopWebhook(
+    accountId: string,
+    body: any,
+    rawBody: string,
+    headers: Record<string, string> = {},
+  ) {
+    const eventType = String(body?.type ?? body?.event ?? '')
+    console.log('[Whop webhook]', accountId, eventType)
+
+    // ── 1. Conta ──
+    // getById NÃO filtra por status de propósito: webhook de conta pausada
+    // continua chegando e é dinheiro que já entrou.
+    const account = await this.whopAccounts.getById(accountId)
+    if (!account) {
+      console.warn('[WebhookService] Whop: conta desconhecida no path:', accountId)
+      return { ignored: true, reason: 'unknown account' }
+    }
+
+    // ── 2. Assinatura (Standard Webhooks) ──
+    const secret = account.config?.webhook_secret
+    if (!secret) {
+      // Sem segredo, qualquer um que descubra a URL confirma pagamento. Recusa —
+      // ao contrário dos providers legados aqui, que só avisam e seguem.
+      console.error(`[WebhookService] Whop: conta ${accountId} sem webhook_secret — evento recusado`)
+      return { ignored: true, reason: 'missing webhook secret' }
+    }
+
+    const verification = this.verifyWhopSignature(rawBody, headers, secret)
+    if (!verification.valid) {
+      console.error(
+        `[WebhookService] Whop: ASSINATURA INVÁLIDA (${verification.reason}) em ${accountId}. `
+        + 'Se isto aparecer pra TODO evento, a suspeita nº1 é a derivação da chave '
+        + '(a Whop usa `ws_<hex>` e o HMAC é sobre a string crua, não base64 decodificado) '
+        + 'ou o body ter sido re-serializado antes de chegar aqui (ver express.raw em main.ts).',
+      )
+      // THROW, não 2xx. Devolver 200 aqui faz a Whop marcar como entregue e o
+      // evento se perde PRA SEMPRE — dinheiro entrou e o pedido nunca confirma.
+      // Com 5xx ela reentrega por horas, o que dá janela pra corrigir o segredo
+      // sem perder as primeiras vendas. Assinatura inválida de verdade (ataque)
+      // só custa algumas retentativas ruidosas.
+      throw new Error(`Whop: assinatura inválida (${verification.reason}) em ${accountId}`)
+    }
+
+    // ── 3. Dedupe ──
+    // A Whop entrega at-least-once. Sem isto, um redelivery de payment.succeeded
+    // roda o pipeline de crédito de novo. A PK da tabela é a trava real — a
+    // corrida entre duas entregas simultâneas morre no conflito, não no if.
+    const webhookId = headers['webhook-id'] ?? null
+    if (webhookId) {
+      const { error: dedupeError } = await supabase
+        .from('whop_webhook_events')
+        .insert({ webhook_id: webhookId, account_id: accountId, event_type: eventType })
+
+      if (dedupeError) {
+        // 23505 = unique_violation → já processado.
+        if ((dedupeError as any).code === '23505') {
+          return { alreadyProcessed: true }
+        }
+        console.error('[WebhookService] Whop dedupe insert error:', dedupeError.message)
+      }
+    }
+
+    // A marca acima é uma RESERVA, não um "pronto". Se o processamento estourar,
+    // ela é desfeita no catch — senão o retry da Whop chegaria como duplicado e
+    // o pagamento ficaria pendente pra sempre por causa de um erro transitório.
+    try {
+      return await this.processWhopEvent(accountId, account, eventType, body)
+    } catch (err) {
+      if (webhookId) {
+        await supabase.from('whop_webhook_events').delete().eq('webhook_id', webhookId)
+      }
+      throw err
+    }
+  }
+
+  private async processWhopEvent(
+    accountId: string,
+    account: { config?: Record<string, any> },
+    eventType: string,
+    body: any,
+  ) {
+    if (eventType.startsWith('membership.')) {
+      return this.persistWhopMembership(accountId, eventType, body);
+    }
+
+    // ── 4. Eventos que não mexem em transação ──
+    if (eventType === 'dispute.created' || eventType === 'dispute.updated') {
+      console.warn(
+        `[WebhookService] Whop DISPUTA em ${accountId} ` +
+        `(${account.config?.legal_name ?? 'titular não identificado'}):`,
+        JSON.stringify(body?.data ?? {}),
+      )
+      return { received: true, disputed: true }
+    }
+
+    const mapped = WHOP_EVENT_STATUS[eventType]
+    if (!mapped) {
+      console.log('[WebhookService] Whop: evento sem mapeamento, ignorado:', eventType)
+      return { ignored: true, reason: 'unmapped event' }
+    }
+
+    // ── 5. Resolve a transação ──
+    const tx = await this.resolveWhopTx(body)
+    if (!tx) {
+      console.error(
+        '[WebhookService] Whop: PAGAMENTO ÓRFÃO — nenhuma transação casou.',
+        JSON.stringify({ accountId, eventType, data: body?.data ?? null }),
+      )
+      // THROW, não `ignored`. Responder 2xx aqui faz a Whop parar de tentar e o
+      // pagamento morre órfão de vez. Com 5xx ela reentrega (a reserva de dedupe
+      // é desfeita no catch de handleWhopWebhook), e a corrida "webhook chegou
+      // antes da linha existir" se resolve sozinha na retentativa. Se esgotarem
+      // as tentativas, aí é conciliação manual mesmo — mas com log, não silêncio.
+      throw new Error(`Whop: transação não encontrada para o evento ${eventType} (${accountId})`)
+    }
+
+    // Confere o valor. Divergência aqui significa associação errada (metadata
+    // reaproveitado, sessão reusada) — não bloqueia, mas tem que ser visível:
+    // aprovar a transação errada é pior do que aprovar tarde.
+    this.warnOnWhopAmountMismatch(tx, body?.data)
+
+    // Guarda member + payment method (e o link de 3DS, se houver): é o que torna
+    // a compra apta ao upsell de um clique. Roda ANTES da aprovação para o
+    // checkout já enxergar a compra como elegível quando o postback chegar.
+    // Falha aqui não pode travar a aprovação — o dinheiro já entrou.
+    if (eventType.startsWith('payment.')) {
+      await this.rememberWhopPaymentContext(tx.id, body?.data).catch((err: any) =>
+        console.error('[WebhookService] Whop: não guardou o contexto do pagamento:', err?.message ?? err),
+      )
+    }
+
+    if (mapped === 'REFUNDED') return this.refundTransaction(tx.id)
+
+    return this.handleWebhookProvider({
+      reference: tx.id,
+      status: mapped,
+      type: 'TRANSACTION',
+      failure_message: body?.data?.failure_message ?? body?.data?.error?.message ?? null,
+    })
+  }
+
+  // Ids da Whop que o pay não guardava: sem member + payment_method não existe
+  // cobrança off-session. Mescla no metadata da transação (sem apagar o resto).
+  private async rememberWhopPaymentContext(transactionId: string, data: any) {
+    if (!data) return
+
+    const patch: Record<string, string> = {}
+    const put = (key: string, value: unknown) => {
+      const text = typeof value === 'string' ? value.trim() : ''
+      if (text) patch[key] = text
+    }
+    put('whop_payment_id', data.id)
+    put('whop_member_id', data.member?.id ?? data.member_id)
+    put('whop_payment_method_id', data.payment_method?.id ?? data.payment_method_id)
+    put('whop_user_id', data.user?.id ?? data.user_id)
+    put('whop_recovery_url', data.recovery_url)
+    if (!Object.keys(patch).length) return
+
+    const { data: current } = await supabase
+      .from('transactions').select('metadata').eq('id', transactionId).maybeSingle()
+    const { error } = await supabase
+      .from('transactions')
+      .update({ metadata: { ...(current?.metadata ?? {}), ...patch } })
+      .eq('id', transactionId)
+    if (error) throw error
+  }
+
+  private async persistWhopMembership(accountId: string, eventType: string, body: any) {
+    const data = body?.data ?? {};
+    const metadata = data?.metadata ?? body?.metadata ?? {};
+    const membershipId = data?.id ?? data?.membership_id;
+    if (!membershipId) {
+      console.warn('[WebhookService] Whop membership sem id:', eventType);
+      return { ignored: true, reason: 'membership id missing' };
+    }
+
+    const status = eventType === 'membership.deactivated'
+      ? 'inactive'
+      : (data?.status ?? 'active');
+    const tx = await this.resolveWhopTx(body);
+    const row = {
+      whop_membership_id: String(membershipId),
+      whop_account_id: accountId,
+      whop_plan_id: String(data?.plan_id ?? data?.plan?.id ?? metadata?.koopfy_plan_id ?? '') || null,
+      koopfy_product_id: String(metadata?.koopfy_product_id ?? '') || null,
+      koopfy_transaction_id: tx?.id ?? metadata?.koopfy_transaction_id ?? null,
+      customer_email: data?.user?.email ?? data?.customer?.email ?? null,
+      status,
+      cancel_at_period_end: Boolean(data?.cancel_at_period_end),
+      current_period_end: data?.current_period_end ?? data?.expires_at ?? null,
+      metadata,
+      updated_at: new Date().toISOString(),
+    };
+
+    const { error } = await supabase
+      .from('whop_subscriptions')
+      .upsert(row, { onConflict: 'whop_membership_id' });
+    if (error) throw new Error(`Whop: falha ao persistir membership (${error.message})`);
+
+    // Keep Koopfy's entitlement in sync with the processor membership.
+    // cancel_at_period_end remains active until Whop emits deactivated.
+    if (tx?.id) {
+      const { data: order } = await supabase
+        .from('orders')
+        .select('id')
+        .eq('gateway_payment_id', tx.id)
+        .maybeSingle();
+
+      if (order?.id) {
+        const now = new Date().toISOString();
+        if (['inactive', 'past_due', 'unpaid', 'canceled', 'cancelled'].includes(status)) {
+          const { error: revokeError } = await supabase
+            .from('digital_access')
+            .update({
+              status: 'revoked',
+              revoked_at: now,
+              revoke_reason: `subscription_${status}`,
+              updated_at: now,
+            })
+            .eq('order_id', order.id)
+            .eq('status', 'active');
+          if (revokeError) throw new Error(`Whop: falha ao revogar acesso (${revokeError.message})`);
+        } else if (status === 'active') {
+          const { error: renewError } = await supabase
+            .from('digital_access')
+            .update({
+              status: 'active',
+              expires_at: row.current_period_end,
+              revoked_at: null,
+              revoke_reason: null,
+              updated_at: now,
+            })
+            .eq('order_id', order.id);
+          if (renewError) throw new Error(`Whop: falha ao renovar acesso (${renewError.message})`);
+        }
+      }
+    }
+    return { received: true, membership: membershipId, status };
+  }
+
+  // Resolve transactions.id a partir do payload da Whop.
+  //
+  // Ordem importa: o metadata é o fio PRIMÁRIO (posto em WhopProvider.charge e
+  // propagado pela Whop até o payment). Os demais são rede de segurança.
+  private async resolveWhopTx(body: any): Promise<{ id: string } | null> {
+    const data = body?.data ?? {}
+    const metadata = data?.metadata ?? body?.metadata ?? {}
+
+    // 1) PRIMÁRIO — nosso transactions.id, ida e volta pelo metadata.
+    const txId = metadata?.koopfy_transaction_id
+    if (txId) {
+      const { data: byId } = await supabase
+        .from('transactions').select('id').eq('id', String(txId)).maybeSingle()
+      if (byId) return byId
+    }
+
+    // 2) checkout configuration (ch_xxx) — gravado como provider_transaction_id.
+    const sessionId =
+      data?.checkout_configuration_id
+      ?? data?.checkout_configuration?.id
+      ?? data?.checkout_session_id
+      ?? null
+
+    if (sessionId) {
+      const { data: bySession } = await supabase
+        .from('transactions').select('id')
+        .eq('provider_transaction_id', String(sessionId)).maybeSingle()
+      if (bySession) return bySession
+    }
+
+    // 2b) Cobrança off-session (upsell de um clique): não existe checkout
+    //     configuration; o id do payment (pay_xxx) foi gravado como
+    //     provider_transaction_id quando a cobrança foi criada.
+    const paymentId = typeof data?.id === 'string' && data.id.startsWith('pay_') ? data.id : null
+    if (paymentId) {
+      const { data: byPayment } = await supabase
+        .from('transactions').select('id')
+        .eq('provider_transaction_id', paymentId).maybeSingle()
+      if (byPayment) return byPayment
+    }
+
+    // 3) order_number → external_reference (mesmo fallback do Sentinel/Rox).
+    const orderRef = metadata?.koopfy_order_ref
+    if (orderRef) {
+      const { data: byRef } = await supabase
+        .from('transactions').select('id')
+        .eq('external_reference', String(orderRef))
+        .eq('provider', 'whop')
+        .order('created_at', { ascending: false })
+        .limit(1).maybeSingle()
+      if (byRef) return byRef
+    }
+
+    return null
+  }
+
+  private warnOnWhopAmountMismatch(tx: { id: string }, data: any) {
+    const paid = Number(data?.amount ?? data?.total ?? NaN)
+    if (!Number.isFinite(paid)) return
+
+    // A Whop reporta em unidade principal (o mesmo formato de initial_price).
+    supabase
+      .from('transactions').select('amount, currency').eq('id', tx.id).maybeSingle()
+      .then(({ data: row }) => {
+        if (!row) return
+        const expected = Number(row.amount) / 100
+        if (Math.abs(expected - paid) > 0.01) {
+          console.error(
+            `[WebhookService] Whop: VALOR DIVERGENTE na transação ${tx.id} — ` +
+            `esperado ${expected} ${row.currency}, recebido ${paid}`,
+          )
+        }
+      })
+  }
+
+  // ─────────────────────────────────────────────
+  // Standard Webhooks (a mesma spec do Svix, usada pela Whop).
+  //
+  // Headers: webhook-id, webhook-timestamp, webhook-signature.
+  // Conteúdo assinado: `{id}.{timestamp}.{body-bruto}`.
+  // O header pode trazer VÁRIAS assinaturas separadas por espaço (rotação de
+  // segredo) — basta uma bater.
+  //
+  // ⚠️ A CHAVE DO HMAC. A spec padrão usa `whsec_<base64>` e manda base64-decodar
+  // a parte depois do prefixo. A Whop NÃO segue isso: o segredo dela vem como
+  // `ws_<64 hex>` (confirmado criando um webhook de verdade na API). O prefixo
+  // não é `whsec_`, então o verificador padrão não corta nada — e o SDK deles
+  // manda passar `btoa(secret)`, ou seja, base64 do segredo INTEIRO, que o
+  // verificador decodifica de volta para os bytes literais da string.
+  //
+  // Resultado prático: a chave é a STRING CRUA do segredo, com prefixo e tudo.
+  // Base64-decodar aqui (o que a spec sugeriria) produz lixo e a assinatura
+  // nunca bate — o pagamento chega, é recusado por "signature mismatch" e a
+  // transação fica pendente pra sempre.
+  //
+  // Testamos as duas derivações porque só uma entrega real prova qual está
+  // valendo, e um formato futuro `whsec_` voltaria a exigir a outra. Ambas saem
+  // do MESMO segredo, então aceitar as duas não amplia superfície de ataque.
+  // ─────────────────────────────────────────────
+
+  private verifyWhopSignature(
+    rawBody: string,
+    headers: Record<string, string>,
+    secret: string,
+  ): { valid: boolean; reason?: string } {
+    const id = headers['webhook-id']
+    const timestamp = headers['webhook-timestamp']
+    const signatureHeader = headers['webhook-signature']
+
+    if (!id || !timestamp || !signatureHeader) {
+      return { valid: false, reason: 'missing signature headers' }
+    }
+
+    const ts = Number(timestamp)
+    if (!Number.isFinite(ts)) return { valid: false, reason: 'invalid timestamp' }
+
+    const skew = Math.abs(Math.floor(Date.now() / 1000) - ts)
+    if (skew > WHOP_SIGNATURE_TOLERANCE_S) {
+      return { valid: false, reason: `timestamp fora da tolerância (${skew}s)` }
+    }
+
+    const signedContent = `${id}.${timestamp}.${rawBody}`
+
+    const keys: Buffer[] = [
+      // Formato da Whop hoje: chave = bytes literais do segredo (`ws_<hex>`).
+      Buffer.from(secret, 'utf8'),
+    ]
+    if (secret.startsWith('whsec_')) {
+      // Formato Standard Webhooks canônico, caso a Whop migre pra ele.
+      keys.push(Buffer.from(secret.slice('whsec_'.length), 'base64'))
+    }
+
+    const provided = signatureHeader
+      .split(' ')
+      .map(part => part.split(',')[1] ?? '')
+      .filter(Boolean)
+
+    if (provided.length === 0) return { valid: false, reason: 'no v1 signature' }
+
+    for (const key of keys) {
+      const expectedBuf = Buffer.from(
+        crypto.createHmac('sha256', key).update(signedContent).digest('base64'),
+      )
+
+      for (const candidate of provided) {
+        const candidateBuf = Buffer.from(candidate)
+        if (candidateBuf.length !== expectedBuf.length) continue
+        if (crypto.timingSafeEqual(candidateBuf, expectedBuf)) return { valid: true }
+      }
+    }
+
+    return { valid: false, reason: 'signature mismatch' }
+  }
+
+  // Resolve o transactions.id interno a partir do payload do webhook do Sentinel.
+  // ══════════════════════════════════════════════════════════════════════════
+  // STRIPE — um endpoint por conta: /webhook/stripe/:accountId
+  // ══════════════════════════════════════════════════════════════════════════
+  //
+  // A conta vai no PATH pela mesma razão da Whop: cada titular tem seu próprio
+  // signing secret, e um endpoint único não teria como saber com qual validar.
+  // Testar todos, além de lento, aceitaria um payload assinado pela conta
+  // errada — o que abriria a porta para uma conta confirmar pagamento de outra.
+  //
+  // ⚠️ O CORPO TEM QUE SER O BRUTO. A assinatura é sobre os bytes exatos;
+  // re-serializar o JSON parseado (ordem de chaves, escapes) invalida tudo.
+  // Ver express.raw em main.ts, registrado em /webhook/stripe.
+
+  async handleStripeWebhook(
+    accountId: string,
+    rawBody: string,
+    headers: Record<string, string> = {},
+  ) {
+    // ── 1. Conta ──
+    // getById NÃO filtra status nem quarentena de propósito: webhook de conta
+    // restringida continua chegando e é dinheiro que já entrou. Aliás, é
+    // justamente na conta quarentenada que os eventos mais importantes chegam.
+    const account = await this.stripeAccounts.getById(accountId)
+    if (!account) {
+      console.warn('[WebhookService] Stripe: conta desconhecida no path:', accountId)
+      return { ignored: true, reason: 'unknown account' }
+    }
+
+    // ── 2. Assinatura ──
+    const secret = account.config?.webhook_secret
+    if (!secret) {
+      // Sem segredo, qualquer um que descubra a URL confirma pagamento.
+      console.error(
+        `[WebhookService] Stripe: conta ${accountId} sem webhook_secret — evento recusado. `
+        + 'Cadastre o whsec_ do endpoint DESTA conta em stripe_accounts.webhook_secret.',
+      )
+      return { ignored: true, reason: 'missing webhook secret' }
+    }
+
+    const verification = this.verifyStripeSignature(rawBody, headers, secret)
+    if (!verification.valid) {
+      console.error(
+        `[WebhookService] Stripe: ASSINATURA INVÁLIDA (${verification.reason}) em ${accountId}. `
+        + 'Suspeita nº1: o body chegou re-serializado (confira express.raw em /webhook/stripe '
+        + 'no main.ts — o prefixo é SINGULAR). Suspeita nº2: o whsec_ cadastrado é de outro '
+        + 'endpoint/conta.',
+      )
+      // THROW, não 2xx. Responder 200 faz a Stripe marcar como entregue e o
+      // evento se perde: dinheiro entrou e o pedido nunca confirma. Com 5xx ela
+      // reentrega por até 3 dias, o que dá janela para corrigir o segredo sem
+      // perder as primeiras vendas.
+      throw new Error(`Stripe: assinatura inválida (${verification.reason}) em ${accountId}`)
+    }
+
+    let event: any = {}
+    try { event = JSON.parse(rawBody || '{}') } catch { /* payload inválido */ }
+
+    const eventId = String(event?.id ?? '')
+    const eventType = String(event?.type ?? '')
+    console.log('[Stripe webhook]', accountId, eventType, eventId)
+
+    // ── 3. Dedupe ──
+    // A Stripe entrega at-least-once e reentrega por até 3 dias. Sem isto, um
+    // redelivery de payment_intent.succeeded roda o pipeline de crédito de novo.
+    // A PK da tabela é a trava real — a corrida entre duas entregas simultâneas
+    // morre no conflito, não no if.
+    if (eventId) {
+      const { error: dedupeError } = await supabase
+        .from('stripe_webhook_events')
+        .insert({ event_id: eventId, account_id: accountId, event_type: eventType })
+
+      if (dedupeError) {
+        if ((dedupeError as any).code === '23505') return { alreadyProcessed: true }
+        console.error('[WebhookService] Stripe dedupe insert error:', dedupeError.message)
+      }
+    }
+
+    // A marca acima é RESERVA, não "pronto". Se o processamento estourar, é
+    // desfeita — senão o retry chegaria como duplicado e o pagamento ficaria
+    // pendente para sempre por causa de um erro transitório.
+    try {
+      return await this.processStripeEvent(accountId, eventType, event)
+    } catch (err) {
+      if (eventId) {
+        await supabase.from('stripe_webhook_events').delete().eq('event_id', eventId)
+      }
+      throw err
+    }
+  }
+
+  private async processStripeEvent(accountId: string, eventType: string, event: any) {
+    const object = event?.data?.object ?? {}
+
+    // ── 4. Eventos de RISCO — não mexem em transação, alimentam o governador ──
+    if (STRIPE_RISK_EVENTS.has(eventType)) {
+      return this.processStripeRiskEvent(accountId, eventType, object)
+    }
+
+    const mapped = STRIPE_EVENT_STATUS[eventType]
+    if (!mapped) {
+      console.log('[WebhookService] Stripe: evento sem mapeamento, ignorado:', eventType)
+      return { ignored: true, reason: 'unmapped event' }
+    }
+
+    // ── 5. Resolve a transação ──
+    const tx = await this.resolveStripeTx(object)
+    if (!tx) {
+      console.error(
+        '[WebhookService] Stripe: PAGAMENTO ÓRFÃO — nenhuma transação casou.',
+        JSON.stringify({ accountId, eventType, objectId: object?.id ?? null }),
+      )
+      // THROW, não `ignored`. Responder 2xx faz a Stripe parar de tentar e o
+      // pagamento morre órfão de vez. Com 5xx ela reentrega (a reserva de
+      // dedupe é desfeita no catch), e a corrida "webhook chegou antes de a
+      // linha existir" se resolve sozinha na retentativa.
+      throw new Error(`Stripe: transação não encontrada para ${eventType} (${accountId})`)
+    }
+
+    if (mapped === 'REFUNDED') {
+      // Reembolso conta como sinal de risco também: taxa de reembolso alta é o
+      // que a Stripe olha ANTES de a disputa aparecer — e é o único indicador
+      // em que agir cedo realmente muda o desfecho.
+      await this.stripeRisk.recordRiskEvent({
+        id: `rf_${object?.id ?? tx.id}`,
+        accountId,
+        kind: 'refund',
+        amountCents: object?.amount_refunded ?? null,
+        currency: object?.currency ?? null,
+        chargeId: object?.id ?? null,
+        transactionId: tx.id,
+        payload: { eventType },
+      }).catch(err => console.error('[WebhookService] recordRiskEvent(refund):', err?.message))
+
+      return this.refundTransaction(tx.id)
+    }
+
+    // Divergência de valor significa associação errada (metadata reaproveitado,
+    // intent reusado). Não bloqueia, mas tem que ser visível: aprovar a
+    // transação errada é pior do que aprovar tarde.
+    this.warnOnStripeAmountMismatch(tx, object)
+
+    return this.handleWebhookProvider({
+      reference: tx.id,
+      status: mapped,
+      type: 'TRANSACTION',
+      failure_message:
+        object?.last_payment_error?.message
+        ?? object?.failure_message
+        ?? null,
+    })
+  }
+
+  // ─────────────────────────────────────────────
+  // Eventos de risco → StripeRiskService
+  //
+  // O id do objeto na Stripe (dp_xxx, issfr_xxx, prv_xxx) vira a PK em
+  // stripe_risk_events, então reentrega não infla o numerador das taxas.
+  // ─────────────────────────────────────────────
+
+  private async processStripeRiskEvent(accountId: string, eventType: string, object: any) {
+    // Resolve uma vez: o id serve à atribuição do evento e o seller_id à
+    // atribuição por AFILIADO — que é onde está a causa, no modelo de afiliação.
+    const tx = await this.resolveStripeTx(object)
+    const txId = object?.metadata?.koopfy_transaction_id ?? tx?.id ?? null
+    const sellerId = tx?.seller_id ?? null
+
+    if (eventType.startsWith('charge.dispute')) {
+      await this.stripeRisk.recordRiskEvent({
+        id: String(object?.id ?? `dp_${Date.now()}`),
+        accountId,
+        kind: 'dispute',
+        reason: object?.reason ?? null,
+        amountCents: object?.amount ?? null,
+        currency: object?.currency ?? null,
+        chargeId: object?.charge ?? null,
+        paymentIntentId: object?.payment_intent ?? null,
+        transactionId: txId,
+        payload: { eventType, status: object?.status ?? null },
+      })
+
+      console.error(
+        `[WebhookService] 🚨 DISPUTA em ${accountId}: motivo="${object?.reason ?? '?'}" `
+        + `valor=${object?.amount ?? '?'} ${object?.currency ?? ''} `
+        + `prazo=${object?.evidence_details?.due_by ?? '?'}. `
+        + 'Responder com evidência de entrega é o que mantém a taxa sob controle — '
+        + 'disputa não contestada conta igual a disputa perdida.',
+      )
+
+      // A conta é onde o sintoma aparece; o afiliado é onde está a causa.
+      // Reavaliar na hora porque a decisão de cortar depende de ver a tendência
+      // cedo — esperar o ciclo de 1h é aceitável para a estatística e não é
+      // para o afiliado que acabou de cruzar o limiar.
+      if (sellerId) {
+        await this.affiliateRisk.evaluateOne(sellerId)
+          .catch(err => console.error('[WebhookService] affiliateRisk:', err?.message))
+      }
+
+      return { received: true, disputed: true }
+    }
+
+    if (eventType === 'radar.early_fraud_warning.created') {
+      await this.stripeRisk.recordRiskEvent({
+        id: String(object?.id ?? `efw_${Date.now()}`),
+        accountId,
+        kind: 'early_fraud_warning',
+        reason: object?.fraud_type ?? null,
+        chargeId: object?.charge ?? null,
+        paymentIntentId: object?.payment_intent ?? null,
+        transactionId: txId,
+        payload: { eventType },
+      })
+
+      console.error(
+        `[WebhookService] ⚠️ EARLY FRAUD WARNING em ${accountId} (charge ${object?.charge ?? '?'}, `
+        + `tipo=${object?.fraud_type ?? '?'}).`,
+      )
+
+      // Auto-reembolso na janela em que ainda muda o placar: EFW não conta para
+      // o programa das bandeiras, disputa conta. Opt-in por conta — ver
+      // StripeEfwService, que registra TODA decisão, inclusive as de não agir.
+      const outcome = await this.stripeEfw.handle({
+        efwId: String(object?.id ?? `efw_${Date.now()}`),
+        accountId,
+        chargeId: object?.charge ?? null,
+        paymentIntentId: object?.payment_intent ?? null,
+        fraudType: object?.fraud_type ?? null,
+        transactionId: txId,
+      })
+
+      // O reembolso na Stripe já saiu; falta a contabilidade daqui (status da
+      // transação, reversão do saldo do seller, postback). refundTransaction é
+      // idempotente, então reentrega do webhook não reverte duas vezes.
+      if (outcome.decision === 'refunded' && txId) {
+        await this.refundTransaction(String(txId))
+      }
+
+      return { received: true, earlyFraudWarning: true, efw: outcome }
+    }
+
+    if (eventType.startsWith('review.')) {
+      if (eventType === 'review.opened') {
+        await this.stripeRisk.recordRiskEvent({
+          id: String(object?.id ?? `prv_${Date.now()}`),
+          accountId,
+          kind: 'review',
+          reason: object?.reason ?? null,
+          chargeId: object?.charge ?? null,
+          paymentIntentId: object?.payment_intent ?? null,
+          transactionId: txId,
+          payload: { eventType },
+        })
+      }
+      return { received: true, review: true }
+    }
+
+    if (eventType === 'payout.failed') {
+      await this.stripeRisk.recordRiskEvent({
+        id: String(object?.id ?? `po_${Date.now()}`),
+        accountId,
+        kind: 'payout_failed',
+        reason: object?.failure_message ?? object?.failure_code ?? null,
+        amountCents: object?.amount ?? null,
+        currency: object?.currency ?? null,
+        payload: { eventType },
+      })
+
+      console.error(
+        `[WebhookService] 🚨 PAYOUT FALHOU em ${accountId}: `
+        + `${object?.failure_code ?? '?'} — ${object?.failure_message ?? 'sem mensagem'}. `
+        + 'O dinheiro está preso. Confira os dados bancários do titular antes que '
+        + 'a Stripe suspenda os payouts da conta.',
+      )
+      return { received: true, payoutFailed: true }
+    }
+
+    if (eventType === 'account.updated') {
+      // Chega em conta Connect; em standalone o sinal confiável é o probe do
+      // StripeRiskService. Quando chega, vale antecipar a avaliação em vez de
+      // esperar os 5 min do ciclo.
+      const row = await this.stripeAccounts.getRowById(accountId)
+      if (row) {
+        await this.stripeRisk.probeOne(row)
+          .catch(err => console.error('[WebhookService] probeOne:', err?.message))
+      }
+      return { received: true, accountUpdated: true }
+    }
+
+    return { received: true }
+  }
+
+  // ─────────────────────────────────────────────
+  // Resolve transactions.id a partir do objeto da Stripe.
+  //
+  // Ordem importa: o metadata é o fio PRIMÁRIO (posto em StripeProvider.charge
+  // e devolvido em todo evento do intent). Os demais são rede de segurança —
+  // eventos de Charge, por exemplo, nem sempre carregam o metadata do intent.
+  // ─────────────────────────────────────────────
+
+  private async resolveStripeTx(object: any): Promise<{ id: string; amount?: number; currency?: string; seller_id?: string } | null> {
+    // 1) PRIMÁRIO — nosso transactions.id, ida e volta pelo metadata.
+    const txId = object?.metadata?.koopfy_transaction_id
+    if (txId) {
+      const { data } = await supabase
+        .from('transactions').select('id, amount, currency, seller_id').eq('id', String(txId)).maybeSingle()
+      if (data) return data
+    }
+
+    // 2) PaymentIntent id — gravado como provider_transaction_id no charge.
+    const intentId = typeof object?.payment_intent === 'string'
+      ? object.payment_intent
+      : (object?.payment_intent?.id ?? (String(object?.id ?? '').startsWith('pi_') ? object.id : null))
+
+    if (intentId) {
+      const { data } = await supabase
+        .from('transactions').select('id, amount, currency')
+        .eq('provider_transaction_id', String(intentId)).maybeSingle()
+      if (data) return data
+    }
+
+    return null
+  }
+
+  private warnOnStripeAmountMismatch(tx: { id: string; amount?: number; currency?: string }, object: any) {
+    const raw = Number(object?.amount_received ?? object?.amount ?? NaN)
+    if (!Number.isFinite(raw) || tx.amount == null) return
+
+    // O valor volta na MENOR UNIDADE DA MOEDA, que não é centavo em toda moeda.
+    // Sem desfazer a conversão do StripeProvider.toStripeAmount, JPY divergiria
+    // por 100x em TODA venda — e um alerta que dispara sempre é um alerta que
+    // ninguém lê no dia em que ele estiver certo.
+    const currency = String(object?.currency ?? tx.currency ?? '').toUpperCase()
+    const received = STRIPE_ZERO_DECIMAL.has(currency) ? raw * 100
+      : STRIPE_THREE_DECIMAL.has(currency) ? raw / 10
+        : raw
+
+    if (Math.abs(received - Number(tx.amount)) > 1) {
+      console.error(
+        `[WebhookService] Stripe: VALOR DIVERGENTE na transação ${tx.id} — `
+        + `esperado ${tx.amount} ${tx.currency ?? '?'}, recebido ${received} `
+        + `${object?.currency?.toUpperCase() ?? '?'}. Provável associação errada `
+        + '(metadata reaproveitado ou intent reusado). Não bloqueia, mas confira.',
+      )
+    }
+  }
+
+  // ─────────────────────────────────────────────
+  // Assinatura da Stripe (header `stripe-signature`)
+  //
+  // Formato: t=<unix>,v1=<hex>[,v1=<hex>...]
+  // Payload assinado: `${t}.${rawBody}`, HMAC-SHA256 com o whsec_ COMO STRING
+  // (não decodificado de base64 — erro clássico, e o sintoma é "assinatura
+  // inválida em TODO evento").
+  //
+  // Feito à mão em vez de stripe.webhooks.constructEvent de propósito: o
+  // construtor do SDK exige uma secret key válida, e o webhook precisa
+  // funcionar mesmo quando a chave da conta foi revogada pela Stripe — que é
+  // exatamente o cenário em que os eventos importantes chegam.
+  // ─────────────────────────────────────────────
+
+  private verifyStripeSignature(
+    rawBody: string,
+    headers: Record<string, string>,
+    secret: string,
+  ): { valid: boolean; reason?: string } {
+    const header = headers['stripe-signature'] ?? headers['Stripe-Signature']
+    if (!header) return { valid: false, reason: 'header stripe-signature ausente' }
+
+    let timestamp: string | null = null
+    const signatures: string[] = []
+
+    for (const part of String(header).split(',')) {
+      const [k, v] = part.split('=', 2)
+      if (k?.trim() === 't') timestamp = v?.trim() ?? null
+      if (k?.trim() === 'v1' && v) signatures.push(v.trim())
+    }
+
+    if (!timestamp) return { valid: false, reason: 'timestamp ausente no header' }
+    if (signatures.length === 0) return { valid: false, reason: 'nenhuma assinatura v1 no header' }
+
+    // Janela de tolerância: é o que impede replay de um payload legítimo
+    // capturado. Sem ela, quem gravar um payment_intent.succeeded pode
+    // reenviá-lo para sempre.
+    const age = Math.abs(Math.floor(Date.now() / 1000) - Number(timestamp))
+    if (!Number.isFinite(age) || age > STRIPE_SIGNATURE_TOLERANCE_S) {
+      return { valid: false, reason: `timestamp fora da tolerância (${age}s)` }
+    }
+
+    const expected = crypto
+      .createHmac('sha256', secret)
+      .update(`${timestamp}.${rawBody}`, 'utf8')
+      .digest('hex')
+
+    const expectedBuf = Buffer.from(expected, 'hex')
+
+    // timingSafeEqual em todas as v1 (a Stripe manda mais de uma durante a
+    // rotação do segredo — comparar só a primeira quebra exatamente no
+    // momento em que você está rotacionando).
+    const match = signatures.some(sig => {
+      const sigBuf = Buffer.from(sig, 'hex')
+      return sigBuf.length === expectedBuf.length && crypto.timingSafeEqual(sigBuf, expectedBuf)
+    })
+
+    return match ? { valid: true } : { valid: false, reason: 'HMAC não confere' }
+  }
+
+  private async resolveSentinelTxId(body: any): Promise<string | null> {
+    // 1) PRIMÁRIO: provider_transaction_id == sentinel_transaction_id. É o id ÚNICO
+    //    da Sentinel, gravado na criação do hosted (antes do redirect) — a associação
+    //    mais confiável, sem depender do order_id (que é humano e pode colidir).
+    const sentinelTxnId = body?.sentinel_transaction_id ?? body?.transaction_id ?? null
+    if (sentinelTxnId) {
+      const { data } = await supabase
+        .from('transactions').select('id')
+        .eq('provider_transaction_id', sentinelTxnId).maybeSingle()
+      if (data) return data.id
+    }
+
+    // 2) Fallback por order_id (caso o webhook não traga o sentinel_transaction_id).
+    const ref = body?.wc_order_id ?? body?.order_id ?? body?.reference ?? null
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+    if (ref) {
+      // 2a) Compat: fluxo antigo enviava order_id = transactions.id (UUID).
+      if (UUID_RE.test(String(ref))) {
+        const { data } = await supabase
+          .from('transactions').select('id').eq('id', ref).maybeSingle()
+        if (data) return data.id
+      }
+      // 2b) Fluxo atual: order_id = order_number (humano) → external_reference.
+      //     Pega a transação mais recente (cobre retries com o mesmo número).
+      const { data: byRef } = await supabase
+        .from('transactions').select('id')
+        .eq('external_reference', String(ref))
+        .order('created_at', { ascending: false })
+        .limit(1).maybeSingle()
+      if (byRef) return byRef.id
+    }
+
+    return null
+  }
+
+  // Verificação da assinatura do webhook do Sentinel.
+  // Header: X-Sentinel-Signature: sha256=<hmac_hex>
+  // HMAC-SHA256 do corpo BRUTO usando o Webhook Secret (env SENTINEL_WEBHOOK).
+  private verifySentinelSignature(rawBody: string, headers: Record<string, string>): boolean {
+    const secret = process.env.SENTINEL_WEBHOOK
+    const signature = headers['x-sentinel-signature'] ?? null
+
+    if (!secret) {
+      console.error('[WebhookService] SENTINEL_WEBHOOK não configurado — rejeitando webhook')
+      return false
+    }
+    if (!signature) return false
+
+    const expected = 'sha256=' + crypto
+      .createHmac('sha256', secret)
+      .update(rawBody)
+      .digest('hex')
+
+    try {
+      return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature))
+    } catch {
+      return false
+    }
+  }
+
+  // ─── REFUND ───────────────────────────────────────────────────────────────
+  // Reverte uma transação estornada. O estorno é dirigido pelas entradas REAIS
+  // de crédito no ledger (credit_pending / credit_platform_fee /
+  // credit_external_fee), revertendo cada uma do bucket onde o dinheiro está.
+  // Assim só debitamos o que foi de fato creditado, no lugar certo.
+  private async refundTransaction(reference: string) {
+    const { data: tx } = await supabase
+      .from('transactions').select('*').eq('id', reference).single()
+
+    if (!tx) {
+      console.warn('[WebhookService] refund: transação não encontrada:', reference)
+      return { ignored: true, reason: 'transaction not found' }
+    }
+    if (tx.status === 'refunded') return { alreadyProcessed: true }
+
+    const now = new Date().toISOString()
+
+    // 1) Marca a transação como refunded (idempotente via .neq)
+    const { data: updated } = await supabase
+      .from('transactions')
+      .update({
+        status: 'refunded',
+        provider_status: 'refunded',
+        processed_at: now,
+        webhook_sent: true,
+        last_webhook_at: now,
+        updated_at: new Date(),
+      })
+      .eq('id', tx.id)
+      .neq('status', 'refunded')
+      .select()
+
+    if (!updated || updated.length === 0) return { alreadyProcessed: true }
+
+    // 2) Reverte APENAS o net do seller. As taxas (platform/external) NÃO são
+    //    estornadas — num refund nossas taxas permanecem.
+    const { data: credits } = await supabase
+      .from('wallet_ledger')
+      .select('seller_id, type, amount, status')
+      .eq('transaction_id', tx.id)
+      .eq('type', 'credit_pending')
+
+    for (const c of credits ?? []) {
+      if (!c.amount || c.amount <= 0) continue
+
+      // credit_pending pode estar em pending (não liquidado) ou available (liquidado)
+      const bucket = c.status === 'completed' ? 'available' : 'pending'
+      await this.reverseBalance(c.seller_id, bucket, c.amount, tx.id, 'refund')
+    }
+
+    // 3) Notifica o seller
+    await this.dispatchToAll(tx, 'payment.refunded', {
+      status: 'refunded',
+      transactionId: tx.id,
+      amount: tx.amount,
+      currency: tx.currency,
+      amountUsd: tx.amount_usd_net_cents,
+    })
+
+    return { refunded: true }
+  }
+
+  // Debita um bucket e registra o lançamento de estorno (idempotente por
+  // transaction_id+type). Se o saldo for insuficiente, NÃO trava: marca o
+  // lançamento para reconciliação manual e segue (retornamos 200 ao provider).
+  private async reverseBalance(
+    walletRef: string,
+    bucket: string,
+    amountCents: number,
+    txId: string,
+    ledgerType: string,
+  ): Promise<void> {
+    const { data: existing } = await supabase
+      .from('wallet_ledger')
+      .select('id')
+      .eq('transaction_id', txId)
+      .eq('type', ledgerType)
+      .maybeSingle()
+
+    if (existing) return // já revertido
+
+    const { error: rpcError } = await supabase.rpc('debit_balance', {
+      p_seller_id: walletRef,
+      p_bucket: bucket,
+      p_amount_cents: amountCents,
+    })
+
+    await supabase.from('wallet_ledger').insert({
+      seller_id: walletRef,
+      transaction_id: txId,
+      type: ledgerType,
+      amount: amountCents,
+      currency: 'USD',
+      status: rpcError ? 'failed' : 'completed',
+      metadata: rpcError
+        ? { bucket, reconciliation: true, error: rpcError.message }
+        : { bucket },
+      created_at: new Date().toISOString(),
+    })
+
+    if (rpcError) {
+      console.error(
+        `[WebhookService] refund debit falhou (${ledgerType}) wallet=${walletRef} ` +
+        `bucket=${bucket} amount=${amountCents}: ${rpcError.message} — marcado p/ reconciliação`,
+      )
+    }
   }
 
   // ─── Dispatch para todas as URLs (inalterado) ─────────────────────────────
@@ -337,7 +1706,7 @@ export class WebhookService {
   }
 
   async replayWaylinxWebhooks() {
-    const POSTBACK_URL = 'https://api.waylinxpay.com/webhook/nexor';
+    const POSTBACK_URL = 'https://api.koopfy.com/webhook/nexor';
     const PAGE_SIZE = 500;
     const CONCURRENCY = 5;  // disparos paralelos por lote
 

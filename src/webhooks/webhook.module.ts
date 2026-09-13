@@ -8,5 +8,6 @@ import { OrchestratorModule } from '../orchestrator/orchestrator.module';
   imports: [WalletModule, OrchestratorModule],
   controllers: [WebhookController],
   providers: [WebhookService],
+  exports: [WebhookService],
 })
 export class WebhookModule {}

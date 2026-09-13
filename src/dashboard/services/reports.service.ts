@@ -46,15 +46,74 @@ export class DashboardService {
       prevTo = dateFrom
     }
 
-    const [kpis, volumeChart, methodsDistribution, recentActivity, topPlayers] = await Promise.all([
+    const [kpis, volumeChart, methodsDistribution, recentActivity, topPlayers, recurring] = await Promise.all([
       this.getKPIs(sellerId, dateFrom, dateTo, prevFrom, prevTo, isDay),
       isDay ? Promise.resolve([]) : this.getVolumeChart(sellerId, period as '7d' | '30d' | '90d'),
       this.getMethodsDistribution(sellerId, dateFrom, dateTo),
       this.getRecentActivity(sellerId, isDay ? dateFrom : undefined),
       this.getTopPlayers(),
+      this.getRecurringSummary(sellerId),
     ])
 
-    return { kpis, volumeChart, methodsDistribution, recentActivity, topPlayers }
+    return { kpis, volumeChart, methodsDistribution, recentActivity, topPlayers, recurring }
+  }
+
+  private async getRecurringSummary(sellerId: string) {
+    const { data: transactions } = await supabase
+      .from('transactions')
+      .select('id, amount_usd_gross_cents, metadata')
+      .eq('seller_id', sellerId)
+
+    const txRows = transactions ?? []
+    const txIds = txRows.map(tx => tx.id)
+    if (txIds.length === 0) {
+      return { active: 0, trialing: 0, pastDue: 0, canceling: 0, mrr: 0, plans: [] }
+    }
+
+    const { data: subscriptions } = await supabase
+      .from('whop_subscriptions')
+      .select('koopfy_transaction_id, status, cancel_at_period_end, metadata')
+      .in('koopfy_transaction_id', txIds)
+
+    const txById = new Map(txRows.map(tx => [tx.id, tx]))
+    const rows = subscriptions ?? []
+    const activeStatuses = new Set(['active', 'trialing'])
+    const plans = new Map<string, { id: string; name: string; subscribers: number; mrr: number }>()
+    let mrrCents = 0
+
+    for (const subscription of rows) {
+      const tx: any = txById.get(subscription.koopfy_transaction_id)
+      const metadata = tx?.metadata ?? subscription.metadata ?? {}
+      const plan = metadata?.pricing_plan ?? {}
+      const planId = String(plan.id ?? metadata?.koopfy_pricing_plan_id ?? 'default')
+      const planName = String(plan.name ?? 'Plano principal')
+      const billingDays = Math.max(1, Number(
+        plan.billing_period_days ?? metadata?.subscription_config?.billing_period_days ?? 30,
+      ))
+      // Os preços do plano Koopfy são armazenados em unidade principal (USD),
+      // enquanto a transação usa centavos.
+      const recurringCents = plan.renewal_price != null
+        ? Math.round(Number(plan.renewal_price) * 100)
+        : Math.round(Number(tx?.amount_usd_gross_cents ?? 0))
+      const monthlyCents = Math.round(recurringCents * (30 / billingDays))
+
+      if (activeStatuses.has(String(subscription.status))) mrrCents += monthlyCents
+      const current = plans.get(planId) ?? { id: planId, name: planName, subscribers: 0, mrr: 0 }
+      if (activeStatuses.has(String(subscription.status))) {
+        current.subscribers += 1
+        current.mrr += c(monthlyCents)
+      }
+      plans.set(planId, current)
+    }
+
+    return {
+      active: rows.filter(row => row.status === 'active').length,
+      trialing: rows.filter(row => row.status === 'trialing').length,
+      pastDue: rows.filter(row => ['past_due', 'unpaid'].includes(row.status)).length,
+      canceling: rows.filter(row => Boolean(row.cancel_at_period_end)).length,
+      mrr: c(mrrCents),
+      plans: [...plans.values()].sort((a, b) => b.subscribers - a.subscribers),
+    }
   }
 
   // ─── KPIs ─────────────────────────────────────────────────────────────────────

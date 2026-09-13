@@ -13,7 +13,10 @@ import { AccountRouterService } from '../orchestrator/router/account-router.serv
 // stripe-js + PaymentElement, usando flow 'client'.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const HOSTED_PROVIDERS = new Set<string>(['viva', 'stripe_crypto'])
+// Whop é hosted: o comprador paga dentro do iframe da company escolhida pelo
+// router. NÃO entra em FIXED_PROVIDERS de propósito — dividir volume entre as
+// contas é o objetivo, então ela compete por país/risco/déficit como as demais.
+const HOSTED_PROVIDERS = new Set<string>(['viva', 'stripe_crypto', 'whop'])
 
 // FIXED_PROVIDERS — selecionados via seller.provider_default, não via router.
 // Quando seller fixa um desses, pulamos a competição por país/risco/balanço.
@@ -447,6 +450,109 @@ export class CheckoutService {
       country: args.country,
       methods: args.payload.methods,
     }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // EMBED — configuração pública de uma sessão
+  // ──────────────────────────────────────────────────────────────────────────
+  // Chamada pelo IFRAME do embed, sem sk_live_: o segredo do seller nunca vai
+  // ao browser. O que autentica aqui é o próprio sessionId, que já é escopado a
+  // um seller, um valor e uma moeda.
+  //
+  // ⚠️ NÃO DEVOLVE NADA QUE PERMITA COBRAR FORA DESTA SESSÃO. Sem chave de
+  // API, sem id de conta, sem secret. A public_key do cartão vem só depois, do
+  // /payments/clip/route, e amarrada à reserva.
+  //
+  // `origins` sai daqui porque quem monta o CSP `frame-ancestors` é a camada de
+  // borda do embed, e ela precisa saber onde aquela sessão pode ser enquadrada.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /** Sessão resolvida para uso no caminho de cobrança do embed.
+   *  Fonte de verdade de seller, valor e moeda — nada disso vem do browser. */
+  async resolveSession(sessionId: string) {
+    const { data } = await supabase
+      .from('checkout_sessions')
+      .select('id, seller_id, amount, currency, country')
+      .eq('id', sessionId)
+      .maybeSingle()
+
+    if (!data) throw new BadRequestException('Sessão não encontrada.')
+    return {
+      sellerId: data.seller_id as string,
+      amount: Number(data.amount),
+      currency: String(data.currency),
+      country: String(data.country ?? 'MX'),
+    }
+  }
+
+  async getEmbedConfig(sessionId: string) {
+    const { data: sess } = await supabase
+      .from('checkout_sessions')
+      .select('id, seller_id, amount, currency, country, metadata, created_at')
+      .eq('id', sessionId)
+      .maybeSingle()
+
+    if (!sess) throw new BadRequestException('Sessão não encontrada.')
+
+    const seller = await this.getSeller(sess.seller_id)
+    if (!seller || seller.status !== 'active') {
+      throw new BadRequestException('Seller indisponível.')
+    }
+
+    const { data: origens } = await supabase
+      .from('gw_embed_origins')
+      .select('origin, wildcard')
+      .eq('seller_id', sess.seller_id)
+      .eq('status', 'active')
+
+    // ⚠️ Sem origem cadastrada, o embed NÃO renderiza em lugar nenhum.
+    // Fechado por padrão: "sem lista, libera tudo" transforma um cadastro
+    // esquecido em brecha aberta. Tabela ausente cai aqui também, e negar é a
+    // resposta certa: migration não aplicada não pode virar embed liberado.
+    const lista = origens ?? []
+
+    const habilitados = new Set(
+      (seller.enabled_methods ?? []).map((m: any) => String(m).toLowerCase()),
+    )
+    const metodos: string[] = []
+    if (['card', 'credit_card', 'debit_card'].some(m => habilitados.has(m))) {
+      metodos.push('card')
+    }
+    if (habilitados.has('spei') && String(sess.currency).toUpperCase() === 'MXN') {
+      metodos.push('spei')
+    }
+
+    return {
+      sessionId: sess.id,
+      amount: sess.amount,
+      currency: sess.currency,
+      country: sess.country,
+      // ⚠️ Os métodos vêm do SELLER, não da sessão — `checkout_sessions` não
+      // guarda essa coluna, e o que vale é o que está habilitado agora.
+      //
+      // O filtro de SPEI acontece AQUI, no servidor, e não no iframe: SPEI é o
+      // trilho do Banco de México e só existe em MXN. Deixar o cliente decidir
+      // faria uma sessão em BRL oferecer um método que o comprador não tem como
+      // usar — ele só descobriria depois de preencher tudo.
+      methods: metodos,
+      provider: this.normalizeProviderName(seller.provider_default),
+      // Aparência da loja, para o iframe não parecer um corpo estranho na
+      // página do seller.
+      brand: {
+        name: seller.name ?? null,
+        primaryColor: seller.config?.primary_color ?? null,
+      },
+      origins: lista,
+    }
+  }
+
+  /** Registra ONDE a sessão foi de fato enquadrada. Depois de um incidente,
+   *  é o que responde de onde o pagamento veio sem depender de log rotativo. */
+  async registrarEmbedOrigin(sessionId: string, origin: string) {
+    await supabase.from('checkout_sessions')
+      .update({ embed_origin: origin, embed_rendered_at: new Date().toISOString() })
+      .eq('id', sessionId)
+      .is('embed_origin', null)
   }
 
   // ─── Helpers ──────────────────────────────────────────────────────────────

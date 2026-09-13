@@ -36,9 +36,10 @@ import { SettingsService } from '../services/services'
 // ─── Payments (já existia) ────────────────────────────────────────────────────
 import { PaymentController } from '../../payments/payments.controller'
 import { PaymentService } from '../../payments/payments.service'
-import { AccountRouterService } from '../../orchestrator/router/account-router.service'
+import { OrchestratorModule } from '../../orchestrator/orchestrator.module'
 import { CurrencyModule } from '../../currency/currency.module'
 import { CryptoModule } from '../../crypto/crypto.module'
+import { StorageService } from '../../lib/storage.service'
 
 // ============================================================
 // DASHBOARD MODULE
@@ -47,6 +48,7 @@ import { CryptoModule } from '../../crypto/crypto.module'
 @Module({
   controllers: [DashboardController],
   providers:   [DashboardService],
+  exports:     [DashboardService],
 })
 export class DashboardModule {}
 
@@ -56,7 +58,7 @@ export class DashboardModule {}
 
 @Module({
   controllers: [TransactionsController],
-  providers:   [TransactionsService],
+  providers:   [TransactionsService, StorageService],
   exports:     [TransactionsService],
 })
 export class TransactionsModule {}
@@ -79,6 +81,7 @@ export class WalletDashModule {}
 @Module({
   controllers: [DisputesController],
   providers:   [DisputesService],
+  exports:     [DisputesService],
 })
 export class DisputesModule {}
 
@@ -89,6 +92,7 @@ export class DisputesModule {}
 @Module({
   controllers: [TransfersController],
   providers:   [TransfersService],
+  exports:     [TransfersService],
 })
 export class TransfersModule {}
 
@@ -99,6 +103,7 @@ export class TransfersModule {}
 @Module({
   controllers: [PaymentMethodsController],
   providers:   [PaymentMethodsService],
+  exports:     [PaymentMethodsService],
 })
 export class PaymentMethodsModule {}
 
@@ -109,6 +114,7 @@ export class PaymentMethodsModule {}
 @Module({
   controllers: [SettingsController],
   providers:   [SettingsService],
+  exports:     [SettingsService],
 })
 export class SettingsModule {}
 
@@ -121,9 +127,11 @@ export class SettingsModule {}
     WalletDashModule,
     CurrencyModule,
     CryptoModule,
+    // Instância ÚNICA do router — ver comentário em payments/payments.module.ts.
+    OrchestratorModule,
   ],
   controllers: [PaymentController],
-  providers:   [PaymentService, AccountRouterService],
+  providers:   [PaymentService],
   exports:     [PaymentService],
 })
 export class PaymentModule {}

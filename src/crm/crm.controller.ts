@@ -109,9 +109,127 @@ export class CrmController {
       enabledMethods: string[]
       feeOverride?: any
       notes?: string
+      /** Grupo de WhatsApp da operação logística — o grupo já existe na aprovação. */
+      logisticsGroupUrl?: string | null
     },
   ) {
     return this.crm.approveSeller(id, req.manager.sub, body)
+  }
+
+  /**
+   * Adiciona / edita / remove o grupo logístico depois da aprovação.
+   * Body vazio (`url: null`) desvincula o grupo.
+   */
+  @Patch('sellers/:id/logistics-group')
+  @UseGuards(CrmAuthGuard)
+  updateLogisticsGroup(
+    @Param('id') id: string,
+    @Req() req: any,
+    @Body() body: { url?: string | null; notes?: string; partner?: string | null },
+  ) {
+    return this.crm.updateLogisticsGroup(id, req.manager.sub, body)
+  }
+
+  // ─── Radar de risco de chargeback ─────────────────────────────────────────
+
+  // ─── SPEI: contas e saque ──────────────────────────────────────────────────
+  //
+  // O teto do SPEI é de ESTOQUE: só volta quando alguém saca. Conta cheia = o
+  // roteador para de oferecer SPEI, e sem esta rota a única saída seria UPDATE
+  // na mão no banco.
+  @Get('spei/accounts')
+  @UseGuards(CrmAuthGuard)
+  speiAccounts() {
+    return this.crm.listSpeiAccounts()
+  }
+
+  /**
+   * Registra o saque e libera o teto.
+   *
+   * ⚠️ Exige `saldo_observado_minor` ALÉM do valor sacado. O observado é o que
+   * a pessoa vê no app da Clip naquele instante — é ele que zera a deriva
+   * acumulada e revela pagamento fantasma ou comprovante falso aprovado.
+   * Aceitar só o valor sacado deixaria o contador ser uma crença que erra um
+   * pouco todo mês.
+   */
+  @Post('spei/accounts/:accountId/withdraw')
+  @UseGuards(CrmAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  speiWithdraw(
+    @Param('accountId') accountId: string,
+    @Req() req: any,
+    @Body() body: { saldo_observado_minor?: number; valor_sacado_minor?: number; nota?: string },
+  ) {
+    return this.crm.withdrawSpei(accountId, req.manager.sub, body)
+  }
+
+  // ─── SPEI: fila de comprovantes para revisão humana ───────────────────────
+  //
+  // Tudo que a análise automática não liberou sozinha: fora da janela de 24h,
+  // agendada, centavos que não batem, leitura ruim.
+  @Get('spei/proofs')
+  @UseGuards(CrmAuthGuard)
+  speiProofs(@Query('page') page?: string, @Query('status') status?: string) {
+    return this.crm.listSpeiProofs({ page: page ? Number(page) : 1, status })
+  }
+
+  /**
+   * Decide um comprovante.
+   *
+   * ⚠️ `conferido_no_extrato` NÃO é detalhe de formulário. Ele separa "li o
+   * comprovante e achei convincente" de "abri o extrato da Clip e o dinheiro
+   * está lá". Só o segundo conta como confirmado nos relatórios de saldo —
+   * quem olha um print tem a mesma limitação do modelo.
+   */
+  @Post('spei/proofs/:transactionId/decide')
+  @UseGuards(CrmAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  decideSpeiProof(
+    @Param('transactionId') transactionId: string,
+    @Req() req: any,
+    @Body() body: { decision: 'approve' | 'reject'; conferido_no_extrato?: boolean; nota?: string },
+  ) {
+    return this.crm.decideSpeiProof(transactionId, req.manager.sub, body)
+  }
+
+  @Get('orders/risk')
+  @UseGuards(CrmAuthGuard)
+  orderRisk(
+    @Query('page') page?: string,
+    @Query('level') level?: string,
+    @Query('workspaceId') workspaceId?: string,
+    @Query('search') search?: string,
+    @Query('since') since?: string,
+  ) {
+    return this.crm.listOrderRisk({
+      page: page ? Number(page) : 1,
+      level, workspaceId, search, since,
+    })
+  }
+
+  @Get('orders/risk/:orderId')
+  @UseGuards(CrmAuthGuard)
+  orderRiskDetail(@Param('orderId') orderId: string) {
+    return this.crm.getOrderRisk(orderId)
+  }
+
+  /** Envia a notificação que faltou (idempotente no checkout). */
+  @Post('orders/risk/:orderId/notify')
+  @UseGuards(CrmAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  notifyOrder(
+    @Param('orderId') orderId: string,
+    @Req() req: any,
+    @Body() body: { type: 'confirmation' | 'tracking' },
+  ) {
+    return this.crm.notifyOrder(orderId, req.manager.sub, body?.type ?? 'confirmation')
+  }
+
+  /** Catálogo de parceiros logísticos (vem do checkout) — seletor do CRM. */
+  @Get('logistics-partners')
+  @UseGuards(CrmAuthGuard)
+  logisticsPartners() {
+    return this.crm.listLogisticsPartners()
   }
 
   @Post('sellers/:id/reject')
@@ -253,11 +371,131 @@ export class CrmController {
     @Param('id') id: string,
     @Req() req: any,
     @Body() body: {
-      provider: 'stripe' | 'viva' | 'sibs' | 'stripe_crypto' | 'onramp' | null
+      provider: 'stripe' | 'viva' | 'sibs' | 'stripe_crypto' | 'onramp' | 'setinel_gate' | 'approvebly' | 'coinflow' | 'rox_pay' | 'whop' | 'simulator' | null
       notes?: string
     },
   ) {
     return this.crm.updateProviderDefault(id, req.manager.sub, body)
+  }
+
+  // ─── Whop — pool de contas ──────────────────────────────────────────────────
+  //
+  // Não há rota "conta do seller": o seller só aponta pra `whop` e o router
+  // escolhe a company por pedido. O que se administra aqui é o POOL.
+
+  @Get('whop-accounts')
+  @UseGuards(CrmAuthGuard)
+  listWhopAccounts() {
+    return this.crm.listWhopAccounts()
+  }
+
+  // Provisionamento por CHAVE: descobre a company, registra o webhook e grava
+  // tudo. É o caminho normal pra adicionar um titular novo — o POST abaixo fica
+  // pra edição e pros casos em que a company já tem webhook próprio.
+  @Post('whop-accounts/provision')
+  @UseGuards(CrmAuthGuard)
+  @Roles('admin')
+  provisionWhopAccount(
+    @Req() req: any,
+    @Body() body: {
+      id: string
+      apiKey: string
+      label?: string
+      weight?: number
+      dailyCapAmount?: number | null
+      legalName?: string
+    },
+  ) {
+    return this.crm.provisionWhopAccount(req.manager.sub, body)
+  }
+
+  // Cadastro/edição da conta, incluindo credenciais (só admin).
+  @Post('whop-accounts')
+  @UseGuards(CrmAuthGuard)
+  @Roles('admin')
+  upsertWhopAccount(
+    @Req() req: any,
+    @Body() body: {
+      id: string
+      label?: string
+      companyId: string
+      productId?: string
+      apiKey?: string
+      webhookSecret?: string
+      webhookId?: string
+      apiUrl?: string
+      status?: 'active' | 'inactive'
+      weight?: number
+      currency?: string
+      countries?: string[]
+      country?: string
+      dailyCapAmount?: number | null
+      minTicket?: number | null
+      maxTicket?: number | null
+      legalName?: string
+      descriptor?: string
+    },
+  ) {
+    return this.crm.upsertWhopAccount(req.manager.sub, body)
+  }
+
+  // Controles de roteamento (pausar, peso, tetos, cooldown). Sem credencial —
+  // por isso não exige admin: tirar uma conta do ar é operação, não cadastro.
+  @Patch('whop-accounts/:id')
+  @UseGuards(CrmAuthGuard)
+  updateWhopAccountRouting(
+    @Param('id') id: string,
+    @Req() req: any,
+    @Body() body: {
+      status?: 'active' | 'inactive'
+      weight?: number
+      dailyCapAmount?: number | null
+      minTicket?: number | null
+      maxTicket?: number | null
+      cooldownUntil?: string | null
+      notes?: string
+    },
+  ) {
+    return this.crm.updateWhopAccountRouting(id, req.manager.sub, body)
+  }
+
+  // ─── Sentinel MIDs ──────────────────────────────────────────────────────────
+
+  // Lista os MIDs do Sentinel disponíveis (sem segredos) p/ atribuir ao seller.
+  @Get('sentinel-mids')
+  @UseGuards(CrmAuthGuard)
+  listSentinelMids() {
+    return this.crm.listSentinelMids()
+  }
+
+  // Registra/atualiza um MID + credenciais (admin).
+  @Post('sentinel-mids')
+  @UseGuards(CrmAuthGuard)
+  @Roles('admin')
+  upsertSentinelMid(
+    @Req() req: any,
+    @Body() body: {
+      mid: string
+      label?: string
+      apiKey: string
+      apiSecret: string
+      mbwayApiKey?: string
+      apiUrl?: string
+      status?: 'active' | 'inactive'
+    },
+  ) {
+    return this.crm.upsertSentinelMid(req.manager.sub, body)
+  }
+
+  // Atribui (ou limpa) o MID do Sentinel de um seller.
+  @Patch('sellers/:id/mid')
+  @UseGuards(CrmAuthGuard)
+  updateSellerMid(
+    @Param('id') id: string,
+    @Req() req: any,
+    @Body() body: { mid: string | null; notes?: string },
+  ) {
+    return this.crm.updateSellerMid(id, req.manager.sub, body)
   }
 
 }

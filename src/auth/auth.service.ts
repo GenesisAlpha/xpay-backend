@@ -4,6 +4,7 @@ import {
   UnauthorizedException,
   BadRequestException,
   NotFoundException,
+  ForbiddenException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { supabase } from '../lib/supabase.client';
@@ -199,13 +200,24 @@ export class AuthService {
   async resendVerification(email: string) {
     const { data: user } = await supabase
       .from('users')
-      .select('id, name, email_verified')
+      .select('id, name, email, email_verified')
       .eq('email', email.toLowerCase())
       .maybeSingle();
 
     if (!user) throw new NotFoundException('Usuário não encontrado');
+
     if (user.email_verified) throw new BadRequestException('Email já verificado');
 
+    await this.issueAndSendVerification(user);
+
+    return { message: 'Email de verificação reenviado' };
+  }
+
+  /**
+   * Gera um novo token de verificação, persiste no usuário e dispara o email
+   * de confirmação. Reutilizado pelo resend e pelo login (quando não verificado).
+   */
+  private async issueAndSendVerification(user: { id: string; name: string; email: string }) {
     const newToken  = uuidv4();
     const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
 
@@ -218,12 +230,10 @@ export class AuthService {
       .eq('id', user.id);
 
     await this.mailService.sendVerificationEmail({
-      to:    email,
+      to:    user.email,
       name:  user.name,
       token: newToken,
     });
-
-    return { message: 'Email de verificação reenviado' };
   }
 
   // =========================================
@@ -234,7 +244,7 @@ export class AuthService {
 
     const { data: user } = await supabase
       .from('users')
-      .select('id, email, name, password_hash, email_verified, kyc_completed, onboarding_completed, operation_setup_completed, avatar_url')
+      .select('id, email, name, password_hash, email_verified, kyc_completed, onboarding_completed, operation_setup_completed, documents_completed, avatar_url')
       .eq('email', email)
       .maybeSingle();
 
@@ -248,7 +258,19 @@ export class AuthService {
     }
 
     if (!user.email_verified) {
-      throw new UnauthorizedException('Email não verificado. Verifique sua caixa de entrada.');
+      // Reenvia um novo email de confirmação. Não deixa uma falha no envio
+      // (ex.: SendGrid) virar 500 — o usuário ainda recebe a orientação de verificar.
+      try {
+        await this.issueAndSendVerification(user);
+      } catch (err) {
+        console.error('[login] falha ao reenviar email de verificação:', err);
+      }
+
+      throw new ForbiddenException({
+        code: 'EMAIL_NOT_VERIFIED',
+        message: 'Seu email ainda não foi verificado. Enviamos um novo link de confirmação para a sua caixa de entrada.',
+        email: user.email,
+      });
     }
 
     await supabase
@@ -258,6 +280,7 @@ export class AuthService {
 
     const accessToken = this.issueToken(user.id, user.email);
     const redirectTo  = this.resolveRedirect(user);
+
 
     return {
       accessToken,
@@ -269,6 +292,7 @@ export class AuthService {
         kycCompleted:              user.kyc_completed,           // camelCase para o frontend
         operationSetupCompleted:   user.operation_setup_completed,
         onboardingCompleted:       user.onboarding_completed,    // camelCase para o frontend
+        documentsCompleted:        user.documents_completed,
       },
       redirectTo,
     };
@@ -284,7 +308,7 @@ export class AuthService {
       .eq('email', email.toLowerCase())
       .maybeSingle();
 
-    if (!user || !user.email_verified) {
+    if (!user) {
       return { message: 'Se o email existir, você receberá um link de redefinição.' };
     }
 
@@ -347,13 +371,19 @@ export class AuthService {
       .from('users')
       .select(`
         id, name, email, instagram, whatsapp, avatar_url,
-        kyc_completed, operation_setup_completed, onboarding_completed,
+        kyc_completed, operation_setup_completed, onboarding_completed, documents_completed,
         created_at, last_login_at
       `)
       .eq('id', userId)
       .single();
 
     if (!user) throw new NotFoundException('Usuário não encontrado');
+
+    const { data: seller } = await supabase
+      .from('seller_profiles')
+      .select('provider_default')
+      .eq('user_id', userId)
+      .maybeSingle();
 
     // 🔥 Retorna campos com os nomes que o frontend espera (camelCase consistente)
     return {
@@ -366,8 +396,10 @@ export class AuthService {
       kyc_completed:             user.kyc_completed,
       operation_setup_completed: user.operation_setup_completed,
       onboarding_completed:      user.onboarding_completed,  // 🔥 era operation_setup_completed
+      documentsCompleted:        user.documents_completed,
       created_at:                user.created_at,
       last_login_at:             user.last_login_at,
+      provider_default:          seller?.provider_default ?? null,
     };
   }
 

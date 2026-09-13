@@ -1417,6 +1417,12 @@ Merchant                         Admin/Backoffice
 | `NEXFLOWX_MASTER_KEY` | Chave AES-256 (32 bytes) para criptografia de API keys |
 | `SUPABASE_JWT_SECRET` | Segredo JWT Supabase (SSO) |
 
+### Rollout
+
+| Variavel | Descricao | Padrao |
+|---|---|---|
+| `KOOPFY_UNIFIED_PAYOUTS_ENABLED` | Libera `POST /integration/koopfy/finance/payouts` (saque pelo dash-checkout). Exige a migration `supabase/migrations/*_payout_request_idempotency.sql` aplicada: a rota chama somente `request_payout_idempotent` e nunca cai para `request_payout`. Precisa estar `true` tambem no backend checkout, que anuncia `capabilities.payoutCreate` ao dashboard. | desligada |
+
 ---
 
 ## 17. Estrutura de Diretorios

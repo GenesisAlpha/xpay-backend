@@ -7,7 +7,12 @@ import { WalletService } from '../wallets/wallet.service'
 import { AccountRouterService } from '../orchestrator/router/account-router.service'
 import { getSellerFees, calculateFees } from '../shared/fee.calculator'
 import { validateMbwayPhone } from '../utils/mbway.validator'
-import { RetrieveResponse } from '../orchestrator/providers/viva.provider'
+import { RetrieveResponse } from '../orchestrator/providers/provider.types'
+import { CardCryptoService } from '../crypto/card-crypto.service'
+import { WebhookService } from '../webhooks/webhook.service'
+import { ClipAccountsService } from '../orchestrator/clip/clip-accounts.service'
+import { SpeiReceiptService } from '../orchestrator/clip/spei-receipt.service'
+import { StorageService } from '../lib/storage.service'
 
 export interface ExternalFeeInput {
     recipient_id: string
@@ -20,37 +25,16 @@ export interface ExternalFeeInput {
 //
 // WHITE  → Koopfy recebe o platform_fee
 // GRAY / HIGH → Nexor recebe o platform_fee
-//
-const NEXOR_PLATFORM_WALLET_REF = process.env.NEXOR_PLATFORM_WALLET_REF
-    ?? (() => { throw new Error('NEXOR_PLATFORM_WALLET_REF env var is required') })()
 
 const KOOPFY_PLATFORM_WALLET_REF = process.env.KOOPFY_PLATFORM_WALLET_REF
     ?? (() => { throw new Error('KOOPFY_PLATFORM_WALLET_REF env var is required') })()
 
-// ─── Resolve qual wallet recebe o platform_fee ────────────────────────────────
+// 🐞 Detalhe de erro no corpo da resposta só em dev/local (ou PAY_DEBUG=1).
+const PAY_DEBUG =
+    process.env.NODE_ENV !== 'production' || process.env.PAY_DEBUG === '1'
 
-type RiskLevel = 'WHITE' | 'GRAY' | 'HIGH' | string
-
-
-function resolvePlatformWallet(riskLevel: RiskLevel): {
-    walletRef: string
-    role: 'platform'
-    partner: 'nexor' | 'koopfy'
-} {
-    if (riskLevel === 'WHITE') {
-        return {
-            walletRef: KOOPFY_PLATFORM_WALLET_REF,
-            role: 'platform',
-            partner: 'koopfy',
-        }
-    }
-    // GRAY, HIGH ou qualquer outro → Nexor
-    return {
-        walletRef: NEXOR_PLATFORM_WALLET_REF,
-        role: 'platform',
-        partner: 'nexor',
-    }
-}
+// Rox Pay só aceita liquidar nestas moedas — fora daqui nem chega a chamar a API.
+const ROX_PAY_ALLOWED_CURRENCIES = new Set(['USD', 'EUR', 'GBP', 'CHF', 'CAD', 'RON', 'JPY'])
 
 // ─── Settlement payload pro Nexflow ──────────────────────────────────────────
 
@@ -60,7 +44,6 @@ interface SettlementRecipient {
     amount_cents: number
     fee_type?: 'platform_fee' | 'external_fee'
     fee_pct?: number
-    partner?: string
 }
 
 interface SettlementPayload {
@@ -75,6 +58,9 @@ interface SettlementPayload {
     recipients: SettlementRecipient[]
 }
 
+// Minutos que uma reserva de CARTÃO sobrevive sem virar cobrança.
+const CARD_HOLD_TTL_MIN = Number(process.env.CLIP_CARD_HOLD_TTL_MIN ?? 25)
+
 @Injectable()
 export class PaymentService {
 
@@ -82,66 +68,43 @@ export class PaymentService {
         private readonly currencyService: CurrencyService,
         private readonly walletService: WalletService,
         private readonly accountRouter: AccountRouterService,
+        private readonly cardCrypto: CardCryptoService,
+        // Reuso do pipeline de PAID p/ aprovação síncrona do provider 'simulator'.
+        private readonly webhookService: WebhookService,
+        private readonly clipAccounts: ClipAccountsService,
+        private readonly storage: StorageService,
+        private readonly speiReceipts: SpeiReceiptService,
     ) { }
 
     private static readonly REDIRECT_PROVIDERS = new Set(['viva'])
 
-    private resolvePlatformWalletRef(partner: string): string {
-        if (partner === 'koopfy') return KOOPFY_PLATFORM_WALLET_REF
-        return NEXOR_PLATFORM_WALLET_REF
-    }
+    // Checkout embedado: o comprador ainda NÃO inseriu dados de pagamento quando
+    // respondemos — só abrimos o iframe. O checkout usa esse sinal pra adiar a
+    // criação do pedido até haver engajamento real (ver processSplitAwarePayment).
+    private static readonly HOSTED_AWAITING_PROVIDERS = new Set(['rox_pay', 'whop'])
 
     // ─── createPayment ────────────────────────────────────────────────────────
 
     async createPayment(dto: any) {
         let session: any = null
-        let seller: any = null
-        let candidates: any[] = []
 
+        // 🐞 DEBUG TEMPORÁRIO — timing (remover depois).
+        const __t0 = Date.now()
+        const __mark = (label: string) => console.log(`[timing] ${label}: ${Date.now() - __t0}ms`)
+        __mark('createPayment início')
 
         dto.method = dto.method === 'credit_card' ? 'card' : dto.method;
 
-        if (dto.sessionId) {
-            const { data, error } = await supabase
-                .from('checkout_sessions').select('*').eq('id', dto.sessionId).single()
-            if (error || !data) throw new BadRequestException('Invalid session')
+        // 🔐 Resolve o instrumento: decifra o envelope do cartão OU mapeia o token
+        //    da carteira → dto.payment_data (consumido pelo provider Sentinel).
+        this.resolvePaymentInstrument(dto)
+        __mark('resolvePaymentInstrument')
 
-            session = data
-
-            console.log(session)
-
-            await supabase.from('checkout_sessions')
-                .update({ status: 'completed', consumed_at: new Date().toISOString() })
-                .eq('id', session.id)
-
-            seller = await this.getSellerById(session.seller_id)
-
-
-            const routing = session.routing?.[dto.method]
-            //if (!routing) throw new BadRequestException('Method not available in this session')
-
-            candidates = [
-                { id: routing.provider_account_id },
-                ...(routing.candidates || []).map((c: any) => ({ id: c.id })),
-            ]
-
-
-        } else {
-            seller = await this.getSellerById(dto.sellerId)
-            const ctx = {
-                sellerId: dto.sellerId, method: dto.method,
-                amount: dto.amount, currency: dto.currency,
-                country: dto.customer?.country, riskLevel: seller?.risk_level,
-            }
-            candidates = await this.accountRouter.getCandidateAccounts(ctx)
-            if (!candidates.length) throw new BadRequestException('No provider available')
-        }
+        const seller = await this.getSellerById(dto.sellerId)
+        __mark('getSellerById')
 
         if (!seller) throw new BadRequestException('Seller not found')
         const effectiveSellerId = seller.id
-
-        // 🔥 Resolve plataforma receptora do split baseado no risk_level
-        const platformWallet = resolvePlatformWallet(seller.risk_level)
 
         // ─── Guards ────────────────────────────────────────────────────────────
 
@@ -154,11 +117,17 @@ export class PaymentService {
             throw new ForbiddenException(messages[seller.status] ?? 'Conta não autorizada.')
         }
 
+        // Vertical da oferta (ECOMMERCE | INFO | NUTRA). Decide QUAL titular
+        // recebe o pagamento — ver LAYER 1c no AccountRouterService. Sem isto,
+        // nutra cai na mesma conta do e-commerce e contamina o histórico dela.
+        let offerSegment: string | null = null
+
         if (dto.offerId) {
             const { data: offer } = await supabase
-                .from('offers').select('id, status, name')
+                .from('offers').select('id, status, name, segment')
                 .eq('id', dto.offerId).eq('seller_id', effectiveSellerId).maybeSingle()
             if (!offer) throw new BadRequestException('Oferta não encontrada.')
+            offerSegment = offer.segment ?? null
             if (offer.status !== 'approved') {
                 const msgs: Record<string, string> = {
                     pending_review: `A oferta "${offer.name}" ainda está em análise.`,
@@ -168,21 +137,61 @@ export class PaymentService {
                 throw new ForbiddenException(msgs[offer.status] ?? `Oferta "${offer.name}" não aprovada.`)
             }
         }
+        __mark('offer check')
+
+        // ─── Upsell de um clique (Whop) ────────────────────────────────────────
+        // Cobra o meio de pagamento salvo na compra-mãe, na MESMA conta Whop: o
+        // cartão salvo pertence ao membro daquela company e não é cobrável por
+        // outra. Validado aqui, no servidor — o checkout só informa o id.
+        const upsellParent = dto.upsell?.parentTransactionId
+            ? await this.requireUpsellParent(effectiveSellerId, String(dto.upsell.parentTransactionId))
+            : null
 
         if (dto.method === 'mbway') {
-            const phone = dto.paymentData?.phone ?? dto.payment_data?.phone ?? dto.customer?.phone ?? null
-            const mbway = validateMbwayPhone(phone)
-            if (!mbway.valid) throw new BadRequestException(mbway.reason ?? 'Número de telefone inválido para MB Way.')
-            if (!dto.paymentData) dto.paymentData = {}
-            dto.paymentData.phone = mbway.normalized
+            // No fluxo hosted (Sentinel) o telefone é confirmado na própria página
+            // do MB Way — só validamos quando o checkout já enviou um número.
+            const phone = dto.paymentData?.phone ?? dto.payment_data?.phone ?? null
+            if (phone) {
+                const mbway = validateMbwayPhone(phone)
+                if (!mbway.valid) throw new BadRequestException(mbway.reason ?? 'Número de telefone inválido para MB Way.')
+                if (!dto.paymentData) dto.paymentData = {}
+                dto.paymentData.phone = mbway.normalized
+            }
         }
 
         // ─── FX ────────────────────────────────────────────────────────────────
 
         const amount = Math.round(Number(dto.amount))
         dto.amount = amount;
-        const currency = dto.currency ?? session.currency
+        // ⚠️ `session` é sempre null aqui — o fallback `session.currency` antigo
+        // estourava NullPointer p/ qualquer request sem dto.currency. O checkout
+        // sempre manda currency; guardamos contra ausência com erro claro.
+        const currency = dto.currency
+        if (!currency) throw new BadRequestException('currency is required')
+
+        // Coinflow opera em USD/cripto — não processa BRL. Barra AQUI (antes do FX,
+        // do insert da transação e da chamada ao provider) p/ não gerar pagamento
+        // em BRL no provider e devolver uma mensagem clara ao cliente.
+        if (this.normalizeProviderName(seller?.provider_default) === 'coinflow'
+            && String(currency).toUpperCase() === 'BRL') {
+            throw new BadRequestException({
+                code: 'CURRENCY_NOT_SUPPORTED',
+                message: 'Não aceitamos transações em BRL para este método de pagamento. Selecione outra moeda.',
+            })
+        }
+
+        // Rox Pay: trava de moeda ANTES do FX/transação/chamada ao provider —
+        // fora da allowlist nem gera requisição.
+        if (this.normalizeProviderName(seller?.provider_default) === 'rox_pay'
+            && !ROX_PAY_ALLOWED_CURRENCIES.has(String(currency).toUpperCase())) {
+            throw new BadRequestException({
+                code: 'CURRENCY_NOT_SUPPORTED',
+                message: 'Não aceitamos transações nesta moeda para este método de pagamento. Selecione outra moeda.',
+            })
+        }
+
         const fx = await this.currencyService.convertToUSDWithFee(amount / 100, currency)
+        __mark('convertToUSDWithFee')
         const grossUSDcents = Math.round(fx.grossUSD * 100)
         const fxFeeUSDcents = Math.round(fx.feeUSD * 100)
         const netUSDcents = Math.round(fx.netUSD * 100)
@@ -191,6 +200,7 @@ export class PaymentService {
         // ─── External fee ──────────────────────────────────────────────────────
 
         const externalFee = await this.resolveExternalFee(dto.external_fee, netUSDcents, effectiveSellerId)
+        __mark('resolveExternalFee')
 
         // ─── Idempotência ──────────────────────────────────────────────────────
 
@@ -200,10 +210,30 @@ export class PaymentService {
                 .from('transactions').select('*')
                 .eq('seller_id', effectiveSellerId)
                 .eq('idempotency_key', dto.idempotencyKey).maybeSingle()
+            __mark('idempotency check')
             if (existing) {
-                if (existing.status === 'approved') return this.formatResponse(existing)
-                if (existing.status === 'pending' && existing.provider_gateway_id) return this.formatResponse(existing)
-                if (existing.status === 'failed' && existing.retry_blocked) return this.formatResponse(existing)
+                // ⚠️ Providers de EMBED (Whop) não podem sair por estes atalhos.
+                //
+                // formatResponse devolve a linha do banco, e o par planId/sessionId
+                // NÃO é persistido em transactions — só existe na resposta do
+                // provider. Retornar aqui entregaria uma resposta sem `embed`, e o
+                // loader.js não teria o que montar: o comprador veria o skeleton
+                // pra sempre, sem erro em lugar nenhum.
+                //
+                // Hoje a condição do meio nem dispara (provider_gateway_id nunca é
+                // gravado no pay), mas o dia em que passar a ser, o sintoma seria
+                // exatamente esse — silencioso e difícil de rastrear.
+                const isEmbedProvider = this.normalizeProviderName(seller?.provider_default) === 'whop'
+
+                if (!isEmbedProvider) {
+                    if (existing.status === 'approved') return this.formatResponse(existing)
+                    if (existing.status === 'pending' && existing.provider_gateway_id) return this.formatResponse(existing)
+                    if (existing.status === 'failed' && existing.retry_blocked) return this.formatResponse(existing)
+                } else if (existing.status === 'approved') {
+                    // Já pago: aí sim devolve — não há embed a montar, e recriar a
+                    // sessão cobraria de novo.
+                    return this.formatResponse(existing)
+                }
                 transaction = existing
             }
         }
@@ -228,7 +258,10 @@ export class PaymentService {
                     customer_email: dto.customer?.email,
                     customer_phone: dto.customer?.phone || 'N/A',
                     customer_document: dto.customer?.document || 'N/A',
-                    customer_country: dto.billing_address?.country ?? dto.customer?.country,
+                    // MB Way é método português: se o país não veio no request,
+                    // assume PT (senão a dash mostra o país como cadeado/vazio).
+                    customer_country: dto.billing_address?.country ?? dto.customer?.country
+                        ?? (dto.method === 'mbway' ? 'PT' : null),
                     payment_last4: dto.payment_data?.cardNumber?.slice(-4),
                     payment_brand: dto.payment_data?.cardBrand,
                     ip: dto.context?.ip,
@@ -236,7 +269,12 @@ export class PaymentService {
                     device_id: dto.context?.deviceId,
                     session_id: dto.context?.sessionId ?? dto.sessionId ?? null,
                     idempotency_key: dto.idempotencyKey,
-                    external_reference: dto.metadata?.orderId ?? null,
+                    // order_number (humano) — usado como order_id na Sentinel e p/ o
+                    // webhook casar a transação por external_reference.
+                    external_reference: dto.metadata?.order_number ?? dto.metadata?.orderId ?? null,
+                    // Mantém o contexto comercial para relatórios de produto,
+                    // plano e recorrência sem criar um produto espelho no provider.
+                    metadata: dto.metadata ?? {},
                     postback_url: dto.postback_url,
                     risk_level: seller.risk_level,
                     webhook_sent: false,
@@ -244,7 +282,6 @@ export class PaymentService {
                     webhook_attempts: 0,
                     created_at: new Date().toISOString(),
                     // 🔥 Registra qual plataforma recebeu o split
-                    platform_partner: platformWallet.partner,
                     external_fee_cents: externalFee?.amount_cents ?? null,
                     external_fee_pct: externalFee?.pct ?? null,
                     external_fee_recipient_id: externalFee?.recipient_id ?? null,
@@ -257,15 +294,282 @@ export class PaymentService {
             }
             transaction = created
         }
+        __mark('transaction insert')
+
+        // ── Clip SPEI: cria a transação e reserva a CLABE no mesmo clique ──
+        // Não passa por ClipProvider: SPEI é transferência manual. A resposta
+        // abre o modal de instruções e a transação permanece pending até o
+        // comprovante ser analisado.
+        if (this.normalizeProviderName(seller.provider_default) === 'clip' && dto.method === 'spei') {
+            if (String(currency).toUpperCase() !== 'MXN') {
+                throw new BadRequestException('SPEI está disponível apenas em MXN.')
+            }
+            const riskLevel = String(seller.risk_level ?? '').toUpperCase()
+            if (riskLevel !== 'WHITE' && riskLevel !== 'GRAY') {
+                throw new ForbiddenException('Nível de risco inválido para SPEI.')
+            }
+            const enabled = new Set((seller.enabled_methods ?? []).map((m: any) => String(m).toLowerCase()))
+            if (!enabled.has('spei')) throw new ForbiddenException('SPEI não está habilitado para este seller.')
+
+            const hold = await this.clipAccounts.holdSpei({
+                amountMinor: amount,
+                sellerId: effectiveSellerId,
+                country: String(seller.country ?? 'MX').toUpperCase(),
+                riskLevel: riskLevel as 'WHITE' | 'GRAY',
+                externalReference: transaction.id,
+            })
+            if (!hold) {
+                // Zero linhas tem seis causas e todas chegavam como a mesma
+                // frase. Pergunta o MOTIVO antes de falhar — só neste caminho,
+                // sem custo no fluxo normal.
+                const motivo = await this.clipAccounts.diagnosticarSpei({
+                    amountMinor: amount,
+                    country: String(seller.country ?? 'MX').toUpperCase(),
+                    riskLevel,
+                    currency: String(currency).toUpperCase(),
+                }).catch(() => 'diagnóstico indisponível')
+
+                console.error(
+                    `[PaymentService] SPEI sem conta elegível — seller=${effectiveSellerId} `
+                    + `valor=${amount} país=${seller.country ?? 'MX'} risco=${riskLevel} :: ${motivo}`,
+                )
+
+                await supabase.from('transactions').update({
+                    status: 'failed', failure_code: 'SPEI_CAPACITY_EXHAUSTED',
+                    // Grava o motivo NA TRANSAÇÃO: sem isso, investigar depois
+                    // exige achar a linha certa no log do servidor.
+                    failure_message: `Nenhuma conta SPEI elegível. ${motivo}`.slice(0, 500),
+                    failed_at: new Date().toISOString(),
+                }).eq('id', transaction.id)
+
+                throw new BadRequestException('Pagamento por SPEI indisponível no momento.')
+            }
+
+            // Uma consulta a mais no caminho do SPEI, para ter o prazo autoritativo.
+            const reserva = await this.clipAccounts.getReservation(hold.reservation_id)
+
+            const { data: speiTransaction, error: speiUpdateError } = await supabase
+              .from('transactions').update({
+                status: 'pending',
+                provider: 'clip',
+                provider_account_id: hold.account_id,
+                provider_status: 'awaiting_proof',
+                failure_code: null,
+                failure_message: null,
+                failed_at: null,
+                metadata: {
+                    ...(transaction.metadata ?? {}),
+                    spei_reservation_id: hold.reservation_id,
+                    spei_charge_minor: hold.charge_minor,
+                    spei_proof_status: 'not_uploaded',
+                },
+              })
+              .eq('id', transaction.id)
+              .select('id, status, provider_status, failure_code')
+              .single()
+
+            if (speiUpdateError || !speiTransaction) {
+                console.error('[PaymentService] falha ao restaurar transação SPEI:', {
+                    transactionId: transaction.id,
+                    error: speiUpdateError?.message,
+                })
+                throw new Error('Não foi possível atualizar o status da transação SPEI.')
+            }
+            if (speiTransaction.status !== 'pending' || speiTransaction.failure_code) {
+                console.error('[PaymentService] transação SPEI permaneceu inconsistente:', speiTransaction)
+                throw new Error('Status da transação SPEI permaneceu inconsistente.')
+            }
+
+            return {
+                success: true,
+                status: 'pending',
+                transactionId: transaction.id,
+                provider: 'clip',
+                spei: {
+                    reservationId: hold.reservation_id,
+                    clabe: hold.clabe,
+                    banco: hold.banco,
+                    beneficiario: hold.beneficiario,
+                    chargeMinor: hold.charge_minor,
+                    // Prazo REAL da reserva, lido do banco em vez de recalculado
+                    // a partir do TTL: duplicar a constante aqui faria a tela
+                    // prometer um prazo que o banco não honra no dia em que uma
+                    // das duas mudasse. O comprador precisa saber que a conta
+                    // está apartada e até quando — e essa informação é
+                    // verdadeira, não urgência fabricada.
+                    expiresAt: reserva?.expires_at ?? null,
+                },
+            }
+        }
+
+        // ─── Provider (fixo por seller.provider_default) ────────────────────────
+        // Resolvido ANTES das taxas porque o cross-border depende do país da conta.
+        // `let` porque o failover pode trocar o PSP — e o que vem depois
+        // (taxas, credenciais por seller, resposta ao front) tem que enxergar o
+        // provider REALMENTE usado, não o preferido. Calcular a taxa da Coinflow
+        // num pagamento que saiu pela Stripe é o tipo de erro que só aparece na
+        // conciliação do fim do mês.
+        let providerName = this.normalizeProviderName(seller?.provider_default)
+        const preferredProvider = providerName
+        const customerCountry = dto.billing_address?.country ?? dto.customer?.country
+            ?? (dto.method === 'mbway' ? 'PT' : null)
+
+        // Cadeia de failover cross-PSP. Antes disto, pool preferido vazio =
+        // pagamento morto; agora ele cai para o próximo PSP da cadeia do método
+        // (ver failover.config.ts). A stickiness por pedido vem ANTES da cadeia:
+        // pedido já iniciado num titular volta para ele, sempre.
+        // Upsell não passa pelo router: a conta é a da compra-mãe (ver acima).
+        const routed = upsellParent ? null : await this.accountRouter.resolveWithFailover({
+            sellerId: effectiveSellerId,
+            preferredProvider: providerName,
+            method: dto.method,
+            customerCountry: customerCountry ?? undefined,
+            // Isolamento entre titulares: a oferta define a vertical, o seller
+            // define o nível de risco. Conta que declara `segments` só recebe o
+            // que declarou.
+            segment: offerSegment,
+            riskLevel: seller.risk_level ?? null,
+            // Ticket em USD cents — mesma unidade dos tetos min/max_ticket e do
+            // account_daily_metrics.volume. Mandar `amount` (moeda da transação)
+            // aqui compararia real com dólar sem erro nenhum aparecer.
+            amountUsdCents: netUSDcents,
+            // Stickiness: toda tentativa do MESMO pedido cai na MESMA conta.
+            // Crítico com titulares independentes (Whop, Stripe): reembolso
+            // partido entre duas contas não tem solução — o saldo está em
+            // entidades jurídicas diferentes.
+            orderRef: transaction.external_reference ?? null,
+        })
+        __mark('resolveWithFailover')
+
+        let account = routed?.account ?? null
+
+        // ── Clip: a conta vem da RESERVA, não do router e não do cliente ────
+        //
+        // ⚠️ ESTE BLOCO É O QUE FAZ O TETO EXISTIR.
+        // O token da Clip nasce preso à public key com que o iframe foi montado
+        // e só é cobrável pelo secret da MESMA conta — então a conta já foi
+        // decidida (e o teto já foi debitado) lá no /payments/clip/route.
+        //
+        // Lemos a conta da RESERVA no banco, nunca do `accountId` que o browser
+        // mandou. Confiar no cliente aqui deixaria o próprio comprador escolher
+        // em qual conta cobrar, e um teto que o cobrado escolhe não é teto.
+        let clipReservation: any = null
+        const clipResId = dto.payment_data?.clipReservationId
+        if (clipResId) {
+            clipReservation = await this.clipAccounts.getReservation(clipResId)
+
+            if (!clipReservation) {
+                throw new BadRequestException('Reserva de pagamento inválida. Recarregue o checkout.')
+            }
+            if (clipReservation.seller_id !== effectiveSellerId) {
+                throw new ForbiddenException('Esta reserva não pertence ao seller autenticado.')
+            }
+            if (clipReservation.method !== 'card' || dto.method !== 'card') {
+                throw new BadRequestException('Método da reserva não corresponde ao pagamento.')
+            }
+            if (Number(clipReservation.amount_minor) !== Number(dto.amount)) {
+                throw new BadRequestException('Valor da reserva não corresponde ao pagamento. Recarregue o checkout.')
+            }
+            if (String(clipReservation.currency).toUpperCase() !== String(dto.currency).toUpperCase()) {
+                throw new BadRequestException('Moeda da reserva não corresponde ao pagamento.')
+            }
+            if (String(clipReservation.risk_level).toUpperCase() !== String(seller.risk_level).toUpperCase()) {
+                throw new ForbiddenException('Nível de risco da reserva não corresponde ao seller.')
+            }
+            // Reserva vencida/liberada = o espaço já voltou para o pool. Cobrar
+            // agora passaria por cima do teto sem nada registrado.
+            if (clipReservation.state !== 'held' || Date.parse(clipReservation.expires_at) <= Date.now()) {
+                throw new BadRequestException('Reserva de pagamento expirada. Recarregue o checkout.')
+            }
+            const reserved = await this.accountRouter.resolveAccountById(clipReservation.account_id)
+            if (!reserved) {
+                throw new BadRequestException('Conta de pagamento indisponível. Tente novamente.')
+            }
+            account = reserved
+            providerName = 'clip'
+        }
+
+        if (upsellParent) {
+            const parentAccount = await this.accountRouter.resolveAccountById(upsellParent.provider_account_id)
+            if (!parentAccount) {
+                throw new BadRequestException('Conta de pagamento da compra original indisponível.')
+            }
+            account = parentAccount
+            providerName = 'whop'
+        }
+
+        if (routed && !clipReservation) {
+            providerName = routed.provider
+
+            if (routed.degraded) {
+                // Degradação em silêncio é como se descobre semanas depois que o
+                // provider preferido está fora do ar desde sempre.
+                console.error(
+                    `[PaymentService] ⚠️ FAILOVER ativo: preferido=${preferredProvider} `
+                    + `→ usado=${routed.provider}/${routed.account.id} `
+                    + `(tentados: ${routed.attempted.join(' → ')}) seller=${effectiveSellerId}`,
+                )
+            }
+        }
+
+        if (!account) {
+            // O router filtra por seis critérios diferentes e todos terminavam
+            // nesta mesma frase. Pergunta o MOTIVO antes de falhar — só neste
+            // caminho, sem custo no fluxo normal.
+            let motivo = 'motivo não identificado'
+            try {
+                motivo = await this.accountRouter.explainEmptyPool({
+                    provider: preferredProvider,
+                    amountUsdCents: netUSDcents,
+                    segment: offerSegment,
+                    riskLevel: seller.risk_level ?? null,
+                })
+            } catch (err: any) {
+                console.error('[PaymentService] explainEmptyPool falhou:', err?.message)
+            }
+
+            console.error(
+                `[PaymentService] 🚨 roteamento sem conta em NENHUM PSP da cadeia `
+                + `(method=${dto.method ?? 'any'}, preferido=${preferredProvider}) `
+                + `seller=${effectiveSellerId}. Motivo do preferido: ${motivo}`,
+            )
+
+            const nowFail = new Date().toISOString()
+            await supabase.from('transactions').update({
+                status: 'failed',
+                failure_message: `Nenhuma conta ${providerName} disponível: ${motivo}`,
+                failed_at: nowFail,
+                processed_at: nowFail,
+            }).eq('id', transaction.id)
+
+            throw new BadRequestException(
+                `Nenhuma conta de pagamento (${providerName}) disponível para este seller.`
+                // Detalhe só fora de produção: a mensagem chega ao comprador no
+                // checkout, e "teto diário atingido" não é assunto dele.
+                + (PAY_DEBUG ? ` [${motivo}]` : ''),
+            )
+        }
 
         // ─── Calcula taxas ─────────────────────────────────────────────────────
+        // ⏸️ Cross-border em STANDBY até definirmos como captar o país do cartão.
+        //    Infra pronta p/ reativar: provider-accounts.config.country (país de
+        //    settlement) + computeSurchargePct({ crossBorder }) no fee.calculator.
+        const isCrossBorder = false
 
         const sellerFees = await getSellerFees(effectiveSellerId)
         const baseFee = sellerFees
-            ? calculateFees(netUSDcents / 100, sellerFees, {paymentMethod: dto.method})
-            : this.defaultFeeResult(netUSDcents)
+            ? calculateFees(netUSDcents / 100, sellerFees, {
+                paymentMethod: dto.method,
+                cardBrand: dto.payment_data?.cardBrand,   // amex / diners → +2%
+                walletMethod: dto.method,                 // apple_pay / google_pay → +1%
+                crossBorder: isCrossBorder,               // ⏸️ standby
+                provider: providerName,                   // coinflow → +1.5% proteção
+            })
+            : this.defaultFeeResult(netUSDcents, providerName)
 
         const platformFeeCents = Math.round(baseFee.platformFee * 100)
+        // Parcela de proteção de chargeback (já está DENTRO do platformFee acima).
+        const chargebackProtectionFeeCents = Math.round(baseFee.chargebackProtectionFee * 100)
         const reserveAmountCents = Math.round(baseFee.reserveAmount * 100)
         const externalFeeCents = externalFee?.amount_cents ?? 0
         const baseNetCents = Math.round(baseFee.netAmount * 100)
@@ -282,8 +586,7 @@ export class PaymentService {
             sellerWalletRef: effectiveSellerId,
             sellerNetCents,
             platformFeeCents,
-            platformWalletRef: platformWallet.walletRef,  // 🔥 Koopfy ou Nexor
-            platformPartner: platformWallet.partner,
+            platformWalletRef: KOOPFY_PLATFORM_WALLET_REF,
             externalFeeCents,
             externalWalletRef: externalFee?.recipient_id ?? null,
             externalFeePct: externalFee?.pct ?? null,
@@ -292,61 +595,93 @@ export class PaymentService {
             fxFeeUSDcents,
             fxFinalRate,
             sellerFeePct: sellerFees?.feePercentage ?? 9.99,
+            // Reserve é retido (não distribuído agora) — entra na sanity check
+            // pra fechar net = seller + platform + external + reserve.
+            reserveCents: reserveAmountCents,
         })
 
-        console.log(settlement)
+        // ─── Provider já resolvido acima (account) ──────────────────────────────
+        const enrichedDto = {
+            ...dto,
+            settlement,
+            // WhopProvider.charge cobra off-session quando isto vem preenchido.
+            ...(upsellParent ? {
+                offSession: {
+                    memberId: upsellParent.metadata.whop_member_id,
+                    paymentMethodId: upsellParent.metadata.whop_payment_method_id,
+                    parentTransactionId: upsellParent.id,
+                },
+            } : {}),
+        }
 
-        // ─── Provider ──────────────────────────────────────────────────────────
+        // ─── Credenciais por MID (Sentinel) ─────────────────────────────────────
+        // Se o seller tem um MID configurado, recupera as credenciais daquele MID
+        // e sobrescreve as do env. Sem MID → usa o default in-project/env.
+        let credentialsOverride: any = undefined
+        if (providerName === 'setinel_gate' && seller.provider_mid) {
+            const midCreds = await this.accountRouter.getSentinelMidCredentials(seller.provider_mid)
+            if (!midCreds) {
+                const nowFail = new Date().toISOString()
+                await supabase.from('transactions').update({
+                    status: 'failed',
+                    failure_message: `MID Sentinel "${seller.provider_mid}" sem credenciais ativas`,
+                    failed_at: nowFail,
+                    processed_at: nowFail,
+                }).eq('id', transaction.id)
+                throw new BadRequestException(`MID Sentinel não configurado ou inativo para este seller.`)
+            }
+            credentialsOverride = midCreds
+        }
 
-        const firstAccount = candidates[0]
-        const providerName = this.normalizeProviderName(firstAccount?.provider)
-        const isRedirect = PaymentService.REDIRECT_PROVIDERS.has(providerName)
-        const enrichedDto = { ...dto, settlement }
+        // ─── Merchant ID por seller (Coinflow) ──────────────────────────────────
+        // Guardado em config.coinflow_merchant_id (provider_mid tem FK p/ os MIDs
+        // do Sentinel). Vira o {merchantId} do path /api/checkout/card/{merchantId}.
+        if (providerName === 'coinflow') {
+            const cfMid = seller.config?.coinflow_merchant_id ?? seller.provider_mid ?? null
+            if (cfMid) credentialsOverride = { ...(credentialsOverride ?? {}), mid: cfMid }
+        }
+
+        // ─── Store Reference por seller (Rox Pay) ───────────────────────────────
+        // Guardado em config.rox_pay_store_reference (criada manualmente no painel
+        // da Rox Pay). Vira o `StoreReference` do payments/link — sem isso, cai na
+        // store default da company (ou nenhuma, se não houver default).
+        if (providerName === 'rox_pay') {
+            const storeReference = seller.config?.rox_pay_store_reference ?? null
+            if (storeReference) credentialsOverride = { ...(credentialsOverride ?? {}), storeReference }
+        }
 
         let result: any = null
         let lastError: any = null
 
-        if (isRedirect) {
-            try {
-                result = await this.accountRouter.executeWithProvider({
-                    providerAccountId: candidates[0].id,
-                    dto: enrichedDto, transactionId: transaction.id,
-                })
-                await supabase.from('transaction_attempts').insert({
-                    transaction_id: transaction.id,
-                    provider_account_id: candidates[0].id,
-                    status: result.status,
-                })
-            } catch (err: any) {
-                lastError = err
-                await supabase.from('transaction_attempts').insert({
-                    transaction_id: transaction.id,
-                    provider_account_id: candidates[0].id,
-                    status: 'error', error: err.message,
-                })
-            }
-        } else {
-            for (const candidate of candidates) {
-                try {
-                    result = await this.accountRouter.executeWithProvider({
-                        providerAccountId: candidate.id,
-                        dto: enrichedDto, transactionId: transaction.id,
-                    })
-                    await supabase.from('transaction_attempts').insert({
-                        transaction_id: transaction.id,
-                        provider_account_id: candidate.id,
-                        status: result.status,
-                    })
-                    if (result.success || result.status === 'declined') break
-                } catch (err: any) {
-                    lastError = err
-                    await supabase.from('transaction_attempts').insert({
-                        transaction_id: transaction.id,
-                        provider_account_id: candidate.id,
-                        status: 'error', error: err.message,
-                    })
-                }
-            }
+        __mark('pré-executeWithProvider (fee calc etc)')
+
+        try {
+            result = await this.accountRouter.executeWithProvider({
+                providerAccountId: account.id,
+                dto: enrichedDto,
+                transactionId: transaction.id,
+                credentialsOverride,
+            })
+            __mark('executeWithProvider (provider.charge completo)')
+            // Fire-and-forget: log de auditoria, nunca lido antes de responder —
+            // não precisa bloquear o cliente esperando o iframe aparecer.
+            supabase.from('transaction_attempts').insert({
+                transaction_id: transaction.id,
+                provider_account_id: account.id,
+                status: result.status,
+            }).then(({ error }) => {
+                if (error) console.error('[PaymentService] transaction_attempts insert:', error)
+            })
+            __mark('transaction_attempts insert (disparado)')
+        } catch (err: any) {
+            lastError = err
+            supabase.from('transaction_attempts').insert({
+                transaction_id: transaction.id,
+                provider_account_id: account.id,
+                status: 'error', error: err.message,
+            }).then(({ error }) => {
+                if (error) console.error('[PaymentService] transaction_attempts insert (erro):', error)
+            })
         }
 
         // ─── Falha total ───────────────────────────────────────────────────────
@@ -369,24 +704,104 @@ export class PaymentService {
                 fee: 0,
                 status: 'failed',
             })
-            throw lastError ?? new BadRequestException('Provider failed to create order')
+            // Throw com mensagem REAL no corpo (BadRequestException serializa
+            // `message` no JSON → o checkout lê via err.response.data.message).
+            // Um `throw lastError` cru viraria 500 "Internal server error"
+            // genérico e o checkout nunca veria a causa.
+            // Clip recusada: devolve o espaço AGORA em vez de esperar o TTL.
+            // Segurar teto de 3h por uma venda que já morreu é capacidade
+            // perdida no exato horário em que ela vale mais.
+            if (clipReservation) {
+                void this.clipAccounts.release(clipReservation.id, 'declined')
+            }
+
+            const reason =
+                result?.failureMessage
+                ?? lastError?.message
+                ?? 'Provider failed to create order'
+            throw new BadRequestException({
+                message: reason,
+                error: result?.failureCode ?? lastError?.code ?? 'PROVIDER_FAILED',
+                ...(PAY_DEBUG ? {
+                    provider: providerName,
+                    provider_status: result?.providerStatus ?? null,
+                    // Corpo REAL da resposta do provider (ex.: erro detalhado da Coinflow).
+                    provider_data: result?.data ?? null,
+                    raw: lastError?.message ?? null,
+                    stack: lastError?.stack ?? null,
+                } : {}),
+            })
+        }
+
+        // ─── Clip: reserva → captura ───────────────────────────────────────────
+        //
+        // Migra o espaço de "reservado" para "capturado" no contador do dia. A
+        // folga dos upsells CONTINUA segurada de propósito: os upsells one-click
+        // re-tokenizam o mesmo SDK e caem obrigatoriamente nesta mesma conta.
+        // Quem devolve o que sobrar é o gw_finalize (fim do fluxo) ou o TTL.
+        //
+        // ⚠️ Idempotente pelo clip_payment_id (unique em gw_captures): o webhook
+        // vai chamar isto de novo para o mesmo pagamento, e a segunda chamada
+        // não pode contar duas vezes.
+        //
+        // Em 'pending' (3DS) NÃO capturamos: o dinheiro ainda não existe. A
+        // reserva segue em pé e o desfecho chega pelo webhook.
+        if (clipReservation && result.success && String(result.status).toLowerCase() !== 'pending') {
+            void this.clipAccounts.capture({
+                reservationId: clipReservation.id,
+                // Valor da RESERVA, na unidade dela (centavos de MXN) — não o
+                // `amount` da transação, que pode estar em outra moeda.
+                amountMinor: clipReservation.amount_minor,
+                clipPaymentId: result.providerTransactionId ?? null,
+                kind: 'base',
+                source: 'payments.create',
+            }).then(() => {
+                // ⚠️ FINALIZA AQUI PORQUE ESTE CHECKOUT NÃO TEM UPSELL ONE-CLICK.
+                //
+                // A reserva guarda upsell_headroom (653 MXN por padrão) porque
+                // no funil do tkt-page os upsells re-tokenizam o mesmo SDK e
+                // caem nesta conta. O checkout Koopfy não faz isso: os bumps
+                // entram na MESMA transação, não em cobranças posteriores.
+                //
+                // Sem este finalize a folga ficaria presa até o TTL (3h). Com
+                // ticket de ~1.500 MXN isso é ~30% do teto diário parado
+                // segurando dinheiro que nunca vai chegar.
+                //
+                // Se um dia este fluxo ganhar upsell pós-compra, REMOVA esta
+                // chamada — senão o upsell estoura o teto na borda.
+                return this.clipAccounts.finalize(clipReservation.id)
+            })
         }
 
         // ─── Atualiza transação ────────────────────────────────────────────────
         const now = new Date().toISOString()
-        const finalStatus = result.status === 'requires_action'
+        // Aprovação IMEDIATA (ex.: provider 'simulator'): o provider devolve
+        // 'approved'/'captured' de forma síncrona. Providers reais nunca fazem isso
+        // (confirmam por webhook). Gravamos como 'pending' e logo abaixo rodamos o
+        // pipeline de PAID (que faz pending→approved + credita a wallet) reusando o
+        // handleWebhookProvider — sem disparar postback (o checkout marca o pedido
+        // pago de forma síncrona, evitando o race do postback antes do pedido existir).
+        const isImmediateApproval = ['approved', 'captured', 'succeeded']
+            .includes(String(result.status).toLowerCase())
+        // MB Way é hosted (requires_action + redirectUrl), mas queremos que conte
+        // como PENDENTE e apareça em dash-pay/checkout na hora — sem depender do
+        // webhook sale_in_progress. Só o cartão fica em 'requires_action' (não conta
+        // até o cliente inserir os dados). O redirectUrl segue na resposta em ambos,
+        // então o iframe/redirect abre normalmente.
+        const finalStatus = (result.status === 'requires_action' && dto.method !== 'mbway')
             ? 'requires_action'
             : 'pending'
 
-        const { error } = await supabase.from('transactions').update({
+        const updateQuery = supabase.from('transactions').update({
             status: finalStatus,
             provider_status: result.providerStatus ?? result.status,
             provider: result.provider ?? providerName,
-            provider_account_id: result.accountId ?? candidates[0].id,
-            provider_transaction_id: result.transactionId ?? null,
+            provider_account_id: result.accountId ?? account.id,
+            provider_transaction_id: result.providerTransactionId ?? null,
             failure_code: result.failureCode ?? null,
             failure_message: result.failureMessage ?? null,
             fee: platformFeeCents,
+            chargeback_protection_fee: chargebackProtectionFeeCents,
             net_amount: sellerNetCents,
             reserve_amount: reserveAmountCents,
             available_at: baseFee.availableAt.toISOString(),
@@ -394,21 +809,51 @@ export class PaymentService {
             processed_at: now,
         }).eq('id', transaction.id)
 
-        if (error) console.error('[PaymentService] update error:', error)
+        // Aprovação imediata (simulator) precisa do update já persistido, porque
+        // handleWebhookProvider (logo abaixo) RELÊ a transação do banco — sem
+        // await, leria a linha ainda desatualizada. Nos demais casos (hosted:
+        // Rox Pay, Sentinel, etc.) o frontend só precisa do checkout_url — que já
+        // está em `result`, não depende dessa gravação — então não bloqueia.
+        if (isImmediateApproval) {
+            const { error } = await updateQuery
+            if (error) console.error('[PaymentService] update error:', error)
+        } else {
+            updateQuery.then(({ error }) => {
+                if (error) console.error('[PaymentService] update error:', error)
+            })
+        }
+        __mark('update final da transação (disparado)')
 
 
         // ─── KPIs ──────────────────────────────────────────────────────────────
+        // Hosted/redirect (requires_action): o cliente ainda NÃO inseriu os dados
+        // de pagamento — só abriu o iframe/redirect. NÃO contamos aqui; a transação
+        // só "conta" quando o cliente paga de fato (o webhook registra o KPI na
+        // aprovação/recusa). Assim, quem abre e abandona não vira transação contada.
+        if (finalStatus !== 'requires_action') {
+            await this.registerKpi({
+                sellerId: effectiveSellerId,
+                method: dto.method,
+                amount: netUSDcents,
+                fee: platformFeeCents,
+                status: 'pending',
+            })
+        }
 
-        await this.registerKpi({
-            sellerId: effectiveSellerId,
-            method: dto.method,
-            amount: netUSDcents,
-            fee: platformFeeCents,
-            status: 'pending',
-        })
 
+        // Aprovação imediata (simulator): roda o pipeline de PAID reusando o webhook
+        // — transição pending→approved + crédito na wallet + markPaid — porém SEM
+        // disparar o postback (skipDispatch); o checkout marca o pedido pago síncrono.
+        if (isImmediateApproval) {
+            await this.webhookService.handleWebhookProvider(
+                { reference: transaction.id, status: 'PAID', type: 'TRANSACTION' },
+                { skipDispatch: true },
+            )
+            return this.buildResponse(result, transaction.id, 'approved', PaymentService.HOSTED_AWAITING_PROVIDERS.has(providerName))
+        }
 
-        return this.buildResponse(result, transaction.id, finalStatus)
+        __mark('createPayment fim (antes de retornar)')
+        return this.buildResponse(result, transaction.id, finalStatus, PaymentService.HOSTED_AWAITING_PROVIDERS.has(providerName))
     }
 
     // ─── Build settlement ─────────────────────────────────────────────────────
@@ -418,7 +863,6 @@ export class PaymentService {
         sellerNetCents: number
         platformFeeCents: number
         platformWalletRef: string      // 🔥 Koopfy ou Nexor dependendo do risk_level
-        platformPartner: string      // 'koopfy' | 'nexor'
         externalFeeCents: number
         externalWalletRef: string | null
         externalFeePct: number | null
@@ -427,12 +871,14 @@ export class PaymentService {
         fxFeeUSDcents: number
         fxFinalRate: number
         sellerFeePct: number
+        reserveCents?: number
     }): SettlementPayload {
         const {
             sellerWalletRef, sellerNetCents,
-            platformFeeCents, platformWalletRef, platformPartner,
+            platformFeeCents, platformWalletRef,
             externalFeeCents, externalWalletRef, externalFeePct,
             netUSDcents, grossUSDcents, fxFeeUSDcents, fxFinalRate, sellerFeePct,
+            reserveCents = 0,
         } = args
 
         const recipients: SettlementRecipient[] = [
@@ -449,7 +895,6 @@ export class PaymentService {
                 amount_cents: platformFeeCents,
                 fee_type: 'platform_fee',
                 fee_pct: sellerFeePct,
-                partner: platformPartner,   // 🔥 identifica quem recebeu
             },
         ]
 
@@ -464,13 +909,15 @@ export class PaymentService {
             })
         }
 
-        // Sanity check
+        // Sanity check: a distribuição (seller+platform+external) + o reserve
+        // retido tem que fechar com o net. O reserve NÃO é recipient (fica
+        // retido e volta pro seller depois), por isso entra só aqui.
         const sum = recipients.reduce((s, r) => s + r.amount_cents, 0)
-        if (sum !== netUSDcents) {
+        if (sum + reserveCents !== netUSDcents) {
             console.warn(
-                `[buildSettlement] Sum mismatch: ${sum} != ${netUSDcents}. ` +
-                `seller=${sellerNetCents} platform=${platformFeeCents} ` +
-                `external=${externalFeeCents} partner=${platformPartner}`,
+                `[buildSettlement] Sum mismatch: ${sum} + reserve ${reserveCents} ` +
+                `!= ${netUSDcents}. seller=${sellerNetCents} platform=${platformFeeCents} ` +
+                `external=${externalFeeCents}`,
             )
         }
 
@@ -616,7 +1063,7 @@ export class PaymentService {
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────────────
-    private buildResponse(result: any, transactionId: string, status: string) {
+    private buildResponse(result: any, transactionId: string, status: string, hostedAwaiting = false) {
         // success é true SÓ quando a transação está aprovada/concluída.
         // requires_action, pending, processing NÃO são sucesso final —
         // o frontend precisa fazer algo (3DS, mostrar QR/boleto, esperar webhook).
@@ -637,14 +1084,22 @@ export class PaymentService {
         if (result.checkout_url) body.checkout_url = result.checkout_url
         if (result.client_secret) body.client_secret = result.client_secret
         if (result.clientSecret) body.client_secret = result.clientSecret  // compat camelCase
-        if (result.provider) body.provider = result.provider
+        body.provider = 'koopfy'  // a Waylinx fala com a Koopfy (provider externo é sempre koopfy)
+        // Sinal explícito (sem vazar qual provider é de verdade) pro checkout saber
+        // que deve adiar a criação do pedido até o webhook de engajamento real —
+        // hoje só true pro Rox Pay (checkout embedded, ver processSplitAwarePayment).
+        if (hostedAwaiting) body.hosted_awaiting = true
         if (result.reference && result.entity) {
             body.reference = result.reference
             body.entity = result.entity
         }
         if (result.redirectUrl) body.redirectUrl = result.redirectUrl
+        // Whop: o loader.js precisa de planId + sessionId (o checkout_url sozinho
+        // só serve pra redirect, não pro embed).
+        if (result.data?.embed) body.embed = result.data.embed
         if (result.referenceData) body.referenceData = result.referenceData
         if (result.next_action) body.next_action = result.next_action
+        if (result.data?.card) body.card = result.data.card  // { last4, network, eci }
 
         console.log('[buildResponse] →', JSON.stringify(body))
         return body
@@ -658,8 +1113,199 @@ export class PaymentService {
             gateway_id: tx.provider_gateway_id ?? undefined,
             checkout_url: tx.provider_checkout_url ?? undefined,
             provider: tx.provider ?? undefined,
+            // Idempotência hit (retry) precisa do mesmo sinal que buildResponse manda
+            // na primeira vez — senão um retry faz o checkout criar o pedido cedo demais.
+            ...(PaymentService.HOSTED_AWAITING_PROVIDERS.has(tx.provider) ? { hosted_awaiting: true } : {}),
             ...extra,
         }
+    }
+
+    // Wallet ref da plataforma que recebe o platform_fee.
+    // Modelo atual: plataforma única (Koopfy). O parâmetro `partner` é mantido
+    // para compatibilidade caso volte o split Koopfy/Nexor por risk_level.
+    private resolvePlatformWalletRef(_partner?: string | null): string {
+        return KOOPFY_PLATFORM_WALLET_REF
+    }
+
+    // ─── Clip: reserva a conta ANTES de o formulário de cartão existir ────────
+    //
+    // ⚠️ ESTE ENDPOINT É O QUE TORNA O TETO REAL, E A ORDEM IMPORTA.
+    // O SDK da Clip monta o iframe com a PUBLIC KEY, e o token que sai dali só
+    // é cobrável pelo SECRET DA MESMA CONTA. Ou seja: a conta tem que estar
+    // decidida antes de o comprador ver o campo de cartão. Rotear no
+    // createPayment seria tarde — o token já chegaria amarrado.
+    //
+    // Devolve UMA conta. Nunca a lista, nunca o secret.
+    async clipRoute(sellerId: string, body: {
+        method?: string
+        amount?: number          // CENTAVOS
+        external_reference?: string
+        // ⚠️ DECLARADOS PELA ORIGEM DO PEDIDO, quando existe uma.
+        // No embed, o backend do seller informa país e moeda ao criar a sessão
+        // — isso é FATO, e vence a inferência por IP ou o cadastro do seller.
+        // O checkout hospedado não passa nada e continua caindo no seller.
+        country?: string
+        currency?: string
+    }) {
+        const amountMinor = Math.round(Number(body?.amount))
+        if (!Number.isFinite(amountMinor) || amountMinor <= 0) {
+            throw new BadRequestException('amount (em centavos de MXN) é obrigatório.')
+        }
+
+        const method = (body?.method ?? 'card').toLowerCase()
+        const externalReference = body?.external_reference ?? null
+
+        const seller = await this.getSellerById(sellerId)
+        if (!seller || seller.status !== 'active') {
+            throw new ForbiddenException('Seller não está ativo para receber pagamentos.')
+        }
+        if (this.normalizeProviderName(seller.provider_default) !== 'clip') {
+            throw new ForbiddenException('Provider Clip não está configurado para este seller.')
+        }
+
+        const riskLevel = String(seller.risk_level ?? '').toUpperCase()
+        if (riskLevel !== 'WHITE' && riskLevel !== 'GRAY') {
+            throw new ForbiddenException('Nível de risco do seller inválido para roteamento Clip.')
+        }
+
+        const enabled = new Set(
+            (seller.enabled_methods ?? []).map((m: any) =>
+                String(m).toLowerCase() === 'credit_card' ? 'card' : String(m).toLowerCase(),
+            ),
+        )
+        if (!enabled.has(method)) {
+            throw new ForbiddenException(`Método ${method} não está habilitado para este seller.`)
+        }
+
+        // Clip é uma operação mexicana. Sellers antigos podem não ter country
+        // preenchido; nesse caso MX preserva compatibilidade. A conta ainda é
+        // filtrada no Postgres pelo mesmo país, sem fallback para outro país.
+        // Precedência: o que a origem declarou → cadastro do seller → MX.
+        // Sellers antigos não têm country, e sem o último degrau eles parariam
+        // de rotear de um dia para o outro.
+        const country = String(body?.country ?? seller.country ?? 'MX').toUpperCase()
+        const currency = String(body?.currency ?? 'MXN').toUpperCase()
+
+        if (method === 'spei') {
+            const hold = await this.clipAccounts.holdSpei({
+                amountMinor, externalReference, sellerId, country, currency,
+                riskLevel: riskLevel as 'WHITE' | 'GRAY',
+            })
+            // Sem capacidade NÃO é erro transitório: é o teto funcionando. Um
+            // 503 aqui faria o front dar retry e martelar um pool cheio.
+            if (!hold) return { available: false, method: 'spei' as const }
+
+            return {
+                available: true,
+                method: 'spei' as const,
+                reservation_id: hold.reservation_id,
+                account_id: hold.account_id,
+                clabe: hold.clabe,
+                banco: hold.banco,
+                beneficiario: hold.beneficiario,
+                // ⚠️ O VALOR A COBRAR É ESTE, não o que o front calculou.
+                // Os centavos são únicos por pedido (ver gw_hold_spei): sem
+                // API, o valor no extrato é a ÚNICA chave de conciliação, e
+                // dois pedidos do mesmo valor na mesma CLABE no mesmo dia são
+                // indistinguíveis para sempre.
+                charge_minor: hold.charge_minor,
+            }
+        }
+
+        if (method !== 'card') {
+            throw new BadRequestException(`Método Clip não suportado: ${method}.`)
+        }
+
+        // ⚠️ TTL CURTO NO CARTÃO — 3h era herança do SPEI e está errado aqui.
+        // O SPEI precisa de horas: o comprador sai para o app do banco. O cartão
+        // é preenchido na mesma sessão, em minutos. Com 3h, cada checkout aberto
+        // e abandonado imobilizava (valor + folga de upsell) por meio turno, e
+        // sete abandonos matavam o teto do dia sem uma venda sequer.
+        const hold = await this.clipAccounts.holdCard({
+            amountMinor, externalReference, sellerId, country, currency,
+            riskLevel: riskLevel as 'WHITE' | 'GRAY',
+            ttlMinutes: CARD_HOLD_TTL_MIN,
+        })
+        if (!hold) return { available: false, method: 'card' as const }
+
+        return {
+            available: true,
+            method: 'card' as const,
+            reservation_id: hold.reservation_id,
+            account_id: hold.account_id,
+            // Pública por design — é o que monta o iframe. O secret nunca sai
+            // do servidor.
+            public_key: hold.public_key,
+        }
+    }
+
+    // ─── SPEI: comprovante enviado pelo comprador ─────────────────────────────
+    //
+    // ⚠️ ISTO NÃO CONFIRMA QUE O DINHEIRO CHEGOU. Confirma que uma IMAGEM é
+    // consistente com a reserva. Não existe confirmação de verdade neste fluxo:
+    // o SPEI aqui é transferência direta para uma CLABE, sem webhook e sem
+    // endpoint de saldo. Quem descobre a fraude é a deriva no saque
+    // (gw_spei_withdraw), não este endpoint.
+    //
+    // Três desfechos, e o do meio é o que mais importa:
+    //   approved → reserva capturada, pedido pago
+    //   review   → vai para fila humana. NÃO é recusa; é "não tenho certeza".
+    //   rejected → contradiz a reserva de forma dura (não é comprovante, ou o
+    //              valor não bate)
+    async speiReceipt(sellerId: string, body: {
+        reservation_id?: string
+        // Caminho no bucket privado. Aceita `file_url` pelo nome antigo.
+        file_ref?: string
+        file_url?: string
+        file_type?: string
+    }) {
+        const ref = body?.file_ref ?? body?.file_url
+        if (!body?.reservation_id || !ref) {
+            throw new BadRequestException('reservation_id e file_ref são obrigatórios.')
+        }
+
+        const r = await this.speiReceipts.validate({
+            reservationId: body.reservation_id,
+            fileRef: ref,
+            fileType: body.file_type,
+        })
+
+        // ⚠️ A resposta ao COMPRADOR não carrega `checks` nem `reasons`.
+        // Dizer "o valor não bateu: esperava 1.247,63, li 1.247,00" ensina
+        // exatamente o que ajustar na próxima tentativa. O detalhe fica no
+        // banco, para quem revisa; o comprador recebe só o estado.
+        return {
+            status: r.verdict === 'approved' ? 'paid'
+                : r.verdict === 'rejected' ? 'rejected'
+                    : 'in_review',
+            receipt_id: r.receiptId ?? null,
+        }
+    }
+
+    /**
+     * Devolve o espaço de uma reserva que não vai virar cobrança.
+     *
+     * ⚠️ SEM ISTO O TETO VAZA. Cada abertura do checkout reserva
+     * (valor + folga de upsell); o front chama esta rota ao trocar de valor, ao
+     * sair da tela ou ao trocar de método. Sem ela o espaço só voltava no TTL,
+     * e um punhado de carrinhos abandonados esgotava o teto do dia sem UMA
+     * venda — foi exatamente o que aconteceu.
+     *
+     * Idempotente e silenciosa em reserva já resolvida: quem chama é o browser,
+     * que repete e desiste no meio.
+     */
+    async clipRelease(sellerId: string, reservationId?: string) {
+        if (!reservationId) return { released: false }
+
+        const reserva = await this.clipAccounts.getReservation(reservationId)
+        // ⚠️ Confere o dono. Sem isto qualquer um libera a reserva de qualquer
+        // seller tendo só o id — e o teto passa a furar pelo lado oposto.
+        if (!reserva || reserva.seller_id !== sellerId) return { released: false }
+        // Capturada é dinheiro que entrou: nunca devolve espaço.
+        if (reserva.state !== 'held') return { released: false }
+
+        await this.clipAccounts.release(reservationId, 'checkout-abandonou')
+        return { released: true }
     }
 
     private normalizeProviderName(provider: any): string {
@@ -670,21 +1316,457 @@ export class PaymentService {
         return raw.toLowerCase().replace(/provider$/, '')
     }
 
+    // ─── Config de pagamento p/ o checkout (fluxo unificado Koopfy) ────────────
+    //
+    // Consumido pelo backend checkout (autenticado com a sk_live_ do seller) p/
+    // montar o checkout do comprador: conta ativa?, provider configurado e
+    // métodos habilitados no dash-pay. Não retorna segredos.
+    async getPaymentConfig(sellerId: string) {
+        const { data: seller } = await supabase
+            .from('seller_profiles')
+            .select('status, provider_default, enabled_methods, provider_mid, config')
+            .eq('id', sellerId)
+            .maybeSingle()
+
+        if (!seller) {
+            return { active: false, provider: null, methods: [], providerConfig: null }
+        }
+
+        const provider = seller.provider_default
+            ? this.normalizeProviderName(seller.provider_default)
+            : null
+
+        // MID por seller: Sentinel usa provider_mid; Coinflow usa o merchantId
+        // guardado em config.coinflow_merchant_id (provider_mid tem FK p/ Sentinel).
+        const mid = provider === 'coinflow'
+            ? (seller.config?.coinflow_merchant_id ?? null)
+            : seller.provider_mid
+
+        // Stripe é POOL: a publishable_key é por titular e só existe depois de
+        // rotear. Resolvemos uma conta candidata aqui só para o front conseguir
+        // pré-carregar o stripe.js — a chave que VALE é a que volta junto do
+        // client_secret em createPayment, porque o par tem que ser da mesma
+        // conta. Ver StripeProvider.charge.
+        let stripeAccount: any = null
+        if (provider === 'stripe') {
+            try {
+                stripeAccount = await this.accountRouter.getAccountByProvider({
+                    sellerId,
+                    provider: 'stripe',
+                })
+            } catch (err: any) {
+                console.error('[PaymentService] getPaymentConfig: pool Stripe indisponível:', err?.message)
+            }
+        }
+
+        return {
+            active: seller.status === 'active',
+            provider, // ex.: 'setinel_gate' | 'approvebly' | 'coinflow' | 'stripe'
+            methods: seller.enabled_methods ?? [],
+            providerConfig: provider
+                ? this.buildProviderPublicConfig(provider, mid, seller.config, stripeAccount)
+                : null,
+        }
+    }
+
+    // Minta uma session key da Coinflow p/ o cliente (Apple/Google Pay no client).
+    // A apiKey é secreta (env) — por isso isto roda no servidor, não no front.
+    async mintCoinflowSession(sellerId: string, userId: string): Promise<{ sessionKey: string; merchantId: string; env: string }> {
+        const { data: seller } = await supabase
+            .from('seller_profiles')
+            .select('config')
+            .eq('id', sellerId)
+            .maybeSingle()
+
+        const merchantId = seller?.config?.coinflow_merchant_id ?? process.env.COINFLOW_MERCHANT_ID ?? null
+        const apiUrl = process.env.COINFLOW_API_URL ?? 'https://api.coinflow.cash'
+        const apiKey = process.env.COINFLOW_API_KEY
+        const env = process.env.COINFLOW_ENV ?? 'sandbox'
+
+        if (!apiKey || !merchantId) {
+            throw new BadRequestException('Coinflow não configurado (COINFLOW_API_KEY / merchantId).')
+        }
+
+        try {
+            const res = await fetch(`${apiUrl}/api/auth/session-key`, {
+                method: 'GET',
+                headers: { Authorization: apiKey, 'x-coinflow-auth-user-id': String(userId) },
+            })
+            const json: any = await res.json().catch(() => ({}))
+            if (!res.ok || !json?.key) {
+                throw new BadRequestException('Falha ao gerar session da Coinflow.')
+            }
+            return { sessionKey: json.key, merchantId, env }
+        } catch (e: any) {
+            if (e instanceof BadRequestException) throw e
+            throw new BadRequestException('Falha ao gerar session da Coinflow: ' + (e?.message ?? 'erro'))
+        }
+    }
+
+    // Bits PÚBLICOS por provider p/ o storefront renderizar a UI de cartão.
+    // `cardFlow` é o essencial: 'elements' (Stripe Elements) vs 'redirect'
+    // (bloco/redirect, ex.: Sentinel). publishableKey/scriptUrl vêm de env quando
+    // configurados (nunca segredos).
+    private buildProviderPublicConfig(
+        provider: string,
+        mid?: string | null,
+        sellerConfig?: any,
+        stripeAccount?: any,
+    ) {
+        switch (provider) {
+            case 'rox_pay':
+                // Default: embedded (iframe da Rox Pay, checkout hospedado). Opt-in
+                // por seller (config.rox_pay_card_flow = 'native') pro modo campos
+                // próprios (sem iframe) — ver rox-pay.provider.ts chargeNative().
+                // Experimental: sem 3DS e escopo PCI mais pesado (ver notas lá).
+                if (sellerConfig?.rox_pay_card_flow === 'native') {
+                    const cardEncryption = this.cardCrypto.getPublicKeyInfo()
+                    return {
+                        provider,
+                        cardFlow: 'local' as const,
+                        ...(cardEncryption ? { cardEncryption } : {}),
+                    }
+                }
+                return { provider, cardFlow: 'redirect' as const }
+            case 'stripe':
+                // ⚠️ NÃO cai mais em process.env.STRIPE_PUBLISHABLE_KEY. Com pool de
+                // titulares, uma pk global é a chave de OUTRA conta — e o confirm
+                // falha com um erro que não diz isso. Sem conta no pool, devolve
+                // null e o front espera a chave que vem com o client_secret.
+                return {
+                    provider,
+                    cardFlow: 'elements' as const,
+                    publishableKey: stripeAccount?.config?.publishable_key ?? null,
+                    // O front usa para conferir que a chave do preview e a do
+                    // client_secret são da mesma conta antes de montar o Element.
+                    providerAccountId: stripeAccount?.id ?? null,
+                }
+            case 'setinel_gate':
+                return {
+                    provider,
+                    cardFlow: 'redirect' as const,
+                    scriptUrl: process.env.SENTINEL_SCRIPT_URL ?? null,
+                }
+            case 'coinflow':
+                // Cartão tokenizado no CLIENT pelo SDK da Coinflow (Card Form /
+                // CoinflowPurchase). O front precisa do merchantId + env (sandbox/prod).
+                return {
+                    provider,
+                    cardFlow: 'coinflow' as const,
+                    // merchantId por seller (provider_mid), com fallback do ambiente.
+                    merchantId: mid ?? process.env.COINFLOW_MERCHANT_ID ?? null,
+                    env: (process.env.COINFLOW_ENV ?? 'prod') as 'prod' | 'sandbox',
+                }
+            case 'whop':
+                // Checkout embedado da Whop (loader.js + <div data-whop-checkout-*>).
+                // Não há chave pública: o que identifica a compra é o par
+                // planId/sessionId devolvido por createPayment em `embed`.
+                return {
+                    provider,
+                    cardFlow: 'whop' as const,
+                    scriptUrl: process.env.WHOP_CHECKOUT_SCRIPT_URL
+                        ?? 'https://js.whop.com/static/checkout/loader.js',
+                }
+            case 'clip':
+                // Clip MX — Checkout Transparente. O SDK da Clip monta um iframe
+                // de cartão no browser usando a PUBLIC KEY, tokeniza, e nós
+                // cobramos no servidor com o secret da MESMA conta.
+                //
+                // ⚠️ A public_key NÃO vem de env, e nem sequer vem daqui de
+                // forma definitiva. Ela é da conta que a RESERVA escolheu, e a
+                // reserva acontece em POST /payments/clip/route — antes de o
+                // formulário existir. O que devolvemos aqui é só o suficiente
+                // para o front carregar o SDK; a chave que VALE é a que volta
+                // do route, junto do reservation_id.
+                //
+                // Mandar uma chave "preferida" daqui seria o mesmo erro que a
+                // Stripe já cometeu com STRIPE_PUBLISHABLE_KEY: token gerado
+                // com a chave de uma conta e cobrado com o secret de outra
+                // falha com um erro que não diz isso.
+                return {
+                    provider,
+                    cardFlow: 'clip' as const,
+                    // Nome comercial opcional mostrado como beneficiário no
+                    // SPEI. Sem valor, o checkout usa o nome do workspace.
+                    speiBeneficiaryName: String(sellerConfig?.spei_beneficiary_name ?? '').trim() || null,
+                    scriptUrl: process.env.CLIP_SDK_URL
+                        ?? 'https://sdk.clip.mx/js/clip-sdk.js',
+                    // O front chama este endpoint para reservar a conta e
+                    // receber { reservation_id, public_key }.
+                    routeUrl: '/payments/clip/route',
+                }
+            case 'simulator':
+                // Form LOCAL de cartão (número/validade/cvv) — sem redirect/elements.
+                return { provider, cardFlow: 'local' as const }
+            default:
+                return { provider, cardFlow: 'redirect' as const }
+        }
+    }
+
+    // ─── Resolve o instrumento de pagamento ───────────────────────────────────
+    // - card  + card_encrypted → decifra o envelope (RSA+AES-GCM) e cross-check.
+    // - apple_pay/google_pay   → token cru da carteira (Sentinel decifra).
+    // Resultado normalizado em dto.payment_data (mesma forma da rota de teste).
+    private resolvePaymentInstrument(dto: any) {
+        const method = dto.method
+
+        // ── Clip (MX): token do SDK + reserva. Checado ANTES da Coinflow porque
+        //    os dois são "token de cartão no client" e a ordem define quem
+        //    ganha quando um payload traz os dois (não deveria, mas trazer um
+        //    campo órfão é barato e cair no provider errado é caro).
+        if (dto.clip?.token) {
+            dto.payment_data = {
+                ...(dto.payment_data ?? {}),
+                clipToken: dto.clip.token,
+                clipSessionId: dto.clip.sessionId ?? null,
+                clipReservationId: dto.clip.reservationId ?? null,
+            }
+            return
+        }
+
+        // ── Coinflow (cartão OU wallet) — checa ANTES do wallet-token do Sentinel,
+        //    senão um apple_pay/google_pay da Coinflow cairia no fluxo do Sentinel.
+        //    • token       → CardForm (cartão novo)
+        //    • paymentId   → Apple/Google Pay já cobrado pelo botão (skip-charge)
+        if (dto.coinflow?.token || dto.coinflow?.paymentId) {
+            dto.payment_data = {
+                ...(dto.payment_data ?? {}),
+                coinflowToken: dto.coinflow.token ?? null,
+                coinflowPaymentId: dto.coinflow.paymentId ?? null,
+                expMonth: dto.coinflow.expMonth,
+                expYear: dto.coinflow.expYear,
+                coinflowProtectionHeaders: dto.coinflow.protectionHeaders ?? null,
+            }
+            return
+        }
+
+        // ── Carteiras (Apple/Google Pay) ──
+        // Sentinel agora é HOSTED (payment_method google_pay/apple_pay → hosted_url):
+        // NÃO precisa de token — o cliente paga na página hosted. Se vier um token
+        // (fluxo legado), repassa; senão segue sem instrumento (o provider cria a
+        // sessão hosted). Coinflow (token/paymentId) já foi tratado acima.
+        if (method === 'apple_pay' || method === 'google_pay') {
+            const token = dto.wallet?.payment_token ?? dto.payment_data?.walletToken
+            if (token) dto.payment_data = { ...(dto.payment_data ?? {}), walletToken: token }
+            return
+        }
+
+        // ── Coinflow: token do CardForm (tokenizado no client) + exp + headers
+        //    de proteção (Chargeback Protection) ──
+        if (dto.coinflow?.token) {
+            dto.payment_data = {
+                ...(dto.payment_data ?? {}),
+                coinflowToken: dto.coinflow.token,
+                expMonth: dto.coinflow.expMonth,
+                expYear: dto.coinflow.expYear,
+                coinflowProtectionHeaders: dto.coinflow.protectionHeaders ?? null,
+            }
+            return
+        }
+
+        // ── Cartão cifrado (envelope) ──
+        if (dto.card_encrypted) {
+            const card = this.cardCrypto.decryptCardEnvelope(dto.card_encrypted)
+
+            // Cross-check anti-tamper com os metadados em claro (dto.card)
+            const meta = dto.card ?? {}
+            const last4 = String(card.number).slice(-4)
+            if (meta.last4 && String(meta.last4) !== last4) {
+                throw new BadRequestException({ code: 'TAMPER', message: 'card.last4 não confere' })
+            }
+            if (meta.brand && card.brand && String(meta.brand).toLowerCase() !== String(card.brand).toLowerCase()) {
+                throw new BadRequestException({ code: 'TAMPER', message: 'card.brand não confere' })
+            }
+
+            dto.payment_data = {
+                ...(dto.payment_data ?? {}),
+                cardNumber: card.number,
+                cvv: card.cvv,
+                expMonth: card.expiryMonth,
+                expYear: card.expiryYear,
+                cardBrand: card.brand ?? meta.brand,
+            }
+
+            if (card.document && !dto.customer?.document) {
+                dto.customer = { ...(dto.customer ?? {}), document: card.document }
+            }
+        }
+        // Sem card_encrypted: mantém dto.payment_data como veio (rota de teste/legado).
+    }
+
+    async uploadSpeiProof(sellerId: string, transactionId: string, input: any) {
+        const { data: tx, error } = await supabase.from('transactions')
+            .select('id, seller_id, method, status, amount, currency, metadata')
+            .eq('id', transactionId).eq('seller_id', sellerId).single()
+        if (error || !tx) throw new BadRequestException('Transação não encontrada.')
+        if (tx.method !== 'spei' || tx.status !== 'pending') {
+            throw new BadRequestException('Esta transação não aceita comprovante SPEI.')
+        }
+        if (!tx.metadata?.spei_reservation_id) throw new BadRequestException('Reserva SPEI ausente.')
+
+        const path = await this.storage.uploadSpeiReceipt({
+            sellerId, transactionId, base64: String(input?.base64 ?? ''), mime: String(input?.mime ?? ''),
+        })
+        const uploadedAt = new Date().toISOString()
+        const metadata = {
+            ...(tx.metadata ?? {}), spei_proof_path: path,
+            spei_proof_mime: input?.mime, spei_proof_name: input?.fileName ?? null,
+            spei_proof_status: 'pending_analysis', spei_proof_uploaded_at: uploadedAt,
+        }
+        await supabase.from('transactions').update({ provider_status: 'proof_under_review', metadata })
+            .eq('id', transactionId).eq('seller_id', sellerId)
+
+        // Dispara o validador interno de imagem. A resposta do upload não fica
+        // presa ao tempo do modelo; o checkout acompanha a decisão por polling.
+        // Qualquer falha é convertida em revisão manual dentro de
+        // analyzeSpeiProof — `pending_analysis` nunca pode ser estado terminal.
+        void this.analyzeSpeiProof({ ...tx, metadata }).catch((e) =>
+            console.error('[SPEI proof analyzer]', e?.message ?? e))
+        return { success: true, transactionId, status: 'pending_analysis' }
+    }
+
+    async getSpeiProofStatus(sellerId: string, transactionId: string) {
+        const { data: tx } = await supabase.from('transactions')
+            .select('id, status, provider_status, metadata').eq('id', transactionId).eq('seller_id', sellerId).single()
+        if (!tx) throw new BadRequestException('Transação não encontrada.')
+        return {
+            transactionId: tx.id, status: tx.status, providerStatus: tx.provider_status,
+            proofStatus: tx.metadata?.spei_proof_status ?? 'not_uploaded',
+        }
+    }
+
+    // Janela do upsell pós-compra: passado disto a oferta de um clique já não é
+    // pós-compra, e cobrar sem o comprador na página vira risco de chargeback.
+    private static readonly UPSELL_WINDOW_MS = 60 * 60 * 1000
+
+    /** Compra-mãe apta a upsell de um clique: Whop, aprovada, recente e com meio de pagamento salvo. */
+    private async loadUpsellParent(sellerId: string, transactionId: string) {
+        const { data: parent } = await supabase.from('transactions')
+            .select('id, seller_id, provider, provider_account_id, status, approved_at, metadata')
+            .eq('id', transactionId).eq('seller_id', sellerId).maybeSingle()
+
+        if (!parent) return { parent: null, reason: 'not_found' }
+        if (this.normalizeProviderName(parent.provider) !== 'whop') return { parent: null, reason: 'not_whop' }
+        if (parent.status !== 'approved') return { parent: null, reason: 'not_approved' }
+        if (!parent.provider_account_id) return { parent: null, reason: 'no_account' }
+        if (!parent.metadata?.whop_member_id || !parent.metadata?.whop_payment_method_id) {
+            // Pix, cripto e afins não ficam salvos; e compra feita sem
+            // setup-future-usage no embed também não.
+            return { parent: null, reason: 'no_saved_payment_method' }
+        }
+        const approvedAt = parent.approved_at ? Date.parse(parent.approved_at) : NaN
+        if (!Number.isFinite(approvedAt) || Date.now() - approvedAt > PaymentService.UPSELL_WINDOW_MS) {
+            return { parent: null, reason: 'window_expired' }
+        }
+        return { parent, reason: null }
+    }
+
+    async checkUpsellEligibility(sellerId: string, transactionId: string) {
+        const { parent, reason } = await this.loadUpsellParent(sellerId, transactionId)
+        return { eligible: Boolean(parent), reason }
+    }
+
+    private async requireUpsellParent(sellerId: string, transactionId: string) {
+        const { parent, reason } = await this.loadUpsellParent(sellerId, transactionId)
+        if (!parent) {
+            throw new BadRequestException({
+                message: 'Upsell indisponível para esta compra.',
+                error: `UPSELL_${String(reason).toUpperCase()}`,
+            })
+        }
+        return parent
+    }
+
+    async getTransactionStatus(sellerId: string, transactionId: string) {
+        const { data } = await supabase.from('transactions')
+            .select('id, status, provider_status, provider_transaction_id, failure_message, metadata')
+            .eq('id', transactionId).eq('seller_id', sellerId).single()
+        if (!data) throw new BadRequestException('Transação não encontrada.')
+        return {
+            transactionId: data.id, status: data.status, providerStatus: data.provider_status,
+            providerTransactionId: data.provider_transaction_id,
+            proofStatus: data.metadata?.spei_proof_status ?? null,
+            failureMessage: data.failure_message ?? null,
+            // Cobrança off-session desafiada pelo banco: link da Whop para o
+            // comprador autenticar (3DS). Gravado pelo webhook.
+            recoveryUrl: data.metadata?.whop_recovery_url ?? null,
+        }
+    }
+
+    private async analyzeSpeiProof(tx: any) {
+        try {
+            const result = await this.speiReceipts.validate({
+                reservationId: tx.metadata.spei_reservation_id,
+                fileRef: tx.metadata.spei_proof_path,
+                fileType: tx.metadata.spei_proof_mime,
+            })
+            const decision = result.verdict === 'approved' ? 'approved'
+                : result.verdict === 'rejected' ? 'rejected'
+                    : 'manual_review'
+            const { data: current } = await supabase.from('transactions').select('metadata, status')
+                .eq('id', tx.id).single()
+            if (!current || current.status !== 'pending') return
+
+            // Os detalhes sensíveis permanecem em gw_spei_receipts. Aqui fica
+            // só o necessário para o checkout e o CRM acompanharem o estado.
+            const metadata = {
+                ...(current.metadata ?? {}),
+                spei_proof_status: decision,
+                spei_proof_analysis: {
+                    verdict: result.verdict,
+                    confidence: result.confidence,
+                    receiptId: result.receiptId ?? null,
+                },
+                spei_proof_analyzed_at: new Date().toISOString(),
+            }
+            if (decision === 'approved') {
+                // validate() já captura a reserva atomicamente por
+                // gw_spei_confirm_receipt. Aqui executamos os efeitos da venda:
+                // status, wallet, KPI e postback.
+                await supabase.from('transactions').update({ metadata })
+                    .eq('id', tx.id).eq('status', 'pending')
+                await this.webhookService.handleWebhookProvider({
+                    reference: tx.id, status: 'PAID', type: 'TRANSACTION',
+                })
+            } else {
+                await supabase.from('transactions').update({
+                    provider_status: decision === 'rejected' ? 'proof_rejected' : 'proof_manual_review', metadata,
+                }).eq('id', tx.id).eq('status', 'pending')
+            }
+        } catch (e: any) {
+            // Falha de configuração, provider de IA ou migration ausente não
+            // pode deixar o comprador num spinner eterno. Preserva o pedido e
+            // encaminha para a fila humana.
+            console.error('[SPEI proof analyzer]', e?.message ?? e)
+            const { data: current } = await supabase.from('transactions').select('metadata, status')
+                .eq('id', tx.id).single()
+            if (!current || current.status !== 'pending') return
+            await supabase.from('transactions').update({
+                provider_status: 'proof_manual_review',
+                metadata: {
+                    ...(current.metadata ?? {}),
+                    spei_proof_status: 'manual_review',
+                    spei_proof_analyzed_at: new Date().toISOString(),
+                },
+            }).eq('id', tx.id).eq('status', 'pending')
+        }
+    }
+
     async getSellerById(id: string) {
         const { data } = await supabase
             .from('seller_profiles')
-            .select('id, status, risk_level, enabled_methods, config, metadata, user_id')
+            .select('id, status, risk_level, enabled_methods, config, metadata, user_id, provider_default, provider_mid, country')
             .eq('id', id).single()
         return data
     }
 
-    private defaultFeeResult(netUSDcents: number) {
+    private defaultFeeResult(netUSDcents: number, provider?: string) {
         return calculateFees(netUSDcents / 100, {
             sellerId: '', riskLevel: 'WHITE' as const,
             feePercentage: 9.99, feeFixedUsd: 0.30,
             settlementDays: 3, reservePercentage: 5.00,
             reserveHoldDays: 90, anticipationFeePct: 4.99,
-        })
+        }, { provider })
     }
 
     async registerKpi(data: { sellerId: string; method: string; amount: number; fee: number; status: string }) {

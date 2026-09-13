@@ -33,6 +33,9 @@ declare module 'express' {
 export class ApiKeyGuard implements CanActivate {
 
     async canActivate(context: ExecutionContext): Promise<boolean> {
+        // 🐞 DEBUG TEMPORÁRIO — timing (remover depois).
+        const __t0 = Date.now();
+
         const req = context.switchToHttp().getRequest();
 
         const authHeader = req.headers.authorization;
@@ -53,7 +56,7 @@ export class ApiKeyGuard implements CanActivate {
             .eq('key_prefix', prefix)
             .eq('is_active', true)
             .single();
-            
+        console.log(`[timing][ApiKeyGuard] busca api_keys: ${Date.now() - __t0}ms`);
 
         if (error || !apiKey) {
             throw new UnauthorizedException('Invalid API Key');
@@ -70,6 +73,7 @@ export class ApiKeyGuard implements CanActivate {
         }
         // 🔥 4. injeta seller no request
         req.sellerId = apiKey.seller_id;
+        console.log(`[timing][ApiKeyGuard] canActivate fim: ${Date.now() - __t0}ms`);
 
         return true;
     }

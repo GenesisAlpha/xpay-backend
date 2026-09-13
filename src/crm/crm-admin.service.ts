@@ -2,6 +2,7 @@ import {
   Injectable, NotFoundException, BadRequestException, ForbiddenException,
 } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
+import { CHARGEBACK_FEE_USD } from '../shared/fee.calculator'
 
 interface AdminContext {
   managerId: string
@@ -38,9 +39,14 @@ function normalizeDestination(metadata: any) {
     // Crypto
     wallet_address: dest.cryptoAddress ?? dest.wallet_address,
     network: dest.cryptoNetwork ?? dest.network,
-    // SEPA/Wire (preparado pro futuro)
+    // IBAN (SEPA/internacional) — método ativo hoje
     iban: dest.iban,
     swift: dest.swift,
+    // ACH (bancos EUA) — método ativo hoje
+    ach_routing_number: dest.achRoutingNumber ?? dest.ach_routing_number,
+    ach_account_number: dest.achAccountNumber ?? dest.ach_account_number,
+    ach_account_type: dest.achAccountType ?? dest.ach_account_type,
+    // Comuns às contas bancárias
     bank_name: dest.bankName ?? dest.bank_name,
     account_holder: dest.accountHolder ?? dest.account_holder,
   }
@@ -910,8 +916,15 @@ export class CrmAdminService {
       .range(from, from + pageSize - 1)
 
     if (status && status !== 'all') {
-      const dbStatus = status === 'succeeded' ? 'approved' : status
-      q = q.eq('status', dbStatus)
+      if (status === 'pending') {
+        // O front rotula 'requires_action' como "Pendente" (venda iniciada,
+        // hosted/redirect aguardando o cliente). Então o filtro "Pendente" cobre
+        // AMBOS: 'pending' e 'requires_action' — senão essas vendas somem da lista.
+        q = q.in('status', ['pending', 'requires_action'])
+      } else {
+        const dbStatus = status === 'succeeded' ? 'approved' : status
+        q = q.eq('status', dbStatus)
+      }
     }
     if (provider && provider !== 'all') q = q.eq('provider', provider)
     if (sellerId) q = q.eq('seller_id', sellerId)
@@ -1110,9 +1123,63 @@ export class CrmAdminService {
       resolution_notes: dto.notes ?? null,
     }).eq('id', id)
 
+    // ── Debita o seller: valor do chargeback + taxa fixa de $50 ──────────────
+    // Não trava se faltar saldo — registra para reconciliação manual.
+    const now = new Date().toISOString()
+    const feeCents = CHARGEBACK_FEE_USD * 100
+    const amountCents = Number(cb.amount_cents ?? 0)
+    const totalCents = amountCents + feeCents
+
+    const { error: debitErr } = await supabase.rpc('debit_balance', {
+      p_seller_id: cb.seller_id,
+      p_bucket: 'available',
+      p_amount_cents: totalCents,
+    })
+
+    const ledgerStatus = debitErr ? 'failed' : 'completed'
+    const meta = (kind: string) => ({
+      chargeback_id: cb.id,
+      reconciliation: !!debitErr,
+      ...(debitErr ? { error: debitErr.message } : {}),
+      kind,
+    })
+
+    await supabase.from('wallet_ledger').insert([
+      ...(amountCents > 0 ? [{
+        seller_id: cb.seller_id,
+        transaction_id: cb.transaction_id ?? cb.id,
+        type: 'chargeback_debit',
+        amount: amountCents,
+        currency: 'USD',
+        status: ledgerStatus,
+        metadata: meta('amount'),
+        created_at: now,
+      }] : []),
+      {
+        seller_id: cb.seller_id,
+        transaction_id: cb.id,
+        type: 'chargeback_fee',
+        amount: feeCents,
+        currency: 'USD',
+        status: ledgerStatus,
+        metadata: meta('fee'),
+        created_at: now,
+      },
+    ])
+
+    if (debitErr) {
+      console.error(
+        `[crm-admin] chargeback debit falhou seller=${cb.seller_id} ` +
+        `total=${totalCents}: ${debitErr.message} — marcado p/ reconciliação`,
+      )
+    }
+
     await this.audit(ctx, 'chargeback.accepted', 'chargeback', id, {
       seller_id: cb.seller_id,
       amount_cents: cb.amount_cents,
+      chargeback_fee_cents: feeCents,
+      total_debited_cents: totalCents,
+      debit_failed: !!debitErr,
       notes: dto.notes,
     })
 

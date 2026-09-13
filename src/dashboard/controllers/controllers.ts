@@ -196,6 +196,12 @@ export class PaymentMethodsController {
     return this.svc.toggle(sellerId, id, body.enabled)
   }
 
+  @Patch(':id/config')
+  async updateConfig(@Req() req: any, @Param('id') id: string, @Body() body: { beneficiaryName?: string }) {
+    const sellerId = await getSellerId(req.user.sub)
+    return this.svc.updateConfig(sellerId, id, body)
+  }
+
   @Get(':id/performance')
   async performance(@Req() req: any, @Param('id') id: string) {
     const sellerId = await getSellerId(req.user.sub)

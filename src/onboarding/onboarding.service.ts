@@ -1,6 +1,8 @@
 import { Injectable, BadRequestException } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
 import { getSellerFees, calculateFees } from '../shared/fee.calculator'
+import { StorageService } from '../lib/storage.service'
+import { DocumentsDto } from './onboarding.dto'
 
 // ─── Todos os métodos disponíveis na plataforma ───────────────────────────────
 // O seller seleciona quais quer no onboarding.
@@ -17,13 +19,14 @@ export const AVAILABLE_METHODS = [
 ] as const
 
 const FEE_TABLE = {
-  WHITE: { fee_percentage: 9.99,  fee_fixed_usd: 0.30, settlement_days: 3, reserve_percentage: 5.00, reserve_hold_days: 90,  anticipation_fee_pct: 4.99, anticipation_days: 0 },
-  GRAY:  { fee_percentage: 14.99, fee_fixed_usd: 0.30, settlement_days: 3, reserve_percentage: 0.00, reserve_hold_days: 0,   anticipation_fee_pct: 4.99, anticipation_days: 0 },
-  BLACK: { fee_percentage: 24.99, fee_fixed_usd: 0.30, settlement_days: 3, reserve_percentage: 0.00, reserve_hold_days: 0,   anticipation_fee_pct: 4.99, anticipation_days: 0 },
+  WHITE: { fee_percentage: 9.99,  fee_fixed_usd: 0.59, settlement_days: 3, reserve_percentage: 10.00, reserve_hold_days: 90, anticipation_fee_pct: 4.99, anticipation_days: 0 },
+  GRAY:  { fee_percentage: 14.99, fee_fixed_usd: 0.59, settlement_days: 3, reserve_percentage: 10.00, reserve_hold_days: 90, anticipation_fee_pct: 4.99, anticipation_days: 0 },
 } as const
 
 @Injectable()
 export class OnboardingService {
+
+  constructor(private readonly storageService: StorageService) {}
 
   // =========================================
   // KYC
@@ -61,10 +64,10 @@ export class OnboardingService {
   // =========================================
   async saveOperation(userId: string, dto: {
     description: string
-    overallRiskLevel: 'WHITE' | 'GRAY' | 'BLACK'
+    overallRiskLevel: 'WHITE' | 'GRAY'
     termsAccepted: boolean
     offers: Array<{
-      name: string; salesPageUrl: string; riskLevel: 'WHITE' | 'GRAY' | 'BLACK'
+      name: string; salesPageUrl: string; riskLevel: 'WHITE' | 'GRAY'
     }>
   }) {
     if (!dto.termsAccepted) throw new BadRequestException('Aceite os termos para continuar.')
@@ -139,6 +142,65 @@ export class OnboardingService {
     return {
       message:    'Cadastro enviado! Nossa equipe analisará em até 48h úteis.',
       redirectTo: '/onboarding/pending',  // 🔥 página de aguardando aprovação
+    }
+  }
+
+  // =========================================
+  // DOCUMENTOS
+  // =========================================
+  async saveDocuments(userId: string, dto: DocumentsDto) {
+    // ─── 1. Valida obrigatórios por tipo de empresa ────────────────────────────
+    if (dto.companyType === 'BR') {
+      if (!dto.contratoSocial) throw new BadRequestException('Contrato social é obrigatório.')
+      if (!dto.cartaoCnpj)     throw new BadRequestException('Cartão CNPJ é obrigatório.')
+    } else {
+      if (!dto.einDocument)    throw new BadRequestException('Documento EIN é obrigatório.')
+    }
+    if (!dto.identityDocument) throw new BadRequestException('Documento de identidade é obrigatório.')
+    if (!dto.proofOfResidence) throw new BadRequestException('Comprovante de residência é obrigatório.')
+
+    // ─── 2. Upload de cada arquivo presente → retorna o path ───────────────────
+    const upload = (field: string, file?: { base64: string; mime: string }) =>
+      file
+        ? this.storageService.uploadDocument({ userId, field, base64: file.base64, mime: file.mime })
+        : Promise.resolve(null)
+
+    const [
+      contratoSocialPath,
+      cartaoCnpjPath,
+      einDocumentPath,
+      identityDocumentPath,
+      proofOfResidencePath,
+    ] = await Promise.all([
+      upload('contrato_social', dto.contratoSocial),
+      upload('cartao_cnpj', dto.cartaoCnpj),
+      upload('ein_document', dto.einDocument),
+      upload('identity_document', dto.identityDocument),
+      upload('proof_of_residence', dto.proofOfResidence),
+    ])
+
+    // ─── 3. Upsert em seller_documents (onConflict user_id) ────────────────────
+    const { error } = await supabase.from('seller_documents').upsert({
+      user_id:                 userId,
+      company_type:            dto.companyType,
+      contrato_social_path:    contratoSocialPath,
+      cartao_cnpj_path:        cartaoCnpjPath,
+      ein_document_path:       einDocumentPath,
+      identity_document_path:  identityDocumentPath,
+      proof_of_residence_path: proofOfResidencePath,
+      review_status:           'pending',
+      submitted_at:            new Date().toISOString(),
+      updated_at:              new Date().toISOString(),
+    }, { onConflict: 'user_id' })
+
+    if (error) throw new BadRequestException('Erro ao salvar documentos: ' + error.message)
+
+    // ─── 4. Marca etapa como concluída ─────────────────────────────────────────
+    await supabase.from('users').update({ documents_completed: true }).eq('id', userId)
+
+    return {
+      message:    'Documentos enviados! Nossa equipe fará a análise.',
+      redirectTo: '/onboarding/pending',
     }
   }
 

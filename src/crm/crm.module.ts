@@ -46,6 +46,10 @@ import { CrmController } from './crm.controller'
 import { CrmService }    from './crm.service'
 import { CrmAdminController } from './crm-admin.controller'
 import { CrmAdminService } from './crm-admin.service'
+import { StorageService } from '../lib/storage.service'
+import { CryptoModule } from '../crypto/crypto.module'
+import { OrchestratorModule } from '../orchestrator/orchestrator.module'
+import { WebhookModule } from '../webhooks/webhook.module'
 
 @Module({
   imports: [
@@ -53,9 +57,19 @@ import { CrmAdminService } from './crm-admin.service'
       secret:       process.env.CRM_JWT_SECRET ?? 'crm-secret-change-me',
       signOptions:  { expiresIn: '8h' },
     }),
+    // CryptoModule: cifra api_key/webhook_secret das contas Whop em repouso.
+    // OrchestratorModule: WhopAccountsService, pra invalidar o cache do pool na
+    // hora que uma conta é pausada (senão o TTL de 30s manda pagamento pra uma
+    // conta que o gestor acabou de tirar do ar).
+    CryptoModule,
+    OrchestratorModule,
+    // WebhookModule: aprovar um comprovante à mão precisa rodar o MESMO pipeline
+    // de PAID que um pagamento normal (carteira, KPI, postback). Marcar o status
+    // direto deixaria o pedido pago no CRM e pendente em todo o resto.
+    WebhookModule,
   ],
   controllers: [CrmController, CrmAdminController],
-  providers:   [CrmService, CrmAdminService, CrmAuthGuard],
+  providers:   [CrmService, CrmAdminService, CrmAuthGuard, StorageService],
   exports:     [CrmService, CrmAdminService],
 })
 export class CrmModule {}

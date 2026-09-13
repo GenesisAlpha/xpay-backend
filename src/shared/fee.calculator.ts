@@ -9,6 +9,41 @@ import { supabase } from '../lib/supabase.client'
 // Taxa adicional cobrada quando o método de pagamento é Klarna
 const KLARNA_EXTRA_FEE_PCT = 5
 
+// Surcharges adicionais (somam ao fee da plataforma)
+const AMEX_DINERS_SURCHARGE_PCT = 2   // cartões Amex / Diners
+const WALLET_SURCHARGE_PCT      = 1   // Apple Pay / Google Pay
+const CROSS_BORDER_SURCHARGE_PCT = 2  // transação cross-border
+
+// Taxa fixa cobrada do seller quando um chargeback é aceito (USD)
+export const CHARGEBACK_FEE_USD = 50
+
+// Taxa de PROTEÇÃO contra chargeback (Coinflow CBP) — % cobrada do seller quando
+// o provider é Coinflow. Cobre o custo da proteção (NSure/Verisoul) da Coinflow.
+export const CHARGEBACK_PROTECTION_FEE_PCT = 1.5
+
+// ─── Surcharge (%) por bandeira / wallet / cross-border ───────────────────────
+export function computeSurchargePct(opts?: {
+  cardBrand?:    string
+  walletMethod?: string
+  crossBorder?:  boolean
+}): number {
+  let pct = 0
+
+  const brand = (opts?.cardBrand ?? '').toLowerCase().replace(/[\s_]/g, '')
+  if (['amex', 'americanexpress', 'diners', 'dinersclub'].includes(brand)) {
+    pct += AMEX_DINERS_SURCHARGE_PCT
+  }
+
+  const wallet = (opts?.walletMethod ?? '').toLowerCase()
+  if (wallet === 'apple_pay' || wallet === 'google_pay') {
+    pct += WALLET_SURCHARGE_PCT
+  }
+
+  if (opts?.crossBorder) pct += CROSS_BORDER_SURCHARGE_PCT
+
+  return pct
+}
+
 // ─── Tipos ────────────────────────────────────────────────────────────────────
 
 export type PaymentMethod =
@@ -31,7 +66,10 @@ export interface SellerFees {
 
 export interface TransactionFeeResult {
   grossAmount:      number   // valor bruto (USD)
-  platformFee:      number   // taxa da plataforma (% + fixo)
+  platformFee:      number   // taxa da plataforma (% + fixo + surcharges + CBP)
+  chargebackProtectionFee: number // parcela de proteção de chargeback (Coinflow) DENTRO do platformFee
+  surchargeFee:     number   // parcela de surcharge (bandeira/wallet/cross-border) dentro do platformFee
+  surchargePct:     number   // % de surcharge aplicado
   paymentMethodFee: number   // taxa adicional por método de pagamento (ex: Klarna)
   reserveAmount:    number   // valor retido como reserva
   netAmount:        number   // valor líquido para o seller
@@ -83,15 +121,35 @@ export function calculateFees(
   options?: {
     anticipate?:    boolean
     paymentMethod?: PaymentMethod
+    cardBrand?:     string    // 'amex', 'diners', 'visa'...
+    walletMethod?:  string    // 'apple_pay', 'google_pay'
+    crossBorder?:   boolean
+    provider?:      string    // 'coinflow' → +1.5% de proteção de chargeback
   },
 ): TransactionFeeResult {
 
   const paymentMethod = options?.paymentMethod ?? 'CARD'
 
-  // Taxa da plataforma: % + fixo
+  // Surcharge (%) por bandeira / wallet / cross-border
+  const surchargePct = computeSurchargePct({
+    cardBrand:    options?.cardBrand,
+    walletMethod: options?.walletMethod,
+    crossBorder:  options?.crossBorder,
+  })
+  const surchargeFee = (grossAmountUsd * surchargePct) / 100
+
+  // Proteção de chargeback (Coinflow CBP): +1.5% — entra DENTRO do platformFee
+  // (a liquidação/ledger fecham via platform_fee) e é exposta à parte p/ registro.
+  const chargebackProtectionFee = options?.provider === 'coinflow'
+    ? (grossAmountUsd * CHARGEBACK_PROTECTION_FEE_PCT) / 100
+    : 0
+
+  // Taxa da plataforma: % + fixo + surcharges + proteção de chargeback
   const platformFee =
     (grossAmountUsd * fees.feePercentage) / 100
     + fees.feeFixedUsd
+    + surchargeFee
+    + chargebackProtectionFee
 
   // Taxa adicional por método de pagamento (ex: +5% para Klarna)
   const paymentMethodFeePct = getPaymentMethodFeePct(paymentMethod)
@@ -111,8 +169,11 @@ export function calculateFees(
   const netAmount = afterAllFees - reserveAmount
 
   // Datas
+  // A liberação só ocorre às SEGUNDAS e QUINTAS. O settlementDays (T+N) define a
+  // maturidade; o availableAt encaixa no próximo dia de liberação a partir dela.
   const now          = new Date()
-  const availableAt  = addBusinessDays(now, fees.settlementDays)
+  const maturity     = addCalendarDays(now, fees.settlementDays)
+  const availableAt  = nextReleaseDay(maturity)
   const reserveUntil = fees.reserveHoldDays > 0
     ? addCalendarDays(now, fees.reserveHoldDays)
     : now
@@ -129,6 +190,9 @@ export function calculateFees(
   return {
     grossAmount:      round(grossAmountUsd),
     platformFee:      round(platformFee),
+    chargebackProtectionFee: round(chargebackProtectionFee),
+    surchargeFee:     round(surchargeFee),
+    surchargePct,
     paymentMethodFee: round(paymentMethodFee),
     reserveAmount:    round(reserveAmount),
     netAmount:        round(netAmount),
@@ -180,13 +244,15 @@ function addCalendarDays(date: Date, days: number): Date {
   return d
 }
 
-function addBusinessDays(date: Date, days: number): Date {
-  const d    = new Date(date)
-  let added  = 0
-  while (added < days) {
+// Próximo dia de liberação (SEGUNDA=1 ou QUINTA=4) na data dada ou depois dela.
+// O horário é zerado (00:00) para liberar no início do dia.
+function nextReleaseDay(date: Date): Date {
+  const RELEASE_DOWS = [1, 4] // segunda, quinta
+  const d = new Date(date)
+  d.setHours(0, 0, 0, 0)
+  for (let i = 0; i < 7; i++) {
+    if (RELEASE_DOWS.includes(d.getDay())) return d
     d.setDate(d.getDate() + 1)
-    const dow = d.getDay()
-    if (dow !== 0 && dow !== 6) added++ // pula sáb e dom
   }
   return d
 }

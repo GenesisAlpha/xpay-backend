@@ -3,13 +3,39 @@
 // Transactions | Wallet | Disputes | Transfers | PaymentMethods | Settings
 // ============================================================
 
-import { Injectable, BadRequestException, NotFoundException, UnauthorizedException, InternalServerErrorException, Logger } from '@nestjs/common'
+import { Injectable, BadRequestException, ConflictException, NotFoundException, UnauthorizedException, InternalServerErrorException, ServiceUnavailableException, Logger } from '@nestjs/common'
 import { supabase } from '../../lib/supabase.client'
 import * as bcrypt from 'bcrypt';
 import { generateKey, hashKey } from '../../utils/apikeys.utils';
 import * as crypto from 'crypto';
-import { RequestPayoutDto, RequestPayoutResult } from '../dto/request-payout.dto';
+import {
+  BLOCKED_METHODS,
+  IDEMPOTENCY_KEY_PATTERN,
+  MIN_WITHDRAW_USD,
+  RequestPayoutDto,
+  RequestPayoutResult,
+  UnifiedPayoutResult,
+  VALID_METHODS,
+} from '../dto/request-payout.dto';
+
+// Hash estável do que define o saque. Reusar a mesma chave com outro valor,
+// método ou destino é recusado pelo banco em vez de devolver o saque anterior.
+export function payoutRequestHash(
+  amountCents: number,
+  method: string,
+  destination: Record<string, string>,
+): string {
+  const sortedDestination = Object.fromEntries(
+    Object.entries(destination).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+  )
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify({ amountCents, method, destination: sortedDestination }))
+    .digest('hex')
+}
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { StorageService } from '../../lib/storage.service';
+import { syncInstagram } from './profile-sync';
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -33,6 +59,7 @@ function paginatedResponse<T>(data: T[], total: number, page: number, pageSize: 
 
 @Injectable()
 export class TransactionsService {
+  constructor(private readonly storage: StorageService) {}
 
   async list(sellerId: string, params: {
     page?: number; pageSize?: number
@@ -46,6 +73,10 @@ export class TransactionsService {
       .from('transactions')
       .select('*', { count: 'exact' })
       .eq('seller_id', sellerId)
+      // Esconde 'requires_action' (hosted/redirect onde o cliente abriu o
+      // iframe/redirect mas NÃO inseriu os dados) — não é uma venda/tentativa, o
+      // seller não deve ver/contar. failed/pending são tentativas reais e ficam.
+      .neq('status', 'requires_action')
       .order('created_at', { ascending: false })
       .range(from, to)
 
@@ -62,7 +93,7 @@ export class TransactionsService {
     const { data, error, count } = await q
     if (error) throw new BadRequestException(error.message)
 
-    const mapped = (data ?? []).map(tx => ({
+    const mapped = await Promise.all((data ?? []).map(async tx => ({
       id: tx.id,
       customer: tx.customer_name,
       customerEmail: tx.customer_email,
@@ -87,7 +118,15 @@ export class TransactionsService {
       ip: tx.ip,
       cardLast4: tx.payment_last4,
       cardBrand: tx.payment_brand,
-    }))
+      // 🚚 Rastreio / envio (derivado do campo `tracking`)
+      orderShipped: tx.tracking?.status === 'synced',
+      trackingCode: tx.tracking?.number ?? null,
+      trackingCarrier: tx.tracking?.carrier ?? null,
+      trackingUrl: tx.tracking?.url ?? null,
+      speiProofUrl: await this.storage.getSignedSpeiReceiptUrl(tx.metadata?.spei_proof_path),
+      speiProofStatus: tx.metadata?.spei_proof_status ?? null,
+      speiProofAnalysis: tx.metadata?.spei_proof_analysis ?? null,
+    })))
 
     return paginatedResponse(mapped, count ?? 0, page, pageSize)
   }
@@ -130,6 +169,14 @@ export class TransactionsService {
       failureMessage: data.failure_message,
       webhookStatus: data.webhook_status,
       metadata: data.metadata,
+      speiProofUrl: await this.storage.getSignedSpeiReceiptUrl(data.metadata?.spei_proof_path),
+      speiProofStatus: data.metadata?.spei_proof_status ?? null,
+      speiProofAnalysis: data.metadata?.spei_proof_analysis ?? null,
+      // 🚚 Rastreio / envio (derivado do campo `tracking`)
+      orderShipped: data.tracking?.status === 'synced',
+      trackingCode: data.tracking?.number ?? null,
+      trackingCarrier: data.tracking?.carrier ?? null,
+      trackingUrl: data.tracking?.url ?? null,
     }
   }
 }
@@ -205,16 +252,39 @@ export class WalletService {
 
     const CREDIT_TYPES = ['credit_pending', 'credit_available', 'release_to_available']
 
-    const mapped = (data ?? []).map(entry => ({
-      id: entry.id,
-      type: CREDIT_TYPES.includes(entry.type) ? 'credit' : 'debit',
-      description: this.describeEntry(entry.type),
-      // 🔥 amount em centavos → USD
-      amount: fromCents(entry.amount),
-      status: entry.status === 'completed' ? 'completed' : 'pending',
-      date: new Date(entry.created_at).toLocaleDateString('pt-BR'),
-      transactionId: entry.transaction_id,
-    }))
+    // 🚚 Busca o tracking das transações de origem (só p/ entradas de crédito = venda)
+    const creditTxIds = [...new Set(
+      (data ?? [])
+        .filter(e => CREDIT_TYPES.includes(e.type) && e.transaction_id)
+        .map(e => e.transaction_id),
+    )]
+
+    const trackingMap = new Map<string, any>()
+    if (creditTxIds.length > 0) {
+      const { data: txs } = await supabase
+        .from('transactions')
+        .select('id, tracking')
+        .in('id', creditTxIds)
+      for (const t of txs ?? []) trackingMap.set(t.id, t.tracking)
+    }
+
+    const mapped = (data ?? []).map(entry => {
+      const isCredit = CREDIT_TYPES.includes(entry.type)
+      const tracking = isCredit ? trackingMap.get(entry.transaction_id) : null
+      return {
+        id: entry.id,
+        type: isCredit ? 'credit' : 'debit',
+        description: this.describeEntry(entry.type),
+        // 🔥 amount em centavos → USD
+        amount: fromCents(entry.amount),
+        status: entry.status === 'completed' ? 'completed' : 'pending',
+        date: new Date(entry.created_at).toLocaleDateString('pt-BR'),
+        transactionId: entry.transaction_id,
+        // 🚚 Rastreio da venda de origem (débitos = false/null)
+        orderShipped: isCredit ? tracking?.status === 'synced' : false,
+        trackingCode: isCredit ? (tracking?.number ?? null) : null,
+      }
+    })
 
     return paginatedResponse(mapped, count ?? 0, page, pageSize)
   }
@@ -346,36 +416,148 @@ export class WalletService {
     return Math.round(usd * 100)
   }
 
-  // ── Monta o objeto `destination` conforme o método ─────────────────────────
-  private buildDestination(dto: RequestPayoutDto): Record<string, string> {
-    if (dto.method === 'pix') {
-      const pixKey = (dto.pixKey ?? '').trim()
-      const pixHolder = (dto.pixHolder ?? '').trim()
-      const pixKeyType = (dto.pixKeyType ?? '').trim()
-      const pixBankName = (dto.pixBankName ?? '').trim()
+  // ── Chave Pix ──────────────────────────────────────────────────────────────
+  //
+  // Normaliza no formato que o PSP espera e barra lixo óbvio. Não confere
+  // dígito verificador de CPF/CNPJ: a chave é validada de novo na liquidação,
+  // e recusar aqui um documento válido seria pior que deixar passar.
+  private normalizePixKey(type: string, rawKey: string): string {
+    const key = rawKey.trim()
+    if (!key) {
+      throw new BadRequestException('Informe a chave Pix.')
+    }
 
-      if (!pixKey) throw new BadRequestException('Chave PIX é obrigatória.')
-      if (!pixHolder) {
-        throw new BadRequestException('Nome do titular é obrigatório.')
+    if (type === 'cpf' || type === 'cnpj') {
+      const digits = key.replace(/\D/g, '')
+      const expected = type === 'cpf' ? 11 : 14
+      if (digits.length !== expected) {
+        throw new BadRequestException(
+          `Chave Pix inválida: ${type.toUpperCase()} tem ${expected} dígitos.`,
+        )
       }
+      return digits
+    }
 
+    if (type === 'email') {
+      const email = key.toLowerCase()
+      if (email.length > 77 || !/^[^\s@]+@[^\s@]+\.[a-z]{2,}$/.test(email)) {
+        throw new BadRequestException('Chave Pix inválida: e-mail incorreto.')
+      }
+      return email
+    }
+
+    if (type === 'phone') {
+      const digits = key.replace(/\D/g, '')
+      // Aceita com ou sem o código do país; grava sempre em E.164.
+      const national = digits.startsWith('55') ? digits.slice(2) : digits
+      if (national.length !== 10 && national.length !== 11) {
+        throw new BadRequestException(
+          'Chave Pix inválida: telefone com DDD e 8 ou 9 dígitos.',
+        )
+      }
+      return `+55${national}`
+    }
+
+    if (type === 'random') {
+      const evp = key.toLowerCase()
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(evp)) {
+        throw new BadRequestException('Chave Pix aleatória inválida.')
+      }
+      return evp
+    }
+
+    throw new BadRequestException(
+      'Tipo de chave Pix inválido. Use CPF, CNPJ, e-mail, telefone ou aleatória.',
+    )
+  }
+
+  // ── Monta o objeto `destination` conforme o método ─────────────────────────
+  //
+  // Chaves em camelCase; o CRM normaliza pra snake_case ao exibir
+  // (normalizeDestination em crm-admin.service.ts). Ao mexer aqui, mexer lá.
+  private buildDestination(dto: RequestPayoutDto): Record<string, string> {
+    const accountHolder = (dto.accountHolder ?? '').trim()
+    const bankName = (dto.bankName ?? '').trim()
+
+    if ((dto.method as string) === 'crypto') {
+      const cryptoAddress = (dto.cryptoAddress ?? '').trim()
+      const cryptoNetwork = (dto.cryptoNetwork ?? '').trim().toUpperCase()
+      if (cryptoAddress.length < 10 || cryptoAddress.length > 200) {
+        throw new BadRequestException('Endereço da carteira cripto inválido.')
+      }
+      if (!['TRC20', 'ERC20', 'BEP20'].includes(cryptoNetwork)) {
+        throw new BadRequestException('Rede inválida. Use TRC20, ERC20 ou BEP20.')
+      }
+      return { cryptoAddress, cryptoNetwork, asset: 'USDT' }
+    }
+    if ((dto.method as string) === 'pix') {
+      if (!accountHolder) {
+        throw new BadRequestException('Nome do titular da chave é obrigatório.')
+      }
+      const pixKeyType = (dto.pixKeyType ?? '').trim().toLowerCase()
+      const pixKey = this.normalizePixKey(pixKeyType, dto.pixKey ?? '')
+      // `pixHolder` é o que o CRM exibe; `accountHolder` mantém o campo comum
+      // aos demais métodos. Ao mexer aqui, conferir normalizeDestination.
       return {
         pixKey,
         pixKeyType,
-        pixHolder,
-        ...(pixBankName ? { pixBankName } : {}),
+        pixHolder: accountHolder,
+        accountHolder,
+        ...(bankName ? { bankName } : {}),
       }
     }
 
-    // crypto
-    const cryptoAddress = (dto.cryptoAddress ?? '').trim()
-    const cryptoNetwork = (dto.cryptoNetwork ?? '').trim()
-
-    if (cryptoAddress.length < 20) {
-      throw new BadRequestException('Endereço de carteira inválido.')
+    if (!accountHolder) {
+      throw new BadRequestException('Nome do titular da conta é obrigatório.')
     }
 
-    return { cryptoAddress, cryptoNetwork }
+    if (dto.method === 'ach') {
+      const achRoutingNumber = (dto.achRoutingNumber ?? '').replace(/\D/g, '')
+      const achAccountNumber = (dto.achAccountNumber ?? '').replace(/\s/g, '')
+      const achAccountType = (dto.achAccountType ?? 'checking').trim()
+
+      // ABA routing number tem exatamente 9 dígitos — errar aqui devolve o
+      // dinheiro dias depois, então vale barrar na entrada.
+      if (achRoutingNumber.length !== 9) {
+        throw new BadRequestException(
+          'Routing number (ABA) deve ter 9 dígitos.',
+        )
+      }
+      if (achAccountNumber.length < 4) {
+        throw new BadRequestException('Número da conta inválido.')
+      }
+      if (!['checking', 'savings'].includes(achAccountType)) {
+        throw new BadRequestException('Tipo de conta inválido.')
+      }
+
+      return {
+        achRoutingNumber,
+        achAccountNumber,
+        achAccountType,
+        accountHolder,
+        ...(bankName ? { bankName } : {}),
+      }
+    }
+
+    // iban
+    const iban = (dto.iban ?? '').replace(/\s/g, '').toUpperCase()
+    const swift = (dto.swift ?? '').replace(/\s/g, '').toUpperCase()
+
+    // Formato do IBAN: 2 letras de país + 2 dígitos de verificação + até 30
+    // alfanuméricos. Não valida o dígito verificador — só descarta lixo óbvio.
+    if (!/^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/.test(iban)) {
+      throw new BadRequestException('IBAN inválido.')
+    }
+    if (swift && !/^[A-Z0-9]{8}([A-Z0-9]{3})?$/.test(swift)) {
+      throw new BadRequestException('SWIFT/BIC inválido (8 ou 11 caracteres).')
+    }
+
+    return {
+      iban,
+      ...(swift ? { swift } : {}),
+      accountHolder,
+      ...(bankName ? { bankName } : {}),
+    }
   }
 
 
@@ -383,6 +565,14 @@ export class WalletService {
   async requestPayout(
     dto: RequestPayoutDto,
   ): Promise<RequestPayoutResult> {
+    const { data: seller, error: sellerError } = await supabase
+      .from('seller_profiles')
+      .select('provider_default')
+      .eq('id', dto.sellerId)
+      .maybeSingle()
+    if (sellerError || !seller) {
+      throw new BadRequestException('Seller não encontrado.')
+    }
     // 1. Converte para centavos (formato do banco).
     //    O DTO já garantiu amount > 0 e >= mínimo via class-validator.
     const amountCents = this.usdToCents(dto.amount)
@@ -440,6 +630,97 @@ export class WalletService {
     return {
       payoutId: row.payout_id,
       status: 'processing', // exibido como "Em Processamento" na modal
+    }
+  }
+
+  // ── Fluxo unificado (dash-checkout) ────────────────────────────────────────
+  //
+  // Mesma validação do saque acima, mas a criação passa por
+  // `request_payout_idempotent`: repetir a chamada com a mesma chave devolve o
+  // saque já criado. Não há fallback para `request_payout` — sem a função no
+  // banco, o saque falha fechado.
+  async requestPayoutIdempotent(
+    sellerId: string,
+    dto: RequestPayoutDto,
+    idempotencyKey: string,
+  ): Promise<UnifiedPayoutResult> {
+    if (!IDEMPOTENCY_KEY_PATTERN.test(idempotencyKey ?? '')) {
+      throw new BadRequestException('Idempotency-Key inválido.')
+    }
+    this.assertPayoutInput(dto)
+
+    const amountCents = this.usdToCents(dto.amount)
+    const destination = this.buildDestination(dto)
+
+    const { data, error } = await supabase.rpc('request_payout_idempotent', {
+      p_seller_id: sellerId,
+      p_idempotency_key: idempotencyKey,
+      p_request_hash: payoutRequestHash(amountCents, dto.method, destination),
+      p_amount_cents: amountCents,
+      p_method: dto.method,
+      p_destination: destination,
+    })
+
+    if (error) {
+      this.logger.warn(
+        `request_payout_idempotent falhou: ${error.message} (code=${error.code})`,
+      )
+      if (error.code === 'KP409' || error.code === 'KP425') {
+        throw new ConflictException(error.message)
+      }
+      if (error.code === '28000') {
+        throw new UnauthorizedException(error.message)
+      }
+      // Função ausente no schema: a migration ainda não foi aplicada.
+      if (error.code === 'PGRST202' || error.code === '42883') {
+        throw new ServiceUnavailableException(
+          'Solicitação de saque temporariamente indisponível.',
+        )
+      }
+      if (error.code === 'KP500') {
+        throw new InternalServerErrorException('Não foi possível confirmar o saque.')
+      }
+      throw new BadRequestException(
+        error.message || 'Não foi possível processar o saque.',
+      )
+    }
+
+    const row = Array.isArray(data) ? data[0] : data
+    if (!row?.payoutId) {
+      this.logger.error('request_payout_idempotent não retornou payoutId.')
+      throw new InternalServerErrorException('Não foi possível confirmar o saque.')
+    }
+
+    const replayed = row.replayed === true
+    this.logger.log(
+      `Saque ${replayed ? 'repetido' : 'criado'}: payoutId=${row.payoutId} method=${dto.method} amountCents=${amountCents}`,
+    )
+
+    return {
+      payoutId: String(row.payoutId),
+      status: String(row.status ?? 'processing'),
+      replayed,
+    }
+  }
+
+  // O Pay não tem ValidationPipe global: o fluxo unificado confere aqui o que
+  // o RequestPayoutDto declara com class-validator.
+  private assertPayoutInput(dto: RequestPayoutDto) {
+    const amount = dto?.amount
+    if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
+      throw new BadRequestException('Informe um valor de saque válido.')
+    }
+    if (Math.abs(amount * 100 - Math.round(amount * 100)) > 1e-6) {
+      throw new BadRequestException('O valor do saque aceita no máximo duas casas decimais.')
+    }
+    if (amount < MIN_WITHDRAW_USD) {
+      throw new BadRequestException(
+        `O valor mínimo para saque é US$ ${MIN_WITHDRAW_USD.toFixed(2)}.`,
+      )
+    }
+    const methods: readonly string[] = [...VALID_METHODS, ...BLOCKED_METHODS]
+    if (!methods.includes(dto.method as string)) {
+      throw new BadRequestException('Método de saque inválido.')
     }
   }
 }
@@ -663,9 +944,10 @@ export class PaymentMethodsService {
 
   async list(sellerId: string) {
     const { data: profile } = await supabase
-      .from('seller_profiles').select('enabled_methods, config').eq('id', sellerId).single()
+      .from('seller_profiles').select('enabled_methods, config, provider_default').eq('id', sellerId).single()
 
     const enabledMethods: string[] = profile?.enabled_methods ?? []
+    const isWhopSeller = String(profile?.provider_default ?? '').toLowerCase().replace(/provider$/, '') === 'whop'
 
     const { data: sellerFees } = await supabase
       .from('seller_fees').select('*').eq('seller_id', sellerId).maybeSingle()
@@ -691,44 +973,45 @@ export class PaymentMethodsService {
 
     const metricsByMethod: Record<string, { volume: number; txs: number; approved: number; total: number }> = {}
     for (const k of kpis ?? []) {
-      if (!metricsByMethod[k.method]) metricsByMethod[k.method] = { volume: 0, txs: 0, approved: 0, total: 0 }
+      const method = ({ credit_card: 'card', debit_card: 'card', mbway: 'mb_way', sepa: 'sepa_debit' } as Record<string, string>)[k.method] ?? k.method
+      if (!metricsByMethod[method]) metricsByMethod[method] = { volume: 0, txs: 0, approved: 0, total: 0 }
       // 🔥 approved_volume em centavos USD → USD
-      metricsByMethod[k.method].volume += fromCents(k.approved_volume)
-      metricsByMethod[k.method].txs += Number(k.approved_transactions)
-      metricsByMethod[k.method].approved += Number(k.approved_transactions)
-      metricsByMethod[k.method].total += Number(k.total_transactions)
+      metricsByMethod[method].volume += fromCents(k.approved_volume)
+      metricsByMethod[method].txs += Number(k.approved_transactions)
+      metricsByMethod[method].approved += Number(k.approved_transactions)
+      metricsByMethod[method].total += Number(k.total_transactions)
     }
 
     const ALL_METHODS = [
-      { id: 'credit_card', name: 'Cartão de Crédito', icon: 'credit_card', category: 'card', countries: ['*'] },
-      { id: 'debit_card', name: 'Cartão de Débito', icon: 'debit_card', category: 'card', countries: ['*'] },
+      { id: 'card', name: 'Cartões', icon: 'card', category: 'card', countries: ['*'] },
+      { id: 'apple_pay', name: 'Apple Pay', icon: 'apple_pay', category: 'wallet', countries: ['*'] },
+      { id: 'google_pay', name: 'Google Pay', icon: 'google_pay', category: 'wallet', countries: ['*'] },
+      { id: 'link', name: 'Link', icon: 'link', category: 'wallet', countries: ['*'] },
+      { id: 'paypal', name: 'PayPal', icon: 'paypal', category: 'wallet', countries: ['*'] },
+      { id: 'crypto', name: 'Criptomoedas', icon: 'crypto', category: 'wallet', countries: ['*'] },
       { id: 'pix', name: 'PIX', icon: 'pix', category: 'instant', countries: ['BR'] },
-      { id: 'mbway', name: 'MB Way', icon: 'mbway', category: 'instant', countries: ['PT'] },
-      { id: 'multibanco', name: 'Multibanco', icon: 'multibanco', category: 'bank', countries: ['PT'] },
+      { id: 'boleto', name: 'Boleto', icon: 'boleto', category: 'bank', countries: ['BR'] },
+      { id: 'oxxo', name: 'OXXO', icon: 'oxxo', category: 'bank', countries: ['MX'] },
       { id: 'ideal', name: 'iDEAL', icon: 'ideal', category: 'instant', countries: ['NL'] },
       { id: 'bancontact', name: 'Bancontact', icon: 'bancontact', category: 'instant', countries: ['BE'] },
-      { id: 'apple_pay', name: 'Apple Pay', icon: 'applepay', category: 'wallet', countries: ['*'] },
-      { id: 'google_pay', name: 'Google Pay', icon: 'googlepay', category: 'wallet', countries: ['*'] },
-      { id: 'paypal', name: 'PayPal', icon: 'paypal', category: 'wallet', countries: ['*'] },
-      { id: 'boleto', name: 'Boleto', icon: 'boleto', category: 'bank', countries: ['BR'] },
-      { id: 'sepa', name: 'SEPA', icon: 'sepa', category: 'bank', countries: ['EU'] },
-      { id: 'klarna', name: 'Klarna', icon: 'klarna', category: 'wallet', countries: ['EU', 'US'] },
-      { id: 'blik', name: 'Blik', icon: 'blik', category: 'instant', countries: ['PL'] },
-      { id: 'twint', name: 'Twint', icon: 'twint', category: 'instant', countries: ['CH'] },
+      { id: 'sepa_debit', name: 'SEPA Direct Debit', icon: 'sepa_debit', category: 'bank', countries: ['EU'] },
+      { id: 'multibanco', name: 'Multibanco', icon: 'multibanco', category: 'bank', countries: ['PT'] },
+      { id: 'mb_way', name: 'MB Way', icon: 'mb_way', category: 'instant', countries: ['PT'] },
+      { id: 'blik', name: 'BLIK', icon: 'blik', category: 'instant', countries: ['PL'] },
+      { id: 'p24', name: 'Przelewy24', icon: 'p24', category: 'instant', countries: ['PL'] },
+      { id: 'eps', name: 'EPS', icon: 'eps', category: 'instant', countries: ['AT'] },
+      { id: 'twint', name: 'TWINT', icon: 'twint', category: 'instant', countries: ['CH'] },
+      { id: 'swish', name: 'Swish', icon: 'swish', category: 'instant', countries: ['SE'] },
       { id: 'revolut_pay', name: 'Revolut Pay', icon: 'revolut_pay', category: 'wallet', countries: ['EU'] },
+      { id: 'klarna', name: 'Klarna', icon: 'klarna', category: 'wallet', countries: ['EU', 'US'] },
+      { id: 'affirm', name: 'Affirm', icon: 'affirm', category: 'wallet', countries: ['US', 'CA'] },
+      { id: 'afterpay_clearpay', name: 'Afterpay / Clearpay', icon: 'afterpay_clearpay', category: 'wallet', countries: ['US', 'CA', 'GB', 'AU', 'NZ'] },
+      { id: 'cashapp', name: 'Cash App Pay', icon: 'cashapp', category: 'wallet', countries: ['US'] },
+      { id: 'us_bank_account', name: 'Conta bancária US', icon: 'us_bank_account', category: 'bank', countries: ['US'] },
       { id: 'alipay', name: 'AliPay', icon: 'alipay', category: 'wallet', countries: ['CN'] },
-      { id: 'wechat', name: 'WeChat Pay', icon: 'wechat', category: 'wallet', countries: ['CN'] },
-      { id: 'mercadopago', name: 'Mercado Pago', icon: 'mercadopago', category: 'wallet', countries: ['LATAM'] },
-      { id: 'pse', name: 'PSE', icon: 'pse', category: 'instant', countries: ['CO'] },
-      { id: 'spei', name: 'SPEI', icon: 'spei', category: 'instant', countries: ['MX'] },
-      { id: 'oxxo', name: 'OXXO', icon: 'oxxo', category: 'bank', countries: ['MX'] },
-      { id: 'khipu', name: 'Khipu', icon: 'khipu', category: 'instant', countries: ['CL'] },
-      { id: 'webpay', name: 'Webpay', icon: 'webpay', category: 'instant', countries: ['CL'] },
-      { id: 'nequi', name: 'Nequi', icon: 'nequi', category: 'wallet', countries: ['CO'] },
-      { id: 'daviplata', name: 'Daviplata', icon: 'daviplata', category: 'wallet', countries: ['CO'] },
-      { id: 'rapipago', name: 'Rapipago', icon: 'rapipago', category: 'bank', countries: ['AR'] },
-      { id: 'pagofacil', name: 'Pago Fácil', icon: 'pagofacil', category: 'bank', countries: ['AR'] },
-      { id: 'bank_transfer', name: 'Transferência', icon: 'bank_transfer', category: 'bank', countries: ['*'] },
+      { id: 'wechat_pay', name: 'WeChat Pay', icon: 'wechat_pay', category: 'wallet', countries: ['CN'] },
+      { id: 'amazon_pay', name: 'Amazon Pay', icon: 'amazon_pay', category: 'wallet', countries: ['*'] },
+      { id: 'grabpay', name: 'GrabPay', icon: 'grabpay', category: 'wallet', countries: ['SG', 'MY'] },
     ]
 
     const providerMap: Record<string, string> = {}
@@ -753,7 +1036,9 @@ export class PaymentMethodsService {
         category: m.category,
         provider: providerMap[m.id] ?? '—',
         countries: m.countries,
-        enabled: enabledMethods.includes(m.id),
+        // Na Whop os métodos padrão são resolvidos automaticamente por país,
+        // moeda, dispositivo e elegibilidade do comprador.
+        enabled: isWhopSeller || enabledMethods.includes(m.id),
         volume,           // já convertido via fromCents
         transactions: txs,
         approvalRate: rate,
@@ -764,6 +1049,9 @@ export class PaymentMethodsService {
         settlementDays,
         reservePercentage: reservePct,
         anticipationFeePct: anticipationPct,
+        ...(m.id === 'spei' ? {
+          speiBeneficiaryName: String(profile?.config?.spei_beneficiary_name ?? ''),
+        } : {}),
       }
     })
   }
@@ -779,6 +1067,30 @@ export class PaymentMethodsService {
 
     await supabase.from('seller_profiles').update({ enabled_methods: updated }).eq('id', sellerId)
     return { message: `Método ${enabled ? 'ativado' : 'desativado'} com sucesso` }
+  }
+
+  async updateConfig(sellerId: string, methodId: string, data: { beneficiaryName?: string }) {
+    if (methodId !== 'spei') throw new BadRequestException('Este método não possui configuração editável.')
+
+    const beneficiaryName = String(data?.beneficiaryName ?? '').trim()
+    if (beneficiaryName.length > 120) {
+      throw new BadRequestException('O nome do beneficiário deve ter no máximo 120 caracteres.')
+    }
+
+    const { data: profile } = await supabase
+      .from('seller_profiles').select('config').eq('id', sellerId).single()
+    const config = profile?.config ?? {}
+
+    await supabase.from('seller_profiles').update({
+      config: {
+        ...config,
+        // String vazia remove a personalização e reativa o fallback para o
+        // nome do workspace no checkout.
+        spei_beneficiary_name: beneficiaryName || null,
+      },
+    }).eq('id', sellerId)
+
+    return { message: 'Configuração SPEI atualizada com sucesso' }
   }
 
   async getPerformance(sellerId: string, methodId: string) {
@@ -888,8 +1200,10 @@ export class SettingsService {
   async update(sellerId: string, userId: string, body: { section: string; data: Record<string, unknown> }) {
     const { section, data } = body
 
-    const { data: profile } = await supabase
+    const { data: profile, error: profileReadError } = await supabase
       .from('seller_profiles').select('config, metadata').eq('id', sellerId).single()
+
+    if (profileReadError) throw new BadRequestException(profileReadError.message)
 
     const config = profile?.config ?? {}
     const metadata = profile?.metadata ?? {}
@@ -901,10 +1215,9 @@ export class SettingsService {
       }
 
       // 🔥 seller_profiles — whatsapp NÃO existe aqui, só no users
-      await supabase.from('seller_profiles').update({
+      const { error: companyUpdateError } = await supabase.from('seller_profiles').update({
         ...(data.name !== undefined && { name: data.name }),
         ...(data.email !== undefined && { email: data.email }),
-        ...(data.instagram !== undefined && { instagram: data.instagram }),
         ...(data.country !== undefined && { country: data.country }),
         metadata: {
           ...metadata,
@@ -916,6 +1229,8 @@ export class SettingsService {
         config: { ...config, currency: data.currency },
       }).eq('id', sellerId)
 
+      if (companyUpdateError) throw new BadRequestException(companyUpdateError.message)
+
       // 🔥 users — name, whatsapp e avatar ficam aqui
       const userUpdate: Record<string, any> = {}
       if (data.name !== undefined) userUpdate.name = data.name
@@ -923,7 +1238,31 @@ export class SettingsService {
       if (avatarUrl) userUpdate.avatar_url = avatarUrl
 
       if (Object.keys(userUpdate).length > 0) {
-        await supabase.from('users').update(userUpdate).eq('id', userId)
+        const { error: userUpdateError } = await supabase.from('users').update(userUpdate).eq('id', userId)
+        if (userUpdateError) throw new BadRequestException(userUpdateError.message)
+      }
+
+      // `/auth/me` lê o @ de users, enquanto Configurações lê de
+      // seller_profiles. Mantemos as duas representações sincronizadas para o
+      // refresh fechar a modal e para o restante do painel exibir o mesmo dado.
+      if (data.instagram !== undefined) {
+        try {
+          await syncInstagram({
+            sellerId,
+            userId,
+            instagram: String(data.instagram),
+            updateSeller: async (id, instagram) => {
+              const { error } = await supabase.from('seller_profiles').update({ instagram }).eq('id', id)
+              return { error }
+            },
+            updateUser: async (id, instagram) => {
+              const { error } = await supabase.from('users').update({ instagram }).eq('id', id)
+              return { error }
+            },
+          })
+        } catch (error) {
+          throw new BadRequestException(error instanceof Error ? error.message : 'Não foi possível salvar o Instagram.')
+        }
       }
     }
 
@@ -1010,7 +1349,7 @@ export class SettingsService {
     const { data: profile, error } = await supabase
       .from('seller_profiles')
       .select('metadata')
-      .eq('user_id', sellerId)
+      .eq('id', sellerId)
       .single()
 
     if (error || !profile) {
