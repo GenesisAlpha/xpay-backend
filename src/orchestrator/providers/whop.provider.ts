@@ -211,8 +211,15 @@ export class WhopProvider {
     // Fallback: a página de resultado, que confirma o pedido no backend. Antes
     // era /obrigado — rota que não existe no checkout e caía na página de
     // produto, mostrando "Erro ao carregar" pra quem acabou de pagar.
-    const redirectUrl = metadata?.redirect_url
-      ?? `${checkoutBase}/payment-result?orderId=${encodeURIComponent(String(orderRef))}`;
+    //
+    // ⚠️ Só https E host público. A Whop recusa a checkout configuration INTEIRA
+    // com "The redirect URL must be a valid URL, starting with https://" — tanto
+    // para http quanto para https://localhost (conferido na API). Um return_url
+    // de ambiente local derrubava a sessão e o embed nem abria.
+    const requested = typeof metadata?.redirect_url === 'string' ? metadata.redirect_url.trim() : '';
+    const redirectUrl = this.isPublicHttpsUrl(requested)
+      ? requested
+      : `${checkoutBase}/payment-result?orderId=${encodeURIComponent(String(orderRef))}`;
 
     // Título do plano = nome do produto REAL da Koopfy. É o que o comprador lê
     // no checkout e no recibo — sem isso ele veria o nome do produto-container,
@@ -290,6 +297,41 @@ export class WhopProvider {
       subscriptionTerms = { billingPeriodDays, trialPeriodDays, initialCharge, installments };
     }
 
+    // ⚠️ Ver aviso de reconciliação no topo do arquivo. É o que o webhook usa pra
+    // achar a transação — vale igual pro embed e pro token do Elements.
+    const koopfyMetadata = {
+      koopfy_transaction_id: transactionId,
+      koopfy_order_ref: String(orderRef),
+      koopfy_seller_id: sellerId ?? metadata?.seller_id ?? metadata?.sellerId ?? null,
+      koopfy_product_id: metadata?.product_id ?? metadata?.productId ?? null,
+      koopfy_account_id: id,
+      koopfy_country: country,
+      koopfy_payment_type: isRecurring ? 'subscription' : 'one_time',
+      koopfy_pricing_plan_id: metadata?.pricing_plan?.id ?? null,
+    };
+
+    // ── Whop Elements: o navegador já escolheu o método e gerou o token ──────
+    // Sem checkout configuration nem embed: POST /payments confirma o token.
+    if (typeof ctx?.confirmation_token === 'string' && ctx.confirmation_token.startsWith('ctok_')) {
+      return this.chargeConfirmationToken({
+        accountId: id,
+        apiUrl,
+        apiKey,
+        companyId,
+        transactionId,
+        confirmationToken: ctx.confirmation_token,
+        currency: cur,
+        title: String(metadata?.pricing_plan?.name
+          ? `${title} · ${metadata.pricing_plan.name}`
+          : title).slice(0, WHOP_PLAN_TITLE_MAX),
+        initialPrice,
+        subscriptionTerms,
+        metadata: koopfyMetadata,
+        returnUrl: redirectUrl,
+        config,
+      });
+    }
+
     const body: Record<string, any> = {
       mode: 'payment',
       plan: {
@@ -329,17 +371,7 @@ export class WhopProvider {
         ...this.buildProductLink(config),
       },
       payment_method_configuration: this.buildPaymentMethods(method, config, cur),
-      // ⚠️ Ver aviso de reconciliação no topo do arquivo.
-      metadata: {
-        koopfy_transaction_id: transactionId,
-        koopfy_order_ref: String(orderRef),
-        koopfy_seller_id: sellerId ?? metadata?.seller_id ?? metadata?.sellerId ?? null,
-        koopfy_product_id: metadata?.product_id ?? metadata?.productId ?? null,
-        koopfy_account_id: id,
-        koopfy_country: country,
-        koopfy_payment_type: isRecurring ? 'subscription' : 'one_time',
-        koopfy_pricing_plan_id: metadata?.pricing_plan?.id ?? null,
-      },
+      metadata: koopfyMetadata,
       redirect_url: redirectUrl,
     };
 
@@ -455,6 +487,129 @@ export class WhopProvider {
   // configuration não aparecem na spec do POST /payments — mandar campo fora do
   // contrato arrisca 400 na hora da cobrança.
   // ─────────────────────────────────────────────
+
+  // ─────────────────────────────────────────────
+  // Whop Elements — confirma o token do navegador.
+  //
+  // O checkout monta Payments + PaymentElement (métodos, com Pix) e os botões de
+  // Apple/Google Pay (PaymentRequest). O comprador escolhe o método ali, o
+  // navegador gera um `ctok_` com e-mail e endereço que o NOSSO checkout já
+  // coletou, e o pay confirma aqui: POST /api/v1/payments com o token + plano
+  // inline (https://docs.whop.com/api-reference/payments/create-payment).
+  //
+  // A resposta não é o resultado final. Pix e 3DS têm um passo do comprador: o
+  // `client_secret` volta pro navegador, que chama payments.handleNextAction.
+  // Quem aprova a transação é o webhook payment.succeeded (koopfy_transaction_id
+  // no metadata), igual ao embed.
+  // ─────────────────────────────────────────────
+
+  private async chargeConfirmationToken(args: {
+    accountId: string;
+    apiUrl: string;
+    apiKey: string;
+    companyId: string;
+    transactionId: string;
+    confirmationToken: string;
+    currency: string;
+    title: string;
+    initialPrice: number;
+    subscriptionTerms: {
+      billingPeriodDays: number;
+      trialPeriodDays: number;
+      initialCharge: number;
+      installments: number | null;
+    } | null;
+    metadata: Record<string, any>;
+    returnUrl: string;
+    config: any;
+  }): Promise<ChargeResponse> {
+    const { accountId, transactionId, subscriptionTerms } = args;
+
+    if (subscriptionTerms?.installments) {
+      // split_pay_required_payments não está no contrato do plano inline do
+      // POST /payments. Falhar aqui é melhor que cobrar sem o parcelamento.
+      return this.failure(accountId, transactionId, 'Whop: parcelamento não suportado no pagamento por token');
+    }
+
+    const plan: Record<string, any> = {
+      currency: args.currency,
+      title: args.title,
+      visibility: 'quick_link',
+      plan_type: subscriptionTerms ? 'renewal' : 'one_time',
+      // Em renewal, initial_price é taxa ADICIONAL à primeira cobrança.
+      initial_price: subscriptionTerms ? subscriptionTerms.initialCharge : args.initialPrice,
+      ...(subscriptionTerms ? {
+        renewal_price: args.initialPrice,
+        billing_period: subscriptionTerms.billingPeriodDays,
+        trial_period_days: subscriptionTerms.trialPeriodDays || null,
+      } : {}),
+      ...this.buildProductLink(args.config),
+    };
+
+    const body = {
+      account_id: args.companyId,
+      confirmation_token: args.confirmationToken,
+      plan,
+      metadata: args.metadata,
+      // Para onde o comprador volta depois de um passo fora da página (banco do
+      // Pix, 3DS). Já vem validado como https público pelo charge().
+      return_url: args.returnUrl,
+    };
+
+    try {
+      const res = await fetch(`${args.apiUrl}/api/v1/payments`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${args.apiKey}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          // Um token por transação nossa: retry de rede não cobra duas vezes.
+          'Idempotency-Key': `koopfy_ctok_${transactionId}`,
+        },
+        body: JSON.stringify(body),
+      });
+
+      const json: any = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        const message = json?.error?.message ?? json?.message ?? `Whop HTTP ${res.status}`;
+        return this.failure(accountId, transactionId, message, json);
+      }
+
+      const paymentId = typeof json?.id === 'string' ? json.id : null;
+      const status = String(json?.status ?? '').toLowerCase();
+      const substatus = String(json?.substatus ?? '').toLowerCase();
+      const clientSecret = typeof json?.client_secret === 'string' ? json.client_secret : undefined;
+
+      if (substatus === 'failed' || status === 'uncollectible' || status === 'void') {
+        const reason = json?.failure_message
+          ?? (json?.decline_code ? `Pagamento recusado (${json.decline_code})` : 'Pagamento recusado.');
+        return {
+          ...this.failure(accountId, transactionId, reason, json),
+          providerTransactionId: paymentId ?? undefined,
+          failureCode: json?.decline_code ?? 'WHOP_TOKEN_PAYMENT_FAILED',
+        };
+      }
+
+      return {
+        success: true,
+        // requires_action enquanto houver passo do comprador possível (Pix, 3DS):
+        // o navegador chama handleNextAction com o clientSecret, que resolve na
+        // hora quando não há nada pendente.
+        status: status === 'paid' ? 'pending' : 'requires_action',
+        provider: this.name,
+        accountId,
+        transactionId,
+        providerTransactionId: paymentId ?? undefined,
+        providerStatus: substatus || status || 'pending',
+        clientSecret,
+        data: json,
+      };
+    } catch (err: any) {
+      console.error('[WhopProvider] token charge error:', err?.message);
+      return this.failure(accountId, transactionId, err?.message ?? 'erro desconhecido');
+    }
+  }
 
   private async chargeSavedPaymentMethod(args: {
     accountId: string;
@@ -760,6 +915,21 @@ export class WhopProvider {
   // usar o produto da Koopfy criaria um produto Whop por SKU, o oposto do que
   // se quer. O nome que o comprador lê vem do `plan.title`, não daqui.
   // ─────────────────────────────────────────────
+
+  // https + hostname com domínio. Fora: localhost, IPs de loopback, *.local e
+  // hosts sem ponto — a Whop recusa todos como redirect_url.
+  private isPublicHttpsUrl(value: string): boolean {
+    try {
+      const url = new URL(value);
+      if (url.protocol !== 'https:') return false;
+      const host = url.hostname.toLowerCase();
+      if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) return false;
+      if (host === '127.0.0.1' || host === '::1' || host === '[::1]') return false;
+      return host.includes('.');
+    } catch {
+      return false;
+    }
+  }
 
   private buildProductLink(config: any) {
     const mode: ProductLinkMode = config?.product_link_mode

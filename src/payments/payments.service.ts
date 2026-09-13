@@ -1359,12 +1359,27 @@ export class PaymentService {
             }
         }
 
+        // Whop Elements (Payments/PaymentRequest) é montado no navegador com o id
+        // da conta (biz_). Não é segredo — é o mesmo id que aparece no checkout
+        // hospedado da Whop. Sem ele o checkout fica no embed antigo.
+        let whopAccount: any = null
+        if (provider === 'whop') {
+            try {
+                whopAccount = await this.accountRouter.getAccountByProvider({
+                    sellerId,
+                    provider: 'whop',
+                })
+            } catch (err: any) {
+                console.error('[PaymentService] getPaymentConfig: conta Whop indisponível:', err?.message)
+            }
+        }
+
         return {
             active: seller.status === 'active',
             provider, // ex.: 'setinel_gate' | 'approvebly' | 'coinflow' | 'stripe'
             methods: seller.enabled_methods ?? [],
             providerConfig: provider
-                ? this.buildProviderPublicConfig(provider, mid, seller.config, stripeAccount)
+                ? this.buildProviderPublicConfig(provider, mid, seller.config, stripeAccount, whopAccount)
                 : null,
         }
     }
@@ -1412,6 +1427,7 @@ export class PaymentService {
         mid?: string | null,
         sellerConfig?: any,
         stripeAccount?: any,
+        whopAccount?: any,
     ) {
         switch (provider) {
             case 'rox_pay':
@@ -1466,6 +1482,8 @@ export class PaymentService {
                     cardFlow: 'whop' as const,
                     scriptUrl: process.env.WHOP_CHECKOUT_SCRIPT_URL
                         ?? 'https://js.whop.com/static/checkout/loader.js',
+                    // biz_ da conta — o Whop Elements (Payments) monta com ele.
+                    accountId: whopAccount?.config?.company_id ?? null,
                 }
             case 'clip':
                 // Clip MX — Checkout Transparente. O SDK da Clip monta um iframe

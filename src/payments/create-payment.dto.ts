@@ -88,8 +88,16 @@ export class CreatePaymentDto {
         'card', 'pix', 'mbway', 'multibanco',
         'ideal', 'bancontact', 'apple_pay', 'google_pay',
         'eps', 'p24', 'swish', 'twint', 'blik', 'mobile_pay', 'klarna', 'spei',
+        // Whop Elements: o PaymentElement também oferece cripto.
+        'crypto',
     ])
     method!: string;
+
+    // Whop Elements (Payments + PaymentElement): token `ctok_` que o navegador
+    // gerou com o método escolhido. O WhopProvider confirma com POST /payments
+    // em vez de criar uma checkout configuration pro embed.
+    @IsOptional() @IsString() @MaxLength(200)
+    confirmation_token?: string;
 
     // Roteamento da página hosted (Sentinel): 'apple_pay'/'google_pay' abrem a
     // página unificada com o botão da carteira + fallback de cartão, SEM mudar o
