@@ -13,9 +13,21 @@ import { ProviderAccountConfig } from '../provider-accounts.config';
 //
 // O serviço devolve as contas já no formato ProviderAccountConfig, então o
 // AccountRouterService não precisa saber que essas vieram do banco.
+//
+// ── MODO ENV (atual) ─────────────────────────────────────────────────────────
+// Com WHOP_API_KEY no env, a conta é UMA e vem do env — a tabela é ignorada no
+// roteamento. A company sai de WHOP_COMPANY_ID ou, sem ela, da própria chave
+// (GET /api/v5/company). O segredo do webhook é WHOP_WEBHOOK_SECRET: a API da
+// Whop NÃO devolve o segredo de um webhook já criado, então ele tem que vir do
+// painel (ou de quem criou o webhook).
+//
+// ⚠️ O id `whop_main` vai no metadata `koopfy_account_id` de cada sessão e volta
+// no webhook. Renomear deixa os pagamentos em aberto sem conta pra confirmar.
 // ============================================================================
 
 export const WHOP_API_URL_DEFAULT = 'https://api.whop.com';
+
+export const WHOP_ENV_ACCOUNT_ID = 'whop_main';
 
 export interface WhopAccountRow {
   id: string;
@@ -60,6 +72,11 @@ export class WhopAccountsService {
   // ─────────────────────────────────────────────
 
   async listActive(): Promise<ProviderAccountConfig[]> {
+    if (this.envApiKey()) {
+      const envAccount = await this.getEnvAccount();
+      return envAccount ? [envAccount] : [];
+    }
+
     const fresh = this.cache && Date.now() - this.hydratedAt < this.CACHE_TTL_MS;
     if (fresh) return this.cache!;
 
@@ -103,6 +120,8 @@ export class WhopAccountsService {
   // ─────────────────────────────────────────────
 
   async getById(id: string): Promise<ProviderAccountConfig | null> {
+    if (id === WHOP_ENV_ACCOUNT_ID) return this.getEnvAccount();
+
     const cached = this.cache?.find(a => a.id === id);
     if (cached && Date.now() - this.hydratedAt < this.CACHE_TTL_MS) return cached;
 
@@ -131,6 +150,95 @@ export class WhopAccountsService {
   invalidate() {
     this.cache = null;
     this.hydratedAt = 0;
+  }
+
+  // ─────────────────────────────────────────────
+  // Conta do env
+  //
+  // Montada uma vez por processo: nada nela muda sem restart (env), e a única
+  // parte cara — descobrir a company pela chave — não pode rodar a cada
+  // pagamento. Falha nessa descoberta NÃO fica cacheada: a próxima compra tenta
+  // de novo, em vez de o processo passar o dia sem Whop por um soluço de rede.
+  // ─────────────────────────────────────────────
+
+  private envAccount: ProviderAccountConfig | null = null;
+  private envCompany: Promise<{ id: string; title: string | null } | null> | null = null;
+
+  private envApiKey(): string | undefined {
+    return process.env.WHOP_API_KEY?.trim() || undefined;
+  }
+
+  private async getEnvAccount(): Promise<ProviderAccountConfig | null> {
+    if (this.envAccount) return this.envAccount;
+
+    const apiKey = this.envApiKey();
+    if (!apiKey) return null;
+
+    const apiUrl = process.env.WHOP_API_URL?.trim() || WHOP_API_URL_DEFAULT;
+    const company = await this.resolveEnvCompany(apiKey, apiUrl);
+    if (!company) return null;
+
+    const webhookSecret = process.env.WHOP_WEBHOOK_SECRET?.trim() || undefined;
+    if (!webhookSecret) {
+      // Não bloqueia a cobrança (o embed abre e o comprador paga), mas o webhook
+      // é recusado — pagamento aprovado na Whop fica pendente aqui até o
+      // segredo entrar no env e a Whop reentregar.
+      console.error(
+        '[WhopAccounts] WHOP_WEBHOOK_SECRET ausente. Pagamentos Whop vão ser COBRADOS '
+        + 'e NÃO vão confirmar: o webhook é recusado sem segredo. Pegue o segredo do '
+        + `webhook ${process.env.PAY_PUBLIC_URL ?? 'https://api.koopfy.com/pay'}/webhook/whop no painel da Whop.`,
+      );
+    }
+
+    this.envAccount = {
+      id: WHOP_ENV_ACCOUNT_ID,
+      provider: 'whop',
+      status: 'active',
+      weight: 1,
+      // 'all', não 'card': o supportsMethod do router é estrito, e com UMA conta
+      // o filtro não escolhe entre contas — só barraria Pix/iDEAL antes de chegar
+      // à Whop. Quem decide o método de fato é o embed.
+      supported_methods: ['all'],
+      api_url: apiUrl,
+      apiKey,
+      config: {
+        company_id: company.id,
+        product_id: process.env.WHOP_PRODUCT_ID?.trim() || null,
+        webhook_secret: webhookSecret,
+        legal_name: process.env.WHOP_LEGAL_NAME?.trim() || null,
+        label: company.title,
+      },
+    };
+
+    console.log(`[WhopAccounts] conta do env ativa: ${WHOP_ENV_ACCOUNT_ID} → ${company.id} (${company.title ?? 'sem título'})`);
+    return this.envAccount;
+  }
+
+  private resolveEnvCompany(apiKey: string, apiUrl: string) {
+    const fromEnv = process.env.WHOP_COMPANY_ID?.trim();
+    if (fromEnv) return Promise.resolve({ id: fromEnv, title: null });
+
+    if (!this.envCompany) {
+      this.envCompany = fetch(`${apiUrl}/api/v5/company`, {
+        headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' },
+      })
+        .then(async res => {
+          const json: any = await res.json().catch(() => ({}));
+          if (!res.ok || !json?.id) {
+            throw new Error(json?.error?.message ?? json?.message ?? `Whop HTTP ${res.status}`);
+          }
+          return { id: String(json.id), title: (json.title as string | undefined) ?? null };
+        })
+        .catch((err: any) => {
+          console.error(
+            '[WhopAccounts] não foi possível descobrir a company da WHOP_API_KEY '
+            + '(defina WHOP_COMPANY_ID pra pular esta chamada):', err?.message,
+          );
+          this.envCompany = null;
+          return null;
+        });
+    }
+    return this.envCompany;
   }
 
   // ─────────────────────────────────────────────

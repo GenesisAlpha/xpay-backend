@@ -208,8 +208,11 @@ export class WhopProvider {
 
     const orderRef = metadata?.order_number ?? metadata?.orderId ?? transactionId;
     const checkoutBase = process.env.CHECKOUT_PUBLIC_URL ?? 'https://checkout.koopfy.com';
+    // Fallback: a página de resultado, que confirma o pedido no backend. Antes
+    // era /obrigado — rota que não existe no checkout e caía na página de
+    // produto, mostrando "Erro ao carregar" pra quem acabou de pagar.
     const redirectUrl = metadata?.redirect_url
-      ?? `${checkoutBase}/obrigado?ref=${encodeURIComponent(String(orderRef))}`;
+      ?? `${checkoutBase}/payment-result?orderId=${encodeURIComponent(String(orderRef))}`;
 
     // Título do plano = nome do produto REAL da Koopfy. É o que o comprador lê
     // no checkout e no recibo — sem isso ele veria o nome do produto-container,

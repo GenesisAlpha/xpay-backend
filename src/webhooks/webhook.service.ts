@@ -672,8 +672,14 @@ export class WebhookService {
     if (!secret) {
       // Sem segredo, qualquer um que descubra a URL confirma pagamento. Recusa —
       // ao contrário dos providers legados aqui, que só avisam e seguem.
+      //
+      // THROW, não 2xx (mesmo motivo da assinatura inválida abaixo): com a conta
+      // vindo do env, faltar WHOP_WEBHOOK_SECRET é o erro de configuração mais
+      // provável. Responder 200 faria a Whop dar o evento por entregue e o
+      // pagamento aprovado nunca confirmaria; com erro ela reentrega até o
+      // segredo entrar no env.
       console.error(`[WebhookService] Whop: conta ${accountId} sem webhook_secret — evento recusado`)
-      return { ignored: true, reason: 'missing webhook secret' }
+      throw new Error(`Whop: conta ${accountId} sem webhook_secret (configure WHOP_WEBHOOK_SECRET)`)
     }
 
     const verification = this.verifyWhopSignature(rawBody, headers, secret)
