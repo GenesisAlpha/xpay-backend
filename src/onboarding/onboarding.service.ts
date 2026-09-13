@@ -40,9 +40,8 @@ export class OnboardingService {
     if (cpfClean.length !== 11) throw new BadRequestException('CPF inválido.')
     if (!this.isValidCPF(cpfClean)) throw new BadRequestException('CPF inválido.')
 
-    const { data: conflict } = await supabase
-      .from('kyc_info').select('user_id').eq('cpf', cpfClean).neq('user_id', userId).maybeSingle()
-    if (conflict) throw new BadRequestException('Este CPF já está cadastrado em outra conta.')
+    // Sem trava de CPF único por enquanto: a mesma pessoa pode ser responsável
+    // por mais de uma empresa. A unicidade deve migrar para o CNPJ/EIN.
 
     const { error } = await supabase.from('kyc_info').upsert({
       user_id: userId, full_name: dto.fullName, cpf: cpfClean,
@@ -52,7 +51,11 @@ export class OnboardingService {
       review_status: 'pending', updated_at: new Date().toISOString(),
     }, { onConflict: 'user_id' })
 
-    if (error) throw new BadRequestException('Erro ao salvar dados: ' + error.message)
+    // A mensagem do 400 chega ao seller pelo checkout: detalhe do banco só no log.
+    if (error) {
+      console.error('[onboarding] saveKyc:', error)
+      throw new BadRequestException('Não foi possível salvar seus dados agora. Tente novamente.')
+    }
 
     await supabase.from('users').update({ kyc_completed: true }).eq('id', userId)
 
@@ -193,7 +196,10 @@ export class OnboardingService {
       updated_at:              new Date().toISOString(),
     }, { onConflict: 'user_id' })
 
-    if (error) throw new BadRequestException('Erro ao salvar documentos: ' + error.message)
+    if (error) {
+      console.error('[onboarding] saveDocuments:', error)
+      throw new BadRequestException('Não foi possível salvar os documentos agora. Tente novamente.')
+    }
 
     // ─── 4. Marca etapa como concluída ─────────────────────────────────────────
     await supabase.from('users').update({ documents_completed: true }).eq('id', userId)

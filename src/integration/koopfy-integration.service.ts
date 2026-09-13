@@ -107,8 +107,10 @@ export class KoopfyIntegrationService {
       .select('id')
       .single();
 
+    // A mensagem do 400 chega ao seller pelo checkout: detalhe do banco só no log.
     if (userError || !user) {
-      throw new BadRequestException('Erro ao provisionar conta: ' + userError?.message);
+      console.error('[integration] provision user:', userError);
+      throw new BadRequestException('Não foi possível criar a conta financeira agora. Tente novamente.');
     }
 
     const { error: profileError } = await supabase.from('seller_profiles').insert({
@@ -130,7 +132,8 @@ export class KoopfyIntegrationService {
 
     if (profileError) {
       await supabase.from('users').delete().eq('id', user.id); // rollback
-      throw new BadRequestException('Erro ao provisionar perfil: ' + profileError.message);
+      console.error('[integration] provision profile:', profileError);
+      throw new BadRequestException('Não foi possível criar a conta financeira agora. Tente novamente.');
     }
 
     const { data: sellerProfile } = await supabase
