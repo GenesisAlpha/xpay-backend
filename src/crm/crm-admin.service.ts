@@ -3,7 +3,21 @@ import {
 } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
 import { CHARGEBACK_FEE_USD } from '../shared/fee.calculator'
-import { notifySellerPayout } from '../utils/seller-mail'
+import { notifySellerPayout, type PayoutEmailInfo } from '../utils/seller-mail'
+
+// Linha do ledger (debit_payout) → dados do e-mail de saque. O destino fica em
+// metadata.destination (camelCase), igual ao que o CRM exibe.
+function payoutEmailInfo(id: string, w: any): PayoutEmailInfo {
+  return {
+    amountCents: Number(w.amount),
+    currency: w.currency,
+    method: w.metadata?.method ?? w.method ?? null,
+    payoutId: id,
+    destination: w.metadata?.destination ?? null,
+    feeCents: Number(w.fee) || null,
+    requestedAt: w.created_at ?? null,
+  }
+}
 
 interface AdminContext {
   managerId: string
@@ -653,7 +667,7 @@ export class CrmAdminService {
       notes: dto.notes,
     })
 
-    void notifySellerPayout(w.seller_id, 'approved', { amountCents: Number(w.amount), currency: w.currency })
+    void notifySellerPayout(w.seller_id, 'approved', payoutEmailInfo(id, w))
 
     return { message: 'Saque aprovado e saldo debitado' }
   }
@@ -705,11 +719,7 @@ export class CrmAdminService {
       seller_id: w.seller_id,
     })
 
-    void notifySellerPayout(w.seller_id, 'rejected', {
-      amountCents: Number(w.amount),
-      currency: w.currency,
-      reason: dto.reason.trim(),
-    })
+    void notifySellerPayout(w.seller_id, 'rejected', { ...payoutEmailInfo(id, w), reason: dto.reason.trim() })
 
     return { message: 'Saque rejeitado e saldo devolvido' }
   }
@@ -754,7 +764,10 @@ export class CrmAdminService {
       seller_id: w.seller_id,
     })
 
-    void notifySellerPayout(w.seller_id, 'completed', { amountCents: Number(w.amount), currency: w.currency })
+    void notifySellerPayout(w.seller_id, 'completed', {
+      ...payoutEmailInfo(id, w),
+      providerPayoutId: dto.provider_tx_id.trim(),
+    })
 
     return { message: 'Saque concluído' }
   }
@@ -798,11 +811,7 @@ export class CrmAdminService {
       seller_id: w.seller_id,
     })
 
-    void notifySellerPayout(w.seller_id, 'failed', {
-      amountCents: Number(w.amount),
-      currency: w.currency,
-      reason: dto.reason.trim(),
-    })
+    void notifySellerPayout(w.seller_id, 'failed', { ...payoutEmailInfo(id, w), reason: dto.reason.trim() })
 
     return { message: 'Saque marcado como falhou e saldo devolvido' }
   }

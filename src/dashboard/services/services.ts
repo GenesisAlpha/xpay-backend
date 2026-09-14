@@ -632,6 +632,9 @@ export class WalletService {
       amountCents,
       currency: 'USD',
       method: dto.method,
+      payoutId: row.payout_id,
+      destination,
+      requestedAt: new Date().toISOString(),
     })
 
     // 6. Resposta — mantém o shape que a modal espera.
@@ -710,6 +713,9 @@ export class WalletService {
         amountCents,
         currency: 'USD',
         method: dto.method,
+        payoutId: String(row.payoutId),
+        destination,
+        requestedAt: new Date().toISOString(),
       })
     }
 
