@@ -1,4 +1,7 @@
-// E-mails de saque para o vendedor.
+// E-mails da conta e de saque para o vendedor.
+//
+// Conta: aprovada (pode vender e aceitar pagamentos, com métodos liberados,
+// taxas e primeiros passos), desativada (motivo e o que muda) e reativada.
 //
 // Saque mexe com dinheiro: o vendedor precisa saber quando pediu, quando foi
 // aprovado ou recusado (e por quê), quando saiu e quando falhou com o saldo
@@ -282,9 +285,24 @@ function stepsFor(event: PayoutEmailEvent, c: (typeof COPY)[Lang]) {
   }
 }
 
+function checklist(items: string[], mark = '✓'): string {
+  return `<table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+${items.map((item) => `<tr>
+<td width="22" style="padding:5px 0;vertical-align:top;font-size:14px;color:${BRAND};font-weight:700">${mark}</td>
+<td style="padding:5px 0;font-size:14px;line-height:1.5;color:${INK}">${item}</td>
+</tr>`).join('')}
+</table>`;
+}
+
+function pills(labels: string[]): string {
+  return labels
+    .map((label) => `<span style="display:inline-block;margin:0 6px 6px 0;padding:6px 12px;border-radius:999px;background:#f4f4f5;border:1px solid ${LINE};font-size:13px;font-weight:600;color:${INK}">${escapeHtml(label)}</span>`)
+    .join('');
+}
+
 function renderEmail(o: {
   lang: Lang; tone: Tone; preheader: string; badge: string; title: string; intro: string;
-  hero: { label: string; value: string; caption?: string }; sections: string[];
+  hero?: { label: string; value: string; caption?: string }; sections: string[];
   primary: { label: string; href: string }; secondary?: { label: string; href: string }; footerNote: string; prefsUrl: string;
 }): string {
   const t = TONES[o.tone];
@@ -305,14 +323,14 @@ function renderEmail(o: {
 <h1 style="margin:14px 0 6px;font-size:22px;line-height:1.3;font-weight:700;color:${INK}">${escapeHtml(o.title)}</h1>
 <p style="margin:0;font-size:15px;line-height:1.6;color:#3f3f46">${escapeHtml(o.intro)}</p>
 </td></tr>
-<tr><td style="padding:16px 32px 20px">
+${o.hero ? `<tr><td style="padding:16px 32px 20px">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
 <td style="padding:18px 20px;background:${t.bg};border:1px solid ${t.border};border-radius:12px">
 <p style="margin:0;font-size:12px;letter-spacing:.06em;text-transform:uppercase;font-weight:700;color:${t.fg}">${escapeHtml(o.hero.label)}</p>
 <p style="margin:6px 0 0;font-size:30px;line-height:1.15;font-weight:800;color:${INK}">${escapeHtml(o.hero.value)}</p>
 ${o.hero.caption ? `<p style="margin:6px 0 0;font-size:13px;color:#52525b">${o.hero.caption}</p>` : ''}
 </td></tr></table>
-</td></tr>
+</td></tr>` : '<tr><td style="padding:8px 32px 4px"></td></tr>'}
 ${o.sections.filter(Boolean).join('\n')}
 <tr><td style="padding:8px 32px 28px">
 <table role="presentation" cellpadding="0" cellspacing="0"><tr>
@@ -329,6 +347,324 @@ ${o.secondary ? `<td style="padding:0 0 8px"><a href="${escapeHtml(o.secondary.h
 </td></tr>
 </table>
 </body></html>`;
+}
+
+// ── Conta: aprovada, desativada, reativada ────────────────────────────────
+
+export type AccountEmailEvent = 'approved' | 'suspended' | 'reactivated';
+
+export interface AccountEmailInfo {
+  reason?: string | null;
+  enabledMethods?: string[] | null;
+  /** Taxas aplicadas na aprovação (seller_fees): percentual, fixo em USD, prazos e reserva. */
+  fees?: {
+    fee_percentage?: number | null;
+    fee_fixed_usd?: number | null;
+    settlement_days?: number | null;
+    reserve_percentage?: number | null;
+    reserve_hold_days?: number | null;
+  } | null;
+}
+
+const PAYMENT_METHOD_NAMES: Record<string, Record<Lang, string>> = {
+  card: { pt: 'Cartão', es: 'Tarjeta', en: 'Card' },
+  credit_card: { pt: 'Cartão de crédito', es: 'Tarjeta de crédito', en: 'Credit card' },
+  debit_card: { pt: 'Cartão de débito', es: 'Tarjeta de débito', en: 'Debit card' },
+  pix: { pt: 'Pix', es: 'Pix', en: 'Pix' },
+  boleto: { pt: 'Boleto', es: 'Boleto', en: 'Boleto' },
+  apple_pay: { pt: 'Apple Pay', es: 'Apple Pay', en: 'Apple Pay' },
+  google_pay: { pt: 'Google Pay', es: 'Google Pay', en: 'Google Pay' },
+  crypto: { pt: 'Cripto', es: 'Cripto', en: 'Crypto' },
+  paypal: { pt: 'PayPal', es: 'PayPal', en: 'PayPal' },
+  mbway: { pt: 'MB WAY', es: 'MB WAY', en: 'MB WAY' },
+  mb_way: { pt: 'MB WAY', es: 'MB WAY', en: 'MB WAY' },
+  multibanco: { pt: 'Multibanco', es: 'Multibanco', en: 'Multibanco' },
+  ideal: { pt: 'iDEAL', es: 'iDEAL', en: 'iDEAL' },
+  bancontact: { pt: 'Bancontact', es: 'Bancontact', en: 'Bancontact' },
+  oxxo: { pt: 'OXXO', es: 'OXXO', en: 'OXXO' },
+  spei: { pt: 'SPEI', es: 'SPEI', en: 'SPEI' },
+  sepa: { pt: 'SEPA', es: 'SEPA', en: 'SEPA' },
+  klarna: { pt: 'Klarna', es: 'Klarna', en: 'Klarna' },
+};
+
+const ACCOUNT_COPY: Record<Lang, {
+  approved: { subject: string; badge: string; title: (name: string) => string; intro: string };
+  suspended: { subject: string; badge: string; title: string; intro: string };
+  reactivated: { subject: string; badge: string; title: string; intro: string };
+  methods: string; conditions: string; fee: string; settlement: (days: number) => string; settlementLabel: string;
+  reserve: (pct: string, days: number) => string; reserveLabel: string;
+  firstSteps: string; steps: string[];
+  reason: string; whatChanges: string; changes: string[]; howToFix: string; fixText: string;
+  reactivatedNote: string;
+  createProduct: string; openDashboard: string; support: string;
+  footerApproved: string; footerAccount: string;
+}> = {
+  pt: {
+    approved: {
+      subject: '🎉 Conta aprovada — você já pode vender com a Koopfy',
+      badge: 'Conta aprovada',
+      title: (name) => (name ? `Tudo pronto, ${name}! Você já pode vender` : 'Tudo pronto! Você já pode vender'),
+      intro: 'Sua conta de pagamentos foi aprovada. Seus checkouts já aceitam pagamentos e cada venda aprovada entra no seu saldo.',
+    },
+    suspended: {
+      subject: 'Sua conta Koopfy foi desativada',
+      badge: 'Conta desativada',
+      title: 'Sua conta de pagamentos foi desativada',
+      intro: 'Enquanto a conta estiver desativada, seus checkouts não aceitam novos pagamentos.',
+    },
+    reactivated: {
+      subject: '✅ Sua conta Koopfy foi reativada',
+      badge: 'Conta reativada',
+      title: 'Você já pode vender de novo',
+      intro: 'Sua conta de pagamentos foi reativada e seus checkouts voltaram a aceitar pagamentos.',
+    },
+    methods: 'Métodos de pagamento liberados',
+    conditions: 'Suas condições',
+    fee: 'Taxa por venda aprovada',
+    settlementLabel: 'Saldo disponível para saque',
+    settlement: (days) => (days <= 0 ? 'no mesmo dia da venda' : days === 1 ? '1 dia após a venda' : `${days} dias após a venda`),
+    reserveLabel: 'Reserva de segurança',
+    reserve: (pct, days) => `${pct} de cada venda, liberada após ${days} dias`,
+    firstSteps: 'Primeiros passos',
+    steps: [
+      'Crie ou revise seus produtos (preço, imagens e descrição)',
+      'Gere o link de checkout e faça uma compra de teste',
+      'Configure seus pixels de anúncio e o domínio da loja',
+      'Cadastre seus dados de saque para receber as vendas',
+    ],
+    reason: 'Motivo',
+    whatChanges: 'O que muda',
+    changes: [
+      'Novos pagamentos ficam bloqueados nos seus checkouts',
+      'Pedidos já concluídos não são afetados',
+      'Para dúvidas sobre saldo e saques, fale com o suporte',
+    ],
+    howToFix: 'Como resolver',
+    fixText: 'Fale com o suporte informando o motivo acima. Se precisar enviar documentos ou ajustar algo na conta, a equipe explica o próximo passo.',
+    reactivatedNote: 'Confira se seus produtos, links de checkout e dados de saque continuam corretos antes de voltar a anunciar.',
+    createProduct: 'Criar produto',
+    openDashboard: 'Abrir painel',
+    support: 'Falar com o suporte',
+    footerApproved: 'Boas vendas! Qualquer dúvida, é só responder para o suporte.',
+    footerAccount: 'Aviso sobre a sua conta — enviado sempre, não pode ser desligado.',
+  },
+  es: {
+    approved: {
+      subject: '🎉 Cuenta aprobada — ya puedes vender con Koopfy',
+      badge: 'Cuenta aprobada',
+      title: (name) => (name ? `¡Todo listo, ${name}! Ya puedes vender` : '¡Todo listo! Ya puedes vender'),
+      intro: 'Tu cuenta de pagos fue aprobada. Tus checkouts ya aceptan pagos y cada venta aprobada entra en tu saldo.',
+    },
+    suspended: {
+      subject: 'Tu cuenta Koopfy fue desactivada',
+      badge: 'Cuenta desactivada',
+      title: 'Tu cuenta de pagos fue desactivada',
+      intro: 'Mientras la cuenta esté desactivada, tus checkouts no aceptan nuevos pagos.',
+    },
+    reactivated: {
+      subject: '✅ Tu cuenta Koopfy fue reactivada',
+      badge: 'Cuenta reactivada',
+      title: 'Ya puedes vender de nuevo',
+      intro: 'Tu cuenta de pagos fue reactivada y tus checkouts volvieron a aceptar pagos.',
+    },
+    methods: 'Métodos de pago habilitados',
+    conditions: 'Tus condiciones',
+    fee: 'Comisión por venta aprobada',
+    settlementLabel: 'Saldo disponible para retiro',
+    settlement: (days) => (days <= 0 ? 'el mismo día de la venta' : days === 1 ? '1 día después de la venta' : `${days} días después de la venta`),
+    reserveLabel: 'Reserva de seguridad',
+    reserve: (pct, days) => `${pct} de cada venta, liberada después de ${days} días`,
+    firstSteps: 'Primeros pasos',
+    steps: [
+      'Crea o revisa tus productos (precio, imágenes y descripción)',
+      'Genera el enlace de checkout y haz una compra de prueba',
+      'Configura tus píxeles de anuncios y el dominio de la tienda',
+      'Registra tus datos de retiro para recibir las ventas',
+    ],
+    reason: 'Motivo',
+    whatChanges: 'Qué cambia',
+    changes: [
+      'Los nuevos pagos quedan bloqueados en tus checkouts',
+      'Los pedidos ya completados no se ven afectados',
+      'Para dudas sobre saldo y retiros, habla con soporte',
+    ],
+    howToFix: 'Cómo resolverlo',
+    fixText: 'Habla con soporte indicando el motivo de arriba. Si hace falta enviar documentos o ajustar algo en la cuenta, el equipo te explica el siguiente paso.',
+    reactivatedNote: 'Revisa que tus productos, enlaces de checkout y datos de retiro sigan correctos antes de volver a anunciar.',
+    createProduct: 'Crear producto',
+    openDashboard: 'Abrir panel',
+    support: 'Hablar con soporte',
+    footerApproved: '¡Buenas ventas! Cualquier duda, escribe a soporte.',
+    footerAccount: 'Aviso sobre tu cuenta — siempre se envía, no se puede desactivar.',
+  },
+  en: {
+    approved: {
+      subject: '🎉 Account approved — you can start selling with Koopfy',
+      badge: 'Account approved',
+      title: (name) => (name ? `You're all set, ${name}! Start selling` : "You're all set! Start selling"),
+      intro: 'Your payments account was approved. Your checkouts now accept payments and every approved sale goes to your balance.',
+    },
+    suspended: {
+      subject: 'Your Koopfy account was deactivated',
+      badge: 'Account deactivated',
+      title: 'Your payments account was deactivated',
+      intro: "While the account is deactivated, your checkouts don't accept new payments.",
+    },
+    reactivated: {
+      subject: '✅ Your Koopfy account was reactivated',
+      badge: 'Account reactivated',
+      title: 'You can sell again',
+      intro: 'Your payments account was reactivated and your checkouts accept payments again.',
+    },
+    methods: 'Enabled payment methods',
+    conditions: 'Your terms',
+    fee: 'Fee per approved sale',
+    settlementLabel: 'Balance available for payout',
+    settlement: (days) => (days <= 0 ? 'same day as the sale' : days === 1 ? '1 day after the sale' : `${days} days after the sale`),
+    reserveLabel: 'Security reserve',
+    reserve: (pct, days) => `${pct} of each sale, released after ${days} days`,
+    firstSteps: 'First steps',
+    steps: [
+      'Create or review your products (price, images and description)',
+      'Generate your checkout link and place a test purchase',
+      'Set up your ad pixels and store domain',
+      'Add your payout details to receive your sales',
+    ],
+    reason: 'Reason',
+    whatChanges: 'What changes',
+    changes: [
+      'New payments are blocked on your checkouts',
+      'Orders already completed are not affected',
+      'For questions about balance and payouts, contact support',
+    ],
+    howToFix: 'How to fix it',
+    fixText: "Contact support mentioning the reason above. If documents or account changes are needed, the team will explain the next step.",
+    reactivatedNote: 'Check that your products, checkout links and payout details are still correct before advertising again.',
+    createProduct: 'Create product',
+    openDashboard: 'Open dashboard',
+    support: 'Contact support',
+    footerApproved: 'Happy selling! Any questions, just reach out to support.',
+    footerAccount: 'Account notice — always sent, cannot be turned off.',
+  },
+};
+
+function percent(value: number, lang: Lang): string {
+  return `${new Intl.NumberFormat(localeOf(lang), { maximumFractionDigits: 2 }).format(value)}%`;
+}
+
+export async function notifySellerAccount(
+  sellerId: string | null | undefined,
+  event: AccountEmailEvent,
+  info: AccountEmailInfo = {},
+): Promise<void> {
+  try {
+    const apiKey = process.env.SENDGRID_API_KEY;
+    if (!apiKey || !sellerId) {
+      if (!apiKey) console.warn(`[SellerMail] account ${event}: SENDGRID_API_KEY ausente — e-mail não enviado.`);
+      return;
+    }
+    const { data: seller } = await supabase
+      .from('seller_profiles').select('email, name, country, enabled_methods').eq('id', sellerId).maybeSingle();
+    if (!seller?.email) {
+      console.warn(`[SellerMail] account ${event}: seller ${sellerId} sem e-mail.`);
+      return;
+    }
+
+    const lang = languageFor(seller.country);
+    const c = ACCOUNT_COPY[lang];
+    const dashboard = (process.env.SELLER_DASHBOARD_URL ?? 'https://app.koopfy.com').replace(/\/+$/, '');
+    const supportEmail = String(process.env.PLATFORM_ALERT_EMAIL ?? 'support@koopfy.com').split(',')[0].trim() || 'support@koopfy.com';
+    const firstName = String(seller.name ?? '').trim().split(/\s+/)[0];
+    const methods = (info.enabledMethods ?? seller.enabled_methods ?? []) as string[];
+    const methodNames = [...new Set(methods.map((m) => {
+      const key = String(m).toLowerCase();
+      return PAYMENT_METHOD_NAMES[key]?.[lang] ?? key.replace(/_/g, ' ').replace(/\b\w/g, (ch) => ch.toUpperCase());
+    }))];
+
+    let subject: string;
+    let html: string;
+
+    if (event === 'approved') {
+      const f = info.fees ?? {};
+      const feeParts = [
+        Number(f.fee_percentage) > 0 ? percent(Number(f.fee_percentage), lang) : null,
+        Number(f.fee_fixed_usd) > 0 ? money(Math.round(Number(f.fee_fixed_usd) * 100), 'USD', lang) : null,
+      ].filter(Boolean).join(' + ');
+      subject = c.approved.subject;
+      html = renderEmail({
+        lang,
+        tone: 'success',
+        preheader: c.approved.intro,
+        badge: c.approved.badge,
+        title: c.approved.title(firstName),
+        intro: c.approved.intro,
+        sections: [
+          methodNames.length ? section(c.methods, pills(methodNames)) : '',
+          section(c.conditions, kvRows([
+            [c.fee, feeParts ? `<strong>${escapeHtml(feeParts)}</strong>` : null],
+            [c.settlementLabel, f.settlement_days != null ? escapeHtml(c.settlement(Number(f.settlement_days))) : null],
+            [c.reserveLabel, Number(f.reserve_percentage) > 0
+              ? escapeHtml(c.reserve(percent(Number(f.reserve_percentage), lang), Number(f.reserve_hold_days ?? 90)))
+              : null],
+          ])),
+          section(c.firstSteps, checklist(c.steps.map((s) => escapeHtml(s)))),
+        ],
+        primary: { label: c.createProduct, href: `${dashboard}/products` },
+        secondary: { label: c.openDashboard, href: dashboard },
+        footerNote: c.footerApproved,
+        prefsUrl: `${dashboard}/settings/notifications`,
+      });
+    } else if (event === 'suspended') {
+      subject = c.suspended.subject;
+      html = renderEmail({
+        lang,
+        tone: 'danger',
+        preheader: c.suspended.intro,
+        badge: c.suspended.badge,
+        title: c.suspended.title,
+        intro: c.suspended.intro,
+        sections: [
+          info.reason ? section(c.reason, callout('danger', `<strong>${escapeHtml(info.reason)}</strong>`)) : '',
+          section(c.whatChanges, checklist(c.changes.map((s) => escapeHtml(s)), '•')),
+          section(c.howToFix, `<p style="margin:0;font-size:14px;line-height:1.6;color:${INK}">${escapeHtml(c.fixText)}</p>`),
+        ],
+        primary: { label: c.support, href: `mailto:${supportEmail}?subject=${encodeURIComponent(c.suspended.badge)}` },
+        secondary: { label: c.openDashboard, href: dashboard },
+        footerNote: c.footerAccount,
+        prefsUrl: `${dashboard}/settings/notifications`,
+      });
+    } else {
+      subject = c.reactivated.subject;
+      html = renderEmail({
+        lang,
+        tone: 'success',
+        preheader: c.reactivated.intro,
+        badge: c.reactivated.badge,
+        title: c.reactivated.title,
+        intro: c.reactivated.intro,
+        sections: [
+          methodNames.length ? section(c.methods, pills(methodNames)) : '',
+          section('', callout('info', escapeHtml(c.reactivatedNote))),
+        ],
+        primary: { label: c.openDashboard, href: dashboard },
+        footerNote: c.footerAccount,
+        prefsUrl: `${dashboard}/settings/notifications`,
+      });
+    }
+
+    sgMail.setApiKey(apiKey);
+    await sgMail.send({
+      to: seller.email,
+      from: {
+        email: process.env.SENDGRID_FROM_EMAIL ?? process.env.PLATFORM_FROM_EMAIL ?? 'no-reply@koopfy.com',
+        name: process.env.SENDGRID_FROM_NAME ?? 'Koopfy',
+      },
+      subject,
+      html,
+    });
+  } catch (error: any) {
+    console.error(`[SellerMail] account ${event} (seller ${sellerId}) falhou:`, error?.response?.body ?? error?.message ?? error);
+  }
 }
 
 export async function notifySellerPayout(

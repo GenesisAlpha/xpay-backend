@@ -10,6 +10,7 @@ import { WhopAccountsService } from '../orchestrator/whop/whop-accounts.service'
 import { WhopProvider } from '../orchestrator/providers/whop.provider'
 import { ClipAccountsService } from '../orchestrator/clip/clip-accounts.service'
 import { WebhookService } from '../webhooks/webhook.service'
+import { notifySellerAccount } from '../utils/seller-mail'
 import * as bcrypt from 'bcrypt'
 
 const FEE_TABLE = {
@@ -517,6 +518,9 @@ export class CrmService {
       logisticsGroupUrl,
     })
 
+    // Vendedor sabe que já pode vender: métodos, taxas e primeiros passos.
+    void notifySellerAccount(sellerId, 'approved', { enabledMethods: dto.enabledMethods, fees })
+
     return { message: 'Seller aprovado', fees, logisticsGroupUrl }
   }
 
@@ -768,6 +772,7 @@ export class CrmService {
     }).eq('id', sellerId)
 
     await this.log(sellerId, managerId, 'suspended', { reason })
+    void notifySellerAccount(sellerId, 'suspended', { reason })
     return { message: 'Seller suspenso' }
   }
 
@@ -777,6 +782,7 @@ export class CrmService {
     }).eq('id', sellerId)
 
     await this.log(sellerId, managerId, 'activated', {})
+    void notifySellerAccount(sellerId, 'reactivated')
     return { message: 'Seller reativado' }
   }
 
