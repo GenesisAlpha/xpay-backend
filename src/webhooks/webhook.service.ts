@@ -806,6 +806,10 @@ export class WebhookService {
     put('whop_payment_method_id', data.payment_method?.id ?? data.payment_method_id)
     put('whop_user_id', data.user?.id ?? data.user_id)
     put('whop_recovery_url', data.recovery_url)
+    // Nome digitado na cobrança do formulário da Whop. Produto digital no
+    // checkout só pede e-mail: é daqui que o pedido tira o nome do cliente
+    // (exposto em GET /payments/:id/status como customerName).
+    put('whop_billing_name', data.billing_address?.name)
     if (!Object.keys(patch).length) return
 
     const { data: current } = await supabase

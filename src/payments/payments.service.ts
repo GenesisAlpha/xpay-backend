@@ -1711,6 +1711,9 @@ export class PaymentService {
             // Disputa aberta na Whop (webhook dispute.*). O checkout só aceita o
             // aviso payment.disputed se isto existir.
             disputeStatus: data.metadata?.whop_dispute?.status ?? null,
+            // Nome da cobrança (Whop). O checkout usa quando o pedido não tem nome
+            // — produto digital só coleta e-mail no formulário da loja.
+            customerName: data.metadata?.whop_billing_name ?? null,
         }
     }
 
