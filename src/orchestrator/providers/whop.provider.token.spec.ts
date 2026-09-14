@@ -108,6 +108,79 @@ describe('WhopProvider confirmation token charge (Whop Elements)', () => {
     expect(body.return_url).toMatch(/^https:\/\/[^/]*koopfy\.com\/payment-result\?orderId=K-20$/);
   });
 
+  describe('subscriptions', () => {
+    const subscriptionMetadata = (overrides: Record<string, any> = {}) => ({
+      ...ctx().metadata,
+      payment_type: 'subscription',
+      subscription_config: { billing_period_days: 30, trial_period_days: 7 },
+      pricing_plan: { id: 'monthly', currency: 'USD', initial_price: 9.9, renewal_price: 29 },
+      subscription_charge: { currency: 'BRL', first_charge: 50.88, renewal_price: 149.06 },
+      ...overrides,
+    });
+
+    it('charges the initial amount today and renews at the plan price after the trial', async () => {
+      const fetchMock = mockFetch(200, { id: 'pay_s1', status: 'open', client_secret: 'pay_s1_secret' });
+
+      await new WhopProvider().charge(ctx({ amount: 5088, metadata: subscriptionMetadata() }));
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.plan).toMatchObject({
+        currency: 'brl',
+        plan_type: 'renewal',
+        initial_price: 50.88,
+        renewal_price: 149.06,
+        billing_period: 30,
+        trial_period_days: 7,
+      });
+      expect(body.metadata.koopfy_payment_type).toBe('subscription');
+    });
+
+    it('without a trial, the first charge already includes the first renewal', async () => {
+      const fetchMock = mockFetch(200, { id: 'pay_s2', status: 'open', client_secret: 'pay_s2_secret' });
+
+      await new WhopProvider().charge(ctx({
+        amount: 3890,
+        currency: 'USD',
+        metadata: subscriptionMetadata({
+          payment_type: 'assinatura-recorrente',
+          subscription_config: { billing_period_days: 30, trial_period_days: 0 },
+          subscription_charge: undefined,
+        }),
+      }));
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.plan).toMatchObject({ plan_type: 'renewal', initial_price: 9.9, renewal_price: 29, trial_period_days: null });
+    });
+
+    it('refuses to guess the renewal when the plan currency differs from the charge', async () => {
+      const fetchMock = mockFetch(200, {});
+
+      const result = await new WhopProvider().charge(ctx({
+        amount: 5088,
+        metadata: subscriptionMetadata({ subscription_charge: undefined }),
+      }));
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ success: false, failureMessage: expect.stringContaining('renovação') });
+    });
+
+    it('refuses a first charge below the renewal when there is no trial', async () => {
+      const fetchMock = mockFetch(200, {});
+
+      const result = await new WhopProvider().charge(ctx({
+        amount: 2000,
+        currency: 'USD',
+        metadata: subscriptionMetadata({
+          subscription_config: { billing_period_days: 30, trial_period_days: 0 },
+          subscription_charge: undefined,
+        }),
+      }));
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ success: false });
+    });
+  });
+
   it('ignores a token without the ctok_ prefix and keeps the embedded checkout', async () => {
     const fetchMock = mockFetch(200, { id: 'ch_1', purchase_url: '/checkout/plan_1?session=ch_1' });
 

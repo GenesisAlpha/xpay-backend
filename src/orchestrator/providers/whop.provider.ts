@@ -53,6 +53,9 @@ const WHOP_API_URL_DEFAULT = 'https://api.whop.com';
 // Limite duro da API — ver bloco acima.
 const WHOP_PLAN_TITLE_MAX = 30;
 
+// Nomes de assinatura que chegam no metadata: produto recorrente e oferta de link.
+const RECURRING_PAYMENT_TYPES = new Set(['assinatura-recorrente', 'subscription']);
+
 // Como o plano inline aponta pro produto da company. Ambos confirmados
 // funcionando; o default é external_identifier porque ele NÃO exige que alguém
 // tenha criado o produto antes (e dedupa sozinho).
@@ -260,11 +263,15 @@ export class WhopProvider {
       });
     }
 
-    const isRecurring = metadata?.payment_type === 'assinatura-recorrente';
+    // Produto recorrente chega como 'assinatura-recorrente' e oferta de checkout
+    // como 'subscription'. Só o primeiro nome virava assinatura: a oferta de
+    // checkout ia pra Whop como pagamento único.
+    const isRecurring = RECURRING_PAYMENT_TYPES.has(String(metadata?.payment_type ?? ''));
     let subscriptionTerms: {
       billingPeriodDays: number;
       trialPeriodDays: number;
       initialCharge: number;
+      renewalPrice: number;
       installments: number | null;
     } | null = null;
 
@@ -276,7 +283,19 @@ export class WhopProvider {
 
       const billingPeriodDays = Number(metadata?.subscription_config?.billing_period_days ?? 30);
       const trialPeriodDays = Number(metadata?.subscription_config?.trial_period_days ?? 0);
-      const initialCharge = Number(metadata?.pricing_plan?.initial_price ?? 0);
+      // `amount` é o que o comprador paga HOJE (cobrança inicial, ou inicial +
+      // primeira mensalidade sem teste). A renovação vem do plano, já na moeda
+      // da cobrança — nunca do amount, senão a assinatura renovaria pelo valor
+      // de entrada.
+      const renewalPrice = this.renewalPriceInChargeCurrency(metadata, cur);
+      if (!Number.isFinite(renewalPrice) || renewalPrice <= 0) {
+        return this.failure(id, transactionId, 'Whop: valor da renovação ausente na moeda da cobrança');
+      }
+      // Na Whop, initial_price é ADICIONAL à primeira cobrança: com teste ele é
+      // tudo o que se cobra hoje; sem teste, hoje = initial_price + renewal_price.
+      const initialCharge = trialPeriodDays > 0
+        ? initialPrice
+        : Number((initialPrice - renewalPrice).toFixed(2));
       const installments = metadata?.pricing_plan?.split_pay_required_payments == null
         ? null
         : Number(metadata.pricing_plan.split_pay_required_payments);
@@ -288,13 +307,15 @@ export class WhopProvider {
         return this.failure(id, transactionId, 'Whop: período de teste da assinatura inválido');
       }
       if (!Number.isFinite(initialCharge) || initialCharge < 0) {
+        // Sem teste, a primeira cobrança não pode ser menor que a renovação (ex.:
+        // cupom maior que a cobrança inicial): a Whop cobraria a mensalidade cheia.
         return this.failure(id, transactionId, 'Whop: cobrança inicial inválida');
       }
       if (installments !== null && (!Number.isInteger(installments) || installments < 2 || installments > 60)) {
         return this.failure(id, transactionId, 'Whop: quantidade de cobranças inválida');
       }
 
-      subscriptionTerms = { billingPeriodDays, trialPeriodDays, initialCharge, installments };
+      subscriptionTerms = { billingPeriodDays, trialPeriodDays, initialCharge, renewalPrice, installments };
     }
 
     // ⚠️ Ver aviso de reconciliação no topo do arquivo. É o que o webhook usa pra
@@ -346,7 +367,7 @@ export class WhopProvider {
         // O valor recorrente normal pertence a renewal_price.
         initial_price: isRecurring ? subscriptionTerms?.initialCharge ?? 0 : initialPrice,
         ...(subscriptionTerms ? {
-          renewal_price: initialPrice,
+          renewal_price: subscriptionTerms.renewalPrice,
           billing_period: subscriptionTerms.billingPeriodDays,
           trial_period_days: subscriptionTerms.trialPeriodDays || null,
           ...(subscriptionTerms.installments
@@ -408,7 +429,7 @@ export class WhopProvider {
           planId,
           whopProductId: config?.product_id ?? null,
           currency: cur,
-          renewalPrice: initialPrice,
+          renewalPrice: subscriptionTerms!.renewalPrice,
           billingPeriodDays: subscriptionTerms!.billingPeriodDays,
           trialPeriodDays: subscriptionTerms!.trialPeriodDays,
           initialCharge: subscriptionTerms!.initialCharge,
@@ -517,6 +538,7 @@ export class WhopProvider {
       billingPeriodDays: number;
       trialPeriodDays: number;
       initialCharge: number;
+      renewalPrice: number;
       installments: number | null;
     } | null;
     metadata: Record<string, any>;
@@ -539,7 +561,7 @@ export class WhopProvider {
       // Em renewal, initial_price é taxa ADICIONAL à primeira cobrança.
       initial_price: subscriptionTerms ? subscriptionTerms.initialCharge : args.initialPrice,
       ...(subscriptionTerms ? {
-        renewal_price: args.initialPrice,
+        renewal_price: subscriptionTerms.renewalPrice,
         billing_period: subscriptionTerms.billingPeriodDays,
         trial_period_days: subscriptionTerms.trialPeriodDays || null,
       } : {}),
@@ -989,6 +1011,21 @@ export class WhopProvider {
 
   // purchase_url vem como `/checkout/plan_xxx?session=ch_yyy`. O plan id nem
   // sempre aparece como campo próprio, então lemos os dois caminhos.
+  // Renovação na moeda da cobrança. O checkout manda `subscription_charge` já
+  // convertido (plano em USD, checkout em BRL); sem ele, só vale o plano quando
+  // a moeda é a mesma. NaN = não dá pra saber sem converter no escuro.
+  private renewalPriceInChargeCurrency(metadata: any, cur: string): number {
+    const charge = metadata?.subscription_charge;
+    if (charge && String(charge.currency ?? '').toLowerCase() === cur) {
+      return Number(charge.renewal_price);
+    }
+    const plan = metadata?.pricing_plan;
+    if (plan && String(plan.currency ?? '').toLowerCase() === cur) {
+      return Number(plan.renewal_price);
+    }
+    return NaN;
+  }
+
   private extractPlanId(json: any): string | null {
     const direct = json?.plan_id ?? json?.plan?.id ?? null;
     if (direct) return String(direct);

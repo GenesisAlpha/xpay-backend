@@ -745,6 +745,14 @@ export class WebhookService {
       return this.handleWhopDispute(accountId, account, eventType, body)
     }
 
+    // ── 4b. Renovação de assinatura ──
+    // A cobrança do ciclo herda o metadata da compra e casaria com a transação
+    // ORIGINAL (já aprovada). Não é ela: registra na assinatura e não mexe no
+    // pedido. Acesso cortado por falta de pagamento vem nos eventos membership.*.
+    if (eventType.startsWith('payment.') && body?.data?.billing_reason === 'subscription_cycle') {
+      return this.recordWhopRenewal(accountId, eventType, body)
+    }
+
     const mapped = WHOP_EVENT_STATUS[eventType]
     if (!mapped) {
       console.log('[WebhookService] Whop: evento sem mapeamento, ignorado:', eventType)
@@ -819,6 +827,36 @@ export class WebhookService {
       .update({ metadata: { ...(current?.metadata ?? {}), ...patch } })
       .eq('id', transactionId)
     if (error) throw error
+  }
+
+  // Última cobrança de renovação fica em whop_subscriptions.metadata.last_renewal.
+  // Sem a linha da assinatura (membership.* ainda não chegou) só registra no log —
+  // responder erro faria a Whop reenviar um evento que não aprova nada.
+  private async recordWhopRenewal(accountId: string, eventType: string, body: any) {
+    const data = body?.data ?? {}
+    const membershipId = data?.membership?.id ?? data?.membership_id ?? null
+    const renewal = {
+      event: eventType,
+      payment_id: data?.id ?? null,
+      status: data?.status ?? null,
+      substatus: data?.substatus ?? null,
+      amount: data?.total ?? data?.final_amount ?? data?.subtotal ?? null,
+      currency: data?.currency ?? null,
+      at: new Date().toISOString(),
+    }
+    console.log('[WebhookService] Whop renovação:', JSON.stringify({ accountId, membershipId, ...renewal }))
+    if (!membershipId) return { renewal: true, recorded: false, reason: 'membership id missing' }
+
+    const { data: row } = await supabase
+      .from('whop_subscriptions').select('metadata').eq('whop_membership_id', String(membershipId)).maybeSingle()
+    if (!row) return { renewal: true, recorded: false, reason: 'subscription not found' }
+
+    const { error } = await supabase
+      .from('whop_subscriptions')
+      .update({ metadata: { ...(row.metadata ?? {}), last_renewal: renewal }, updated_at: renewal.at })
+      .eq('whop_membership_id', String(membershipId))
+    if (error) throw new Error(`Whop: falha ao registrar renovação (${error.message})`)
+    return { renewal: true, recorded: true }
   }
 
   private async persistWhopMembership(accountId: string, eventType: string, body: any) {
