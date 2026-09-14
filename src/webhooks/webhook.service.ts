@@ -1537,6 +1537,35 @@ export class WebhookService {
         + 'disputa não contestada conta igual a disputa perdida.',
       )
 
+      // Mesmo caminho da disputa Whop: grava o estado na transação (é o que o
+      // checkout confere em GET /payments/:id/status) e avisa o checkout, que
+      // registra o chargeback no pedido e alerta o vendedor e a plataforma.
+      // Antes a disputa Stripe só ia pro log — ninguém juntava evidência a tempo.
+      if (txId) {
+        const { data: disputedTx } = await supabase
+          .from('transactions').select('*').eq('id', String(txId)).maybeSingle();
+        if (disputedTx) {
+          const dueBy = object?.evidence_details?.due_by;
+          const dispute = {
+            id: String(object?.id ?? ''),
+            source: 'stripe',
+            status: String(object?.status ?? (eventType === 'charge.dispute.created' ? 'needs_response' : 'updated')),
+            reason: object?.reason ?? null,
+            due_by: typeof dueBy === 'number' ? new Date(dueBy * 1000).toISOString() : (dueBy ?? null),
+            amount: Number.isFinite(Number(object?.amount)) ? Number(object.amount) / 100 : null,
+            currency: object?.currency ? String(object.currency).toUpperCase() : null,
+            updated_at: new Date().toISOString(),
+          };
+          const metadata = { ...(disputedTx.metadata ?? {}), stripe_dispute: dispute };
+          await supabase.from('transactions').update({ metadata }).eq('id', disputedTx.id);
+          await this.dispatchToAll({ ...disputedTx, metadata }, 'payment.disputed', {
+            transactionId: disputedTx.id,
+            status: disputedTx.status,
+            dispute,
+          }).catch((e: any) => console.error('[WebhookService] dispatch payment.disputed (stripe):', e?.message));
+        }
+      }
+
       // A conta é onde o sintoma aparece; o afiliado é onde está a causa.
       // Reavaliar na hora porque a decisão de cortar depende de ver a tendência
       // cedo — esperar o ciclo de 1h é aceitável para a estatística e não é

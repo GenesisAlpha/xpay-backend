@@ -1712,7 +1712,10 @@ export class PaymentService {
             recoveryUrl: data.metadata?.whop_recovery_url ?? null,
             // Disputa aberta na Whop (webhook dispute.*). O checkout só aceita o
             // aviso payment.disputed se isto existir.
-            disputeStatus: data.metadata?.whop_dispute?.status ?? null,
+            // Stripe grava em stripe_dispute (charge.dispute.*) — mesmo aviso.
+            disputeStatus: data.metadata?.whop_dispute?.status
+                ?? data.metadata?.stripe_dispute?.status
+                ?? null,
             // Nome da cobrança (Whop). O checkout usa quando o pedido não tem nome
             // — produto digital só coleta e-mail no formulário da loja.
             customerName: data.metadata?.whop_billing_name ?? null,

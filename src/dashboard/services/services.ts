@@ -8,6 +8,7 @@ import { supabase } from '../../lib/supabase.client'
 import * as bcrypt from 'bcrypt';
 import { generateKey, hashKey } from '../../utils/apikeys.utils';
 import * as crypto from 'crypto';
+import { notifySellerPayout } from '../../utils/seller-mail';
 import {
   BLOCKED_METHODS,
   IDEMPOTENCY_KEY_PATTERN,
@@ -626,6 +627,13 @@ export class WalletService {
       `Saque criado: payoutId=${row.payout_id} method=${dto.method} amountCents=${amountCents}`,
     )
 
+    // Aviso ao vendedor (fire-and-forget: e-mail nunca derruba o saque).
+    void notifySellerPayout(dto.sellerId, 'requested', {
+      amountCents,
+      currency: 'USD',
+      method: dto.method,
+    })
+
     // 6. Resposta — mantém o shape que a modal espera.
     return {
       payoutId: row.payout_id,
@@ -695,6 +703,15 @@ export class WalletService {
     this.logger.log(
       `Saque ${replayed ? 'repetido' : 'criado'}: payoutId=${row.payoutId} method=${dto.method} amountCents=${amountCents}`,
     )
+
+    // Repetição com a mesma chave devolve o saque já criado: não avisa de novo.
+    if (!replayed) {
+      void notifySellerPayout(sellerId, 'requested', {
+        amountCents,
+        currency: 'USD',
+        method: dto.method,
+      })
+    }
 
     return {
       payoutId: String(row.payoutId),

@@ -3,6 +3,7 @@ import {
 } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
 import { CHARGEBACK_FEE_USD } from '../shared/fee.calculator'
+import { notifySellerPayout } from '../utils/seller-mail'
 
 interface AdminContext {
   managerId: string
@@ -652,6 +653,8 @@ export class CrmAdminService {
       notes: dto.notes,
     })
 
+    void notifySellerPayout(w.seller_id, 'approved', { amountCents: Number(w.amount), currency: w.currency })
+
     return { message: 'Saque aprovado e saldo debitado' }
   }
 
@@ -702,6 +705,12 @@ export class CrmAdminService {
       seller_id: w.seller_id,
     })
 
+    void notifySellerPayout(w.seller_id, 'rejected', {
+      amountCents: Number(w.amount),
+      currency: w.currency,
+      reason: dto.reason.trim(),
+    })
+
     return { message: 'Saque rejeitado e saldo devolvido' }
   }
 
@@ -745,6 +754,8 @@ export class CrmAdminService {
       seller_id: w.seller_id,
     })
 
+    void notifySellerPayout(w.seller_id, 'completed', { amountCents: Number(w.amount), currency: w.currency })
+
     return { message: 'Saque concluído' }
   }
 
@@ -785,6 +796,12 @@ export class CrmAdminService {
       reason: dto.reason,
       amount_cents: w.amount,
       seller_id: w.seller_id,
+    })
+
+    void notifySellerPayout(w.seller_id, 'failed', {
+      amountCents: Number(w.amount),
+      currency: w.currency,
+      reason: dto.reason.trim(),
     })
 
     return { message: 'Saque marcado como falhou e saldo devolvido' }
