@@ -740,14 +740,9 @@ export class WebhookService {
       return this.persistWhopMembership(accountId, eventType, body);
     }
 
-    // ── 4. Eventos que não mexem em transação ──
+    // ── 4. Disputa (chargeback) — não muda o status da transação ──
     if (eventType === 'dispute.created' || eventType === 'dispute.updated') {
-      console.warn(
-        `[WebhookService] Whop DISPUTA em ${accountId} ` +
-        `(${account.config?.legal_name ?? 'titular não identificado'}):`,
-        JSON.stringify(body?.data ?? {}),
-      )
-      return { received: true, disputed: true }
+      return this.handleWhopDispute(accountId, account, eventType, body)
     }
 
     const mapped = WHOP_EVENT_STATUS[eventType]
@@ -949,6 +944,100 @@ export class WebhookService {
     }
 
     return null
+  }
+
+  // ─── Disputa da Whop ──────────────────────────────────────────────────────
+  //
+  // Antes era só um console.warn: ninguém ficava sabendo, o pedido não mostrava
+  // nada e o prazo de resposta passava — disputa não contestada conta como
+  // perdida. Agora:
+  //   1. grava em stripe_risk_events (mesma tabela/estatística do Stripe);
+  //   2. guarda o estado em transactions.metadata.whop_dispute — é o que o
+  //      checkout confere em GET /payments/:id/status antes de aceitar o aviso;
+  //   3. avisa o checkout (payment.disputed), que registra o chargeback no pedido
+  //      e alerta vendedor e plataforma;
+  //   4. reavalia o afiliado na hora (o limiar de corte depende de ver cedo).
+  private async handleWhopDispute(
+    accountId: string,
+    account: { config?: Record<string, any> },
+    eventType: string,
+    body: any,
+  ) {
+    const data = body?.data ?? {}
+    const payment = data?.payment && typeof data.payment === 'object' ? data.payment : null
+    const paymentId: string | null = payment?.id ?? data?.payment_id ?? null
+
+    // O payload da disputa pode trazer o payment aninhado (com o metadata que
+    // pusemos na cobrança) ou só o id — tenta cada formato.
+    const candidates = [
+      payment ? { data: payment } : null,
+      paymentId ? { data: { id: paymentId, metadata: data?.metadata ?? {} } } : null,
+      body,
+    ].filter(Boolean)
+    let ref: { id: string } | null = null
+    for (const candidate of candidates) {
+      ref = await this.resolveWhopTx(candidate)
+      if (ref) break
+    }
+    const { data: tx } = ref
+      ? await supabase.from('transactions').select('*').eq('id', ref.id).maybeSingle()
+      : { data: null as any }
+
+    const disputeId = String(data?.id ?? `dp_whop_${Date.now()}`)
+    const status = String(data?.status ?? (eventType === 'dispute.created' ? 'needs_response' : 'updated'))
+    const amountMajor = Number(data?.amount ?? payment?.amount ?? NaN)
+    const currency = data?.currency ?? payment?.currency ?? tx?.currency ?? null
+    const dueBy = data?.due_by ?? data?.evidence_due_by ?? data?.response_due_at ?? null
+    const reason = data?.reason ?? null
+
+    await this.stripeRisk.recordRiskEvent({
+      // created conta uma vez; cada mudança de status do updated vira um evento.
+      id: eventType === 'dispute.created' ? disputeId : `${disputeId}:${status}`,
+      accountId,
+      kind: 'dispute',
+      reason,
+      amountCents: Number.isFinite(amountMajor) ? Math.round(amountMajor * 100) : null,
+      currency: currency ? String(currency).toLowerCase() : null,
+      paymentIntentId: paymentId,
+      transactionId: tx?.id ?? null,
+      payload: { provider: 'whop', eventType, status, dueBy },
+    })
+
+    console.error(
+      `[WebhookService] 🚨 DISPUTA Whop em ${accountId} ` +
+      `(${account.config?.legal_name ?? 'titular não identificado'}): status=${status} ` +
+      `motivo="${reason ?? '?'}" tx=${tx?.id ?? 'não vinculada'} prazo=${dueBy ?? '?'}.`,
+    )
+
+    if (!tx) {
+      console.warn('[WebhookService] disputa Whop sem transação vinculada:', JSON.stringify(data).slice(0, 500))
+      return { received: true, disputed: true, linked: false }
+    }
+
+    const dispute = {
+      id: disputeId,
+      status,
+      reason,
+      due_by: dueBy,
+      amount: Number.isFinite(amountMajor) ? amountMajor : null,
+      currency,
+      updated_at: new Date().toISOString(),
+    }
+    const metadata = { ...(tx.metadata ?? {}), whop_dispute: dispute }
+    await supabase.from('transactions').update({ metadata }).eq('id', tx.id)
+
+    await this.dispatchToAll({ ...tx, metadata }, 'payment.disputed', {
+      transactionId: tx.id,
+      status: tx.status,
+      dispute,
+    }).catch((e: any) => console.error('[WebhookService] dispatch payment.disputed:', e?.message))
+
+    if (tx.seller_id) {
+      await this.affiliateRisk.evaluateOne(tx.seller_id)
+        .catch(err => console.error('[WebhookService] affiliateRisk (whop):', err?.message))
+    }
+
+    return { received: true, disputed: true, linked: true }
   }
 
   private warnOnWhopAmountMismatch(tx: { id: string }, data: any) {

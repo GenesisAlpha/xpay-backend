@@ -1708,6 +1708,9 @@ export class PaymentService {
             // Cobrança off-session desafiada pelo banco: link da Whop para o
             // comprador autenticar (3DS). Gravado pelo webhook.
             recoveryUrl: data.metadata?.whop_recovery_url ?? null,
+            // Disputa aberta na Whop (webhook dispute.*). O checkout só aceita o
+            // aviso payment.disputed se isto existir.
+            disputeStatus: data.metadata?.whop_dispute?.status ?? null,
         }
     }
 
