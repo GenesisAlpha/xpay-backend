@@ -1,11 +1,11 @@
 // nexor/src/payments/payment.service.ts
 
-import { Injectable, BadRequestException, ForbiddenException } from '@nestjs/common'
+import { Injectable, BadRequestException, ForbiddenException, ServiceUnavailableException } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
 import { CurrencyService } from '../currency/currency.service'
 import { WalletService } from '../wallets/wallet.service'
 import { AccountRouterService } from '../orchestrator/router/account-router.service'
-import { getSellerFees, calculateFees } from '../shared/fee.calculator'
+import { getSellerFees, calculateFees, DEFAULT_SELLER_FEES } from '../shared/fee.calculator'
 import { validateMbwayPhone } from '../utils/mbway.validator'
 import { RetrieveResponse } from '../orchestrator/providers/provider.types'
 import { CardCryptoService } from '../crypto/card-crypto.service'
@@ -13,6 +13,8 @@ import { WebhookService } from '../webhooks/webhook.service'
 import { ClipAccountsService } from '../orchestrator/clip/clip-accounts.service'
 import { SpeiReceiptService } from '../orchestrator/clip/spei-receipt.service'
 import { StorageService } from '../lib/storage.service'
+import { WhopProvider, type WhopMembershipState } from '../orchestrator/providers/whop.provider'
+import { customerSubscriptionView, isSubscriptionTransaction } from './customer-subscription'
 
 export interface ExternalFeeInput {
     recipient_id: string
@@ -1697,7 +1699,7 @@ export class PaymentService {
 
     async getTransactionStatus(sellerId: string, transactionId: string) {
         const { data } = await supabase.from('transactions')
-            .select('id, status, provider_status, provider_transaction_id, failure_message, metadata')
+            .select('id, status, provider_status, provider_transaction_id, failure_message, metadata, amount, currency')
             .eq('id', transactionId).eq('seller_id', sellerId).single()
         if (!data) throw new BadRequestException('Transação não encontrada.')
         return {
@@ -1714,7 +1716,142 @@ export class PaymentService {
             // Nome da cobrança (Whop). O checkout usa quando o pedido não tem nome
             // — produto digital só coleta e-mail no formulário da loja.
             customerName: data.metadata?.whop_billing_name ?? null,
+            // Renovação de assinatura: transação filha. O checkout só cria o pedido
+            // de renovação se isto apontar para a compra do pedido original.
+            renewalOf: data.metadata?.renewal_of_transaction_id ?? null,
+            renewalCycle: data.metadata?.renewal_cycle ?? null,
+            amount: data.amount ?? null,
+            currency: data.currency ?? null,
         }
+    }
+
+    // ─── Assinatura do comprador (área do cliente) ───────────────────────────
+    //
+    // O checkout confere que o pedido é do comprador logado; aqui a transação
+    // ainda é filtrada pelo vendedor dono da chave. Regras em customer-subscription.ts.
+
+    async getCustomerSubscription(sellerId: string, transactionId: string) {
+        const ctx = await this.loadWhopSubscription(sellerId, transactionId)
+        return { subscription: ctx ? customerSubscriptionView(ctx.membership, ctx.tx.metadata) : null }
+    }
+
+    async cancelCustomerSubscription(sellerId: string, transactionId: string) {
+        const ctx = await this.requireWhopSubscription(sellerId, transactionId)
+        const current = customerSubscriptionView(ctx.membership, ctx.tx.metadata)
+        // Clique duplo ou outra aba: já está agendado, não é erro.
+        if (current.status === 'canceling') return { subscription: current }
+        if (!current.canCancel) {
+            const installments = current.installments !== null
+            throw new BadRequestException({
+                message: installments
+                    ? 'Plano parcelado: o cancelamento é feito pelo suporte.'
+                    : 'Esta assinatura não pode ser cancelada.',
+                code: installments ? 'SUBSCRIPTION_INSTALLMENTS' : 'SUBSCRIPTION_NOT_CANCELLABLE',
+            })
+        }
+        const membership = await this.callWhopMembership(() =>
+            ctx.whop.cancelMembershipAtPeriodEnd(ctx.membership.id, ctx.account))
+        await this.mirrorWhopMembership(ctx, membership)
+        return { subscription: customerSubscriptionView(membership, ctx.tx.metadata) }
+    }
+
+    async reactivateCustomerSubscription(sellerId: string, transactionId: string) {
+        const ctx = await this.requireWhopSubscription(sellerId, transactionId)
+        const current = customerSubscriptionView(ctx.membership, ctx.tx.metadata)
+        if (current.status === 'active' || current.status === 'trialing') return { subscription: current }
+        if (!current.canReactivate) {
+            throw new BadRequestException({
+                message: 'Esta assinatura não pode ser reativada.',
+                code: 'SUBSCRIPTION_NOT_REACTIVATABLE',
+            })
+        }
+        const membership = await this.callWhopMembership(() =>
+            ctx.whop.uncancelMembership(ctx.membership.id, ctx.account))
+        await this.mirrorWhopMembership(ctx, membership)
+        return { subscription: customerSubscriptionView(membership, ctx.tx.metadata) }
+    }
+
+    private async requireWhopSubscription(sellerId: string, transactionId: string) {
+        const ctx = await this.loadWhopSubscription(sellerId, transactionId)
+        if (!ctx) {
+            throw new BadRequestException({
+                message: 'Assinatura não encontrada para esta compra.',
+                code: 'SUBSCRIPTION_NOT_FOUND',
+            })
+        }
+        return ctx
+    }
+
+    private async loadWhopSubscription(sellerId: string, transactionId: string) {
+        const { data: tx } = await supabase.from('transactions')
+            .select('id, provider, provider_account_id, metadata')
+            .eq('id', transactionId).eq('seller_id', sellerId).maybeSingle()
+        if (!tx) throw new BadRequestException('Transação não encontrada.')
+        if (this.normalizeProviderName(tx.provider) !== 'whop' || !isSubscriptionTransaction(tx.metadata)) {
+            return null
+        }
+
+        // Espelho gravado pelo webhook membership.* — pode faltar (evento não
+        // assinado na conta, ou ainda não chegou).
+        const { data: row } = await supabase.from('whop_subscriptions')
+            .select('whop_membership_id, whop_account_id')
+            .eq('koopfy_transaction_id', tx.id)
+            .order('updated_at', { ascending: false })
+            .limit(1)
+            .maybeSingle()
+
+        const accountId = row?.whop_account_id ?? tx.provider_account_id
+        const account: any = accountId ? await this.accountRouter.resolveAccountById(accountId) : null
+        if (!account?.apiKey) {
+            console.error(`[PaymentService] assinatura ${tx.id}: conta Whop ${accountId ?? '-'} indisponível`)
+            throw new ServiceUnavailableException({
+                message: 'Assinatura indisponível no momento.',
+                code: 'SUBSCRIPTION_UNAVAILABLE',
+            })
+        }
+
+        const whop = new WhopProvider()
+        let membershipId: string | null = row?.whop_membership_id ?? null
+        // Sem o espelho: o payment da compra aponta a membership.
+        if (!membershipId && tx.metadata?.whop_payment_id) {
+            const { raw } = await this.callWhopMembership(() =>
+                whop.getPaymentStatus(String(tx.metadata.whop_payment_id), account))
+            membershipId = raw?.membership?.id ?? raw?.membership_id ?? null
+        }
+        if (!membershipId) return null
+
+        const membership = await this.callWhopMembership(() => whop.getMembership(String(membershipId), account))
+        return { tx, account, whop, membership }
+    }
+
+    private async callWhopMembership<T>(call: () => Promise<T>): Promise<T> {
+        try {
+            return await call()
+        } catch (err: any) {
+            console.error('[PaymentService] Whop membership:', err?.message)
+            throw new ServiceUnavailableException({
+                message: 'Assinatura indisponível no momento.',
+                code: 'SUBSCRIPTION_UNAVAILABLE',
+            })
+        }
+    }
+
+    // Espelho local; a Whop segue sendo a fonte. Falhar aqui não desfaz o que a
+    // Whop já aceitou.
+    private async mirrorWhopMembership(
+        ctx: { tx: { id: string }; account: { id: string } },
+        membership: WhopMembershipState,
+    ) {
+        const { error } = await supabase.from('whop_subscriptions').upsert({
+            whop_membership_id: membership.id,
+            whop_account_id: ctx.account.id,
+            koopfy_transaction_id: ctx.tx.id,
+            status: membership.status ?? 'active',
+            cancel_at_period_end: membership.cancelAtPeriodEnd,
+            current_period_end: membership.renewalPeriodEnd,
+            updated_at: new Date().toISOString(),
+        }, { onConflict: 'whop_membership_id' })
+        if (error) console.warn('[PaymentService] whop_subscriptions não atualizada:', error.message)
     }
 
     private async analyzeSpeiProof(tx: any) {
@@ -1785,12 +1922,7 @@ export class PaymentService {
     }
 
     private defaultFeeResult(netUSDcents: number, provider?: string) {
-        return calculateFees(netUSDcents / 100, {
-            sellerId: '', riskLevel: 'WHITE' as const,
-            feePercentage: 9.99, feeFixedUsd: 0.30,
-            settlementDays: 3, reservePercentage: 5.00,
-            reserveHoldDays: 90, anticipationFeePct: 4.99,
-        }, { provider })
+        return calculateFees(netUSDcents / 100, DEFAULT_SELLER_FEES, { provider })
     }
 
     async registerKpi(data: { sellerId: string; method: string; amount: number; fee: number; status: string }) {

@@ -64,6 +64,14 @@ export interface SellerFees {
   anticipationFeePct: number  // ex: 4.99
 }
 
+/** Tarifa de quem não tem linha em seller_fees (a mesma para venda e renovação). */
+export const DEFAULT_SELLER_FEES: SellerFees = {
+  sellerId: '', riskLevel: 'WHITE',
+  feePercentage: 9.99, feeFixedUsd: 0.30,
+  settlementDays: 3, reservePercentage: 5.00,
+  reserveHoldDays: 90, anticipationFeePct: 4.99,
+}
+
 export interface TransactionFeeResult {
   grossAmount:      number   // valor bruto (USD)
   platformFee:      number   // taxa da plataforma (% + fixo + surcharges + CBP)

@@ -11,6 +11,15 @@ import { StripeAccountsService } from '../orchestrator/stripe/stripe-accounts.se
 import { StripeRiskService } from '../orchestrator/stripe/stripe-risk.service'
 import { StripeEfwService } from '../orchestrator/stripe/stripe-efw.service'
 import { AffiliateRiskService } from '../orchestrator/stripe/affiliate-risk.service'
+import { CurrencyService } from '../currency/currency.service'
+import { getSellerFees } from '../shared/fee.calculator'
+import {
+  isWhopRenewalPayment,
+  renewalEconomics,
+  renewalMetadata,
+  whopPaymentAmountMinor,
+  whopPaymentId,
+} from './whop-renewal'
 import * as crypto from 'crypto'
 
 // Status do Sentinel Gate → status canônico do handleWebhookProvider.
@@ -127,6 +136,7 @@ export class WebhookService {
     private readonly stripeRisk: StripeRiskService,
     private readonly stripeEfw: StripeEfwService,
     private readonly affiliateRisk: AffiliateRiskService,
+    private readonly currencyService: CurrencyService,
   ) { }
 
   // opts.skipDispatch: pula o postback ao seller (usado na aprovação SÍNCRONA do
@@ -747,9 +757,12 @@ export class WebhookService {
 
     // ── 4b. Renovação de assinatura ──
     // A cobrança do ciclo herda o metadata da compra e casaria com a transação
-    // ORIGINAL (já aprovada). Não é ela: registra na assinatura e não mexe no
-    // pedido. Acesso cortado por falta de pagamento vem nos eventos membership.*.
-    if (eventType.startsWith('payment.') && body?.data?.billing_reason === 'subscription_cycle') {
+    // ORIGINAL (já aprovada). Não é ela: a renovação paga vira transação filha,
+    // com taxa e crédito do seller (whop-renewal.ts). failed/pending do ciclo só
+    // ficam registrados na assinatura — acesso cortado por falta de pagamento
+    // vem nos eventos membership.*.
+    if (eventType.startsWith('payment.') && isWhopRenewalPayment(body?.data)) {
+      if (eventType === 'payment.succeeded') return this.recordWhopRenewalPayment(accountId, body)
       return this.recordWhopRenewal(accountId, eventType, body)
     }
 
@@ -761,6 +774,17 @@ export class WebhookService {
 
     // ── 5. Resolve a transação ──
     const tx = await this.resolveWhopTx(body)
+    if (!tx && mapped === 'REFUNDED' && this.isWhopRenewalRefund(body?.data)) {
+      // Estorno de uma renovação sem transação própria (cobrada antes da
+      // contabilização de renovações, ou succeeded nunca processado): nunca foi
+      // creditada, então não há saldo a reverter. 5xx aqui faria a Whop reenviar
+      // para sempre — registra e responde 2xx.
+      console.error(
+        '[WebhookService] Whop: estorno de renovação sem transação — nada a reverter.',
+        JSON.stringify({ accountId, eventType, data: body?.data ?? null }).slice(0, 1000),
+      )
+      return { ignored: true, reason: 'renewal refund without transaction' }
+    }
     if (!tx) {
       console.error(
         '[WebhookService] Whop: PAGAMENTO ÓRFÃO — nenhuma transação casou.',
@@ -829,6 +853,169 @@ export class WebhookService {
     if (error) throw error
   }
 
+  // ─── Renovação paga ───────────────────────────────────────────────────────
+  //
+  // Transação filha da compra original, com taxa da Koopfy e crédito do seller
+  // pelo mesmo pipeline de PAID de uma venda. O checkout é avisado com
+  // `subscription.renewed` (não payment.approved: lá não existe pedido com o id
+  // da filha) e cria o pedido de renovação depois de conferir aqui no pay.
+  private async recordWhopRenewalPayment(accountId: string, body: any) {
+    const data = body?.data ?? {}
+    const paymentId = whopPaymentId(data)
+    if (!paymentId) throw new Error('Whop: renovação sem id de payment')
+
+    // Idempotência pelo payment: depois de um 5xx a Whop reentrega com outro webhook-id.
+    const { data: existing } = await supabase
+      .from('transactions').select('id').eq('provider_transaction_id', paymentId).maybeSingle()
+    let childId = existing?.id ?? null
+
+    if (!childId) {
+      const parent = await this.resolveWhopRenewalParent(data)
+      if (!parent) {
+        console.error(
+          '[WebhookService] Whop: RENOVAÇÃO ÓRFÃ — compra original não encontrada.',
+          JSON.stringify({ accountId, paymentId, membership: data?.membership?.id ?? data?.membership_id ?? null }),
+        )
+        // THROW: com 5xx a Whop reentrega (mesmo motivo do pagamento órfão).
+        throw new Error(`Whop: compra original não encontrada para a renovação ${paymentId}`)
+      }
+      childId = await this.createWhopRenewalTransaction(accountId, parent, data, paymentId)
+    }
+
+    // Pending → approved + creditPending + KPI + markPaid. Idempotente.
+    await this.handleWebhookProvider(
+      { reference: childId, status: 'PAID', type: 'TRANSACTION' },
+      { skipDispatch: true },
+    )
+
+    const { data: child } = await supabase.from('transactions').select('*').eq('id', childId).single()
+    // O checkout cria o pedido de forma idempotente: reenviar é seguro.
+    await this.dispatchToAll(child, 'subscription.renewed', {
+      status: child.status,
+      transactionId: child.id,
+      parentTransactionId: child.metadata?.renewal_of_transaction_id ?? null,
+      amount: child.amount,
+      currency: child.currency,
+      amountUsd: child.amount_usd_net_cents,
+      netAmount: child.net_amount,
+      fee: child.fee,
+      availableAt: child.available_at,
+    })
+
+    await this.recordWhopRenewal(accountId, 'payment.succeeded', body).catch((err: any) =>
+      console.warn('[WebhookService] Whop: last_renewal não registrado:', err?.message ?? err),
+    )
+    return { renewal: true, transactionId: child.id }
+  }
+
+  private isWhopRenewalRefund(data: any): boolean {
+    const payment = data?.payment && typeof data.payment === 'object' ? data.payment : null
+    return isWhopRenewalPayment(data) || isWhopRenewalPayment(payment)
+  }
+
+  // Compra original da renovação: pela membership (espelho em whop_subscriptions)
+  // e, na falta dele, pelo metadata herdado. Nunca pela checkout configuration.
+  private async resolveWhopRenewalParent(data: any): Promise<any | null> {
+    const candidates: string[] = []
+    const membershipId = data?.membership?.id ?? data?.membership_id ?? null
+    if (membershipId) {
+      const { data: row } = await supabase
+        .from('whop_subscriptions').select('koopfy_transaction_id')
+        .eq('whop_membership_id', String(membershipId)).maybeSingle()
+      if (row?.koopfy_transaction_id) candidates.push(String(row.koopfy_transaction_id))
+    }
+    const fromMetadata = data?.metadata?.koopfy_transaction_id
+    if (fromMetadata) candidates.push(String(fromMetadata))
+
+    for (const id of candidates) {
+      const { data: tx } = await supabase.from('transactions').select('*').eq('id', id).maybeSingle()
+      // A original é a compra — nunca outra renovação.
+      if (tx && !tx.metadata?.renewal_of_transaction_id && String(tx.provider ?? '').toLowerCase() === 'whop') {
+        return tx
+      }
+    }
+    return null
+  }
+
+  private async createWhopRenewalTransaction(accountId: string, parent: any, data: any, paymentId: string) {
+    const amount = whopPaymentAmountMinor(data)
+    const currency = String(data?.currency ?? parent.currency ?? '').toUpperCase()
+    if (!amount || !currency) throw new Error(`Whop: renovação ${paymentId} sem valor ou moeda`)
+
+    // Câmbio do dia da renovação — não o da compra original.
+    const fx = await this.currencyService.convertToUSDWithFee(amount / 100, currency)
+    const netUSDcents = Math.round(fx.netUSD * 100)
+
+    const { externalFeeDropped, ...fees } = renewalEconomics({
+      netUSDcents,
+      sellerFees: await getSellerFees(parent.seller_id),
+      parent,
+    })
+    if (externalFeeDropped) {
+      console.error(
+        `[WebhookService] renovação ${paymentId}: comissão do parceiro maior que o líquido — ` +
+        `não aplicada (compra original ${parent.id})`,
+      )
+    }
+
+    const { count } = await supabase
+      .from('transactions').select('id', { count: 'exact', head: true })
+      .eq('metadata->>renewal_of_transaction_id', parent.id)
+    const cycle = (count ?? 0) + 2 // a compra original é o ciclo 1
+    const membershipId = data?.membership?.id ?? data?.membership_id ?? null
+    const now = new Date().toISOString()
+
+    const { data: created, error } = await supabase
+      .from('transactions')
+      .insert({
+        seller_id: parent.seller_id,
+        offer_id: parent.offer_id ?? null,
+        amount,
+        currency,
+        method: parent.method ?? 'card',
+        amount_usd_net_cents: netUSDcents,
+        amount_usd_gross_cents: Math.round(fx.grossUSD * 100),
+        fx_fee_cents: Math.round(fx.feeUSD * 100),
+        fx_rate: fx.fxFinalRate,
+        status: 'pending',
+        provider: parent.provider ?? 'whop',
+        provider_status: data?.status ?? null,
+        provider_account_id: accountId,
+        provider_transaction_id: paymentId,
+        customer_name: parent.customer_name ?? null,
+        customer_email: parent.customer_email ?? null,
+        customer_phone: parent.customer_phone ?? 'N/A',
+        customer_document: parent.customer_document ?? 'N/A',
+        customer_country: parent.customer_country ?? null,
+        payment_last4: parent.payment_last4 ?? null,
+        payment_brand: parent.payment_brand ?? null,
+        idempotency_key: `whop_renewal_${paymentId}`,
+        external_reference: parent.external_reference ? `${parent.external_reference}-R${cycle}` : null,
+        metadata: renewalMetadata(parent.metadata, { parentTransactionId: parent.id, paymentId, membershipId, cycle }),
+        postback_url: parent.postback_url ?? null,
+        risk_level: parent.risk_level ?? null,
+        // Mesmo destino da taxa da plataforma que a compra original.
+        ...('platform_partner' in parent ? { platform_partner: parent.platform_partner } : {}),
+        webhook_sent: false,
+        webhook_status: 'pending',
+        webhook_attempts: 0,
+        ...fees,
+        processed_at: now,
+        created_at: now,
+      })
+      .select('id')
+      .single()
+
+    if (error || !created) {
+      // Duas entregas ao mesmo tempo: a outra já criou.
+      const { data: raced } = await supabase
+        .from('transactions').select('id').eq('provider_transaction_id', paymentId).maybeSingle()
+      if (raced) return raced.id as string
+      throw new Error(`Whop: falha ao criar a transação da renovação ${paymentId} (${error?.message})`)
+    }
+    return created.id as string
+  }
+
   // Última cobrança de renovação fica em whop_subscriptions.metadata.last_renewal.
   // Sem a linha da assinatura (membership.* ainda não chegou) só registra no log —
   // responder erro faria a Whop reenviar um evento que não aprova nada.
@@ -881,7 +1068,7 @@ export class WebhookService {
       customer_email: data?.user?.email ?? data?.customer?.email ?? null,
       status,
       cancel_at_period_end: Boolean(data?.cancel_at_period_end),
-      current_period_end: data?.current_period_end ?? data?.expires_at ?? null,
+      current_period_end: data?.renewal_period_end ?? data?.current_period_end ?? data?.expires_at ?? null,
       metadata,
       updated_at: new Date().toISOString(),
     };
@@ -889,46 +1076,22 @@ export class WebhookService {
     const { error } = await supabase
       .from('whop_subscriptions')
       .upsert(row, { onConflict: 'whop_membership_id' });
-    if (error) throw new Error(`Whop: falha ao persistir membership (${error.message})`);
 
-    // Keep Koopfy's entitlement in sync with the processor membership.
-    // cancel_at_period_end remains active until Whop emits deactivated.
+    // O acesso (digital_access) e os pedidos moram no banco do CHECKOUT, não
+    // neste — o update direto que havia aqui nunca chegava ao comprador. Avisa
+    // pelo postback; o checkout ignora o corpo e consulta a assinatura no pay
+    // com a chave do vendedor antes de mexer no acesso. Vai antes do throw: o
+    // espelho local falhar não pode segurar o corte (ou a volta) do acesso.
     if (tx?.id) {
-      const { data: order } = await supabase
-        .from('orders')
-        .select('id')
-        .eq('gateway_payment_id', tx.id)
+      const { data: fullTx } = await supabase
+        .from('transactions')
+        .select('id, seller_id, postback_url, external_reference, metadata')
+        .eq('id', tx.id)
         .maybeSingle();
-
-      if (order?.id) {
-        const now = new Date().toISOString();
-        if (['inactive', 'past_due', 'unpaid', 'canceled', 'cancelled'].includes(status)) {
-          const { error: revokeError } = await supabase
-            .from('digital_access')
-            .update({
-              status: 'revoked',
-              revoked_at: now,
-              revoke_reason: `subscription_${status}`,
-              updated_at: now,
-            })
-            .eq('order_id', order.id)
-            .eq('status', 'active');
-          if (revokeError) throw new Error(`Whop: falha ao revogar acesso (${revokeError.message})`);
-        } else if (status === 'active') {
-          const { error: renewError } = await supabase
-            .from('digital_access')
-            .update({
-              status: 'active',
-              expires_at: row.current_period_end,
-              revoked_at: null,
-              revoke_reason: null,
-              updated_at: now,
-            })
-            .eq('order_id', order.id);
-          if (renewError) throw new Error(`Whop: falha ao renovar acesso (${renewError.message})`);
-        }
-      }
+      if (fullTx) await this.dispatchToAll(fullTx, 'subscription.updated', { transactionId: fullTx.id });
     }
+
+    if (error) throw new Error(`Whop: falha ao persistir membership (${error.message})`);
     return { received: true, membership: membershipId, status };
   }
 
@@ -940,7 +1103,23 @@ export class WebhookService {
     const data = body?.data ?? {}
     const metadata = data?.metadata ?? body?.metadata ?? {}
 
-    // 1) PRIMÁRIO — nosso transactions.id, ida e volta pelo metadata.
+    // 0) Id do payment (pay_xxx) ANTES do metadata. Upsell de um clique e
+    //    renovação de assinatura têm transação própria com esse id em
+    //    provider_transaction_id, mas carregam o metadata da compra original:
+    //    olhando o metadata primeiro, estorno e disputa de uma renovação cairiam
+    //    na compra original. Em refund/dispute o payment vem aninhado.
+    const nestedPayment = data?.payment && typeof data.payment === 'object' ? data.payment : null
+    const paymentId = whopPaymentId(data) ?? whopPaymentId(nestedPayment) ?? whopPaymentId({ id: data?.payment_id })
+    if (paymentId) {
+      const { data: byPayment } = await supabase
+        .from('transactions').select('id')
+        .eq('provider_transaction_id', paymentId).maybeSingle()
+      if (byPayment) return byPayment
+    }
+    // Renovação ainda sem transação própria: nunca cai na compra original.
+    if (isWhopRenewalPayment(data) || isWhopRenewalPayment(nestedPayment)) return null
+
+    // 1) Nosso transactions.id, ida e volta pelo metadata.
     const txId = metadata?.koopfy_transaction_id
     if (txId) {
       const { data: byId } = await supabase
@@ -960,17 +1139,6 @@ export class WebhookService {
         .from('transactions').select('id')
         .eq('provider_transaction_id', String(sessionId)).maybeSingle()
       if (bySession) return bySession
-    }
-
-    // 2b) Cobrança off-session (upsell de um clique): não existe checkout
-    //     configuration; o id do payment (pay_xxx) foi gravado como
-    //     provider_transaction_id quando a cobrança foi criada.
-    const paymentId = typeof data?.id === 'string' && data.id.startsWith('pay_') ? data.id : null
-    if (paymentId) {
-      const { data: byPayment } = await supabase
-        .from('transactions').select('id')
-        .eq('provider_transaction_id', paymentId).maybeSingle()
-      if (byPayment) return byPayment
     }
 
     // 3) order_number → external_reference (mesmo fallback do Sentinel/Rox).
