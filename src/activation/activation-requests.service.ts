@@ -1,6 +1,7 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
 import { MailService } from '../utils/mail'
+import { contactEmailFor } from '../integration/seller-accounts'
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SOLICITAÇÕES DE ATIVAÇÃO — exceções ao onboarding por LLC
@@ -149,12 +150,14 @@ export class ActivationRequestsService {
 
     // O e-mail não desfaz a decisão se falhar: a mensagem também aparece no
     // cadastro do seller. O CRM recebe `emailSent` para saber se precisa avisar.
-    const { data: user } = await supabase.from('users').select('name, email').eq('id', current.user_id).maybeSingle()
+    const { data: user } = await supabase.from('users').select('name, email, owner_user_id').eq('id', current.user_id).maybeSingle()
+    // Conta a mais tem e-mail interno: a resposta vai para o dono.
+    const to = await contactEmailFor(user)
     let emailSent = false
-    if (user?.email) {
+    if (to) {
       try {
         await this.mail.sendActivationDecisionEmail({
-          to: user.email,
+          to,
           name: user.name ?? '',
           decision: dto.decision,
           message,

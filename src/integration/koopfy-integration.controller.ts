@@ -34,7 +34,22 @@ export class KoopfyIntegrationController {
   @Get('status')
   @UseGuards(CrossServiceTokenGuard)
   status(@Req() req: any) {
-    return this.svc.getStatus(req.tokenEmail);
+    return this.svc.getStatus(req.tokenEmail, req.accountSellerId ?? null);
+  }
+
+  // Contas Koopfy Payments do usuário (a principal e as criadas a mais), para o
+  // workspace escolher qual usar.
+  @Get('accounts')
+  @UseGuards(CrossServiceTokenGuard)
+  accounts(@Req() req: any) {
+    return this.svc.listAccounts(req.tokenEmail);
+  }
+
+  // Conta nova, do zero (cadastro, saldo e repasses próprios).
+  @Post('accounts')
+  @UseGuards(CrossServiceTokenGuard)
+  createAccount(@Req() req: any, @Body() body: any) {
+    return this.svc.createAccount(req.tokenEmail, { name: body?.name });
   }
 
   // Ativa a integração e emite a API key (texto puro retornado UMA vez)
@@ -112,7 +127,7 @@ export class KoopfyIntegrationController {
   @Get('balance')
   @UseGuards(CrossServiceTokenGuard)
   balance(@Req() req: any) {
-    return this.svc.getBalance(req.tokenEmail);
+    return this.svc.getBalance(req.tokenEmail, req.accountSellerId ?? null);
   }
 
   // Carteira recorrente do seller para a central de assinaturas do checkout.
@@ -121,7 +136,7 @@ export class KoopfyIntegrationController {
   @Get('subscriptions')
   @UseGuards(CrossServiceTokenGuard)
   subscriptions(@Req() req: any, @Query() query: any) {
-    return this.svc.getSubscriptions(req.tokenEmail, query);
+    return this.svc.getSubscriptions(req.tokenEmail, query, req.accountSellerId ?? null);
   }
 
   // Grupo de WhatsApp da operação logística deste merchant — definido pelo CRM
@@ -129,6 +144,6 @@ export class KoopfyIntegrationController {
   @Get('logistics-channel')
   @UseGuards(CrossServiceTokenGuard)
   logisticsChannel(@Req() req: any) {
-    return this.svc.getLogisticsChannel(req.tokenEmail);
+    return this.svc.getLogisticsChannel(req.tokenEmail, req.accountSellerId ?? null);
   }
 }
