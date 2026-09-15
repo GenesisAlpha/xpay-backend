@@ -248,6 +248,14 @@ export function calculatePayoutFees(
   return { amountCents: amount, feeCents, fxFeeCents, netCents: amount - feeCents - fxFeeCents }
 }
 
+/** Moeda em que o saque é pago: Pix em BRL, IBAN em EUR, ACH e USDT em USD. */
+export function payoutCurrencyForMethod(method: string): 'USD' | 'BRL' | 'EUR' {
+  const m = String(method ?? '').toLowerCase()
+  if (m === 'pix') return 'BRL'
+  if (m === 'iban') return 'EUR'
+  return 'USD'
+}
+
 // ─── Antecipação ──────────────────────────────────────────────────────────────
 
 /** Antecipação do saldo a liquidar: a taxa incide sobre todo o valor antecipado. */

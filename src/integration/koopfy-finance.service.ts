@@ -52,6 +52,9 @@ const PAYOUT_FIELDS = [
   'swift',
   'cryptoAddress',
   'cryptoNetwork',
+  // Faltavam: sem eles todo saque Pix pelo fluxo unificado falhava no buildDestination.
+  'pixKey',
+  'pixKeyType',
 ] as const;
 
 function publicTransaction(transaction: any) {
@@ -199,6 +202,16 @@ export class KoopfyFinanceService {
       orderShipped: Boolean(entry.orderShipped),
       trackingCode: entry.trackingCode ?? null,
     }));
+  }
+
+  async getPayoutQuote(ctx: SellerCtx, query: Record<string, unknown>) {
+    const method = String(query?.method ?? 'ach').toLowerCase();
+    const amount = Number(String(query?.amount ?? '0').replace(',', '.'));
+    return this.wallet.quotePayout(
+      this.seller(ctx).id,
+      Number.isFinite(amount) ? amount : 0,
+      ['ach', 'iban', 'pix', 'crypto'].includes(method) ? method : 'ach',
+    );
   }
 
   async getAnticipationQuote(ctx: SellerCtx) {

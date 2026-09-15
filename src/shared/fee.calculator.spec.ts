@@ -3,6 +3,7 @@ jest.mock('../lib/supabase.client', () => ({ supabase: {} }))
 import {
   calculatePayoutFees,
   calculateSaleFees,
+  payoutCurrencyForMethod,
   DEFAULT_FEE_SETTINGS,
   saleFeePct,
   sellerFeesFromRow,
@@ -66,6 +67,15 @@ describe('calculatePayoutFees', () => {
     expect(calculatePayoutFees(20000, DEFAULT_FEE_SETTINGS, { currencyConverted: true })).toEqual({
       amountCents: 20000, feeCents: 0, fxFeeCents: 400, netCents: 19600,
     })
+  })
+})
+
+describe('payoutCurrencyForMethod', () => {
+  it('pays Pix in BRL, IBAN in EUR and the rest in USD', () => {
+    expect(payoutCurrencyForMethod('pix')).toBe('BRL')
+    expect(payoutCurrencyForMethod('IBAN')).toBe('EUR')
+    expect(payoutCurrencyForMethod('ach')).toBe('USD')
+    expect(payoutCurrencyForMethod('crypto')).toBe('USD')
   })
 })
 

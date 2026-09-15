@@ -4,7 +4,22 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 
-jest.mock('../lib/supabase.client', () => ({ supabase: { rpc: jest.fn() } }));
+const feesRow = jest.fn();
+
+jest.mock('../lib/supabase.client', () => ({
+  supabase: {
+    rpc: jest.fn(),
+    // Tarifa do seller lida por quotePayout (seller_fees).
+    from: () => {
+      const chain: any = {
+        select: () => chain,
+        eq: () => chain,
+        maybeSingle: () => Promise.resolve(feesRow()),
+      };
+      return chain;
+    },
+  },
+}));
 
 import { supabase } from '../lib/supabase.client';
 import {
@@ -34,7 +49,11 @@ const activeContext: SellerCtx = {
 };
 
 describe('WalletService.requestPayoutIdempotent', () => {
-  beforeEach(() => rpc.mockReset());
+  beforeEach(() => {
+    rpc.mockReset();
+    feesRow.mockReset();
+    feesRow.mockReturnValue({ data: null, error: null });
+  });
 
   it('creates payouts only through the idempotent wrapper', async () => {
     rpc.mockResolvedValue({
@@ -59,7 +78,58 @@ describe('WalletService.requestPayoutIdempotent', () => {
         achAccountType: 'checking',
         accountHolder: 'Jane Doe',
       },
+      p_fee_cents: 0,
+      p_fx_fee_cents: 0,
+      p_payout_currency: 'USD',
+      p_fee_details: { payout_fee_pct: 0, payout_fee_fixed_usd: 0, payout_fx_fee_pct: 0 },
     });
+  });
+
+  it('charges the seller payout fees and spread for Pix in BRL', async () => {
+    feesRow.mockReturnValue({
+      data: {
+        seller_id: 'seller-1',
+        processing_fee_pct: 8.9,
+        payout_min_usd: 100,
+        payout_fee_pct: 1,
+        payout_fee_fixed_usd: 2,
+        payout_fx_fee_pct: 2,
+      },
+      error: null,
+    });
+    rpc.mockResolvedValue({
+      data: { payoutId: 'po-2', status: 'processing', replayed: false },
+      error: null,
+    });
+
+    await new WalletService().requestPayoutIdempotent(
+      'seller-1',
+      { amount: 500, method: 'pix', accountHolder: 'Jane Doe', pixKey: 'jane@example.com', pixKeyType: 'email' } as never,
+      KEY,
+    );
+
+    expect(rpc).toHaveBeenCalledWith(
+      'request_payout_idempotent',
+      expect.objectContaining({
+        p_amount_cents: 50000,
+        p_fee_cents: 700,
+        p_fx_fee_cents: 986,
+        p_payout_currency: 'BRL',
+        p_fee_details: { payout_fee_pct: 1, payout_fee_fixed_usd: 2, payout_fx_fee_pct: 2 },
+      }),
+    );
+  });
+
+  it('applies the per-seller minimum', async () => {
+    feesRow.mockReturnValue({
+      data: { seller_id: 'seller-1', processing_fee_pct: 8.9, payout_min_usd: 300 },
+      error: null,
+    });
+
+    await expect(
+      new WalletService().requestPayoutIdempotent('seller-1', achPayout as never, KEY),
+    ).rejects.toThrow('US$ 300.00');
+    expect(rpc).not.toHaveBeenCalled();
   });
 
   it('returns the original payout when the key is replayed', async () => {

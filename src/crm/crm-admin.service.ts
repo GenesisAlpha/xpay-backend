@@ -1149,6 +1149,12 @@ export class CrmAdminService {
       resolution_notes: dto.notes ?? null,
     }).eq('id', id)
 
+    // Reserva da venda com chargeback não volta ao seller.
+    if (cb.transaction_id) {
+      const { error: reserveError } = await supabase.rpc('cancel_reserve_hold', { p_transaction_id: cb.transaction_id, p_reason: 'chargeback' })
+      if (reserveError) console.error('[crm-admin] chargeback: reserva não cancelada (reconciliar):', reserveError.message)
+    }
+
     // ── Debita o seller: valor do chargeback + taxa de chargeback do seller ───
     // Não trava se faltar saldo — registra para reconciliação manual. Se a venda
     // já pagou a taxa num alerta de chargeback (Whop), não cobra de novo.

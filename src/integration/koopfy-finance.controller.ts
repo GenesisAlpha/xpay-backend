@@ -60,6 +60,12 @@ export class KoopfyFinanceController {
     return this.finance.listPayouts(req.sellerCtx, query);
   }
 
+  // Mínimo, taxas e líquido do saque para mostrar antes de confirmar.
+  @Get('payouts/quote')
+  payoutQuote(@Req() req: any, @Query() query: Record<string, unknown>) {
+    return this.finance.getPayoutQuote(req.sellerCtx, query);
+  }
+
   // O seller vem do token verificado; um sellerId no corpo é descartado.
   @Post('payouts')
   requestPayout(

@@ -1987,6 +1987,10 @@ export class WebhookService {
       await this.reverseBalance(c.seller_id, bucket, c.amount, tx.id, 'refund')
     }
 
+    // Reserva da venda estornada não volta ao seller.
+    const { error: reserveError } = await supabase.rpc('cancel_reserve_hold', { p_transaction_id: tx.id, p_reason: 'refunded' })
+    if (reserveError) console.error('[WebhookService] refund: reserva não cancelada (reconciliar):', reserveError.message)
+
     // 3) Notifica o seller
     await this.dispatchToAll(tx, 'payment.refunded', {
       status: 'refunded',

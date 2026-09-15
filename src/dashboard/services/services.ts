@@ -9,7 +9,7 @@ import * as bcrypt from 'bcrypt';
 import { generateKey, hashKey } from '../../utils/apikeys.utils';
 import * as crypto from 'crypto';
 import { notifySellerPayout } from '../../utils/seller-mail';
-import { getEffectiveSellerFees, saleFeePct } from '../../shared/fee.calculator';
+import { calculatePayoutFees, getEffectiveSellerFees, payoutCurrencyForMethod, saleFeePct } from '../../shared/fee.calculator';
 import {
   BLOCKED_METHODS,
   IDEMPOTENCY_KEY_PATTERN,
@@ -569,6 +569,46 @@ export class WalletService {
   }
 
 
+  // ── Taxas do saque ─────────────────────────────────────────────────────────
+  // Mínimo, % e fixa sobre o valor, e spread quando o saque é pago em outra
+  // moeda (Pix em BRL, IBAN em EUR) — tudo da tarifa do seller no CRM.
+  async quotePayout(sellerId: string, amountUsd: number, method: string) {
+    const fees = await getEffectiveSellerFees(sellerId)
+    const payoutCurrency = payoutCurrencyForMethod(method)
+    const converted = payoutCurrency !== 'USD'
+    const amountCents = Number.isFinite(amountUsd) && amountUsd > 0 ? this.usdToCents(amountUsd) : 0
+    const calc = calculatePayoutFees(amountCents, fees, { currencyConverted: converted })
+    return {
+      minUsd: fees.payoutMinUsd,
+      payoutCurrency,
+      feePct: fees.payoutFeePct,
+      feeFixedUsd: fees.payoutFeeFixedUsd,
+      fxFeePct: converted ? fees.payoutFxFeePct : 0,
+      amountCents: calc.amountCents,
+      feeCents: calc.feeCents,
+      fxFeeCents: calc.fxFeeCents,
+      netCents: calc.netCents,
+      amount: calc.amountCents / 100,
+      fee: calc.feeCents / 100,
+      fxFee: calc.fxFeeCents / 100,
+      net: calc.netCents / 100,
+      details: {
+        payout_fee_pct: fees.payoutFeePct,
+        payout_fee_fixed_usd: fees.payoutFeeFixedUsd,
+        payout_fx_fee_pct: converted ? fees.payoutFxFeePct : 0,
+      },
+    }
+  }
+
+  private assertPayoutQuote(amountUsd: number, quote: { minUsd: number; netCents: number }) {
+    if (amountUsd < quote.minUsd) {
+      throw new BadRequestException(`O valor mínimo para saque é US$ ${quote.minUsd.toFixed(2)}.`)
+    }
+    if (quote.netCents <= 0) {
+      throw new BadRequestException('O valor não cobre as taxas de saque.')
+    }
+  }
+
   // ── Caso de uso principal ──────────────────────────────────────────────────
   async requestPayout(
     dto: RequestPayoutDto,
@@ -599,11 +639,18 @@ export class WalletService {
 
     // 4. Chama a RPC — toda a lógica de saldo (ler, travar, debitar
     //    available→pending, inserir no ledger) roda atômica no banco.
+    const quote = await this.quotePayout(dto.sellerId, dto.amount, dto.method)
+    this.assertPayoutQuote(dto.amount, quote)
+
     const { data, error } = await supabase.rpc('request_payout', {
       p_seller_id: dto.sellerId,
       p_amount_cents: amountCents,
       p_method: dto.method,
       p_destination: destination,
+      p_fee_cents: quote.feeCents,
+      p_fx_fee_cents: quote.fxFeeCents,
+      p_payout_currency: quote.payoutCurrency,
+      p_fee_details: quote.details,
     })
 
     // 5. Tratamento de erro.
@@ -637,6 +684,7 @@ export class WalletService {
     // Aviso ao vendedor (fire-and-forget: e-mail nunca derruba o saque).
     void notifySellerPayout(dto.sellerId, 'requested', {
       amountCents,
+      feeCents: quote.feeCents + quote.fxFeeCents,
       currency: 'USD',
       method: dto.method,
       payoutId: row.payout_id,
@@ -669,6 +717,8 @@ export class WalletService {
 
     const amountCents = this.usdToCents(dto.amount)
     const destination = this.buildDestination(dto)
+    const quote = await this.quotePayout(sellerId, dto.amount, dto.method)
+    this.assertPayoutQuote(dto.amount, quote)
 
     const { data, error } = await supabase.rpc('request_payout_idempotent', {
       p_seller_id: sellerId,
@@ -677,6 +727,10 @@ export class WalletService {
       p_amount_cents: amountCents,
       p_method: dto.method,
       p_destination: destination,
+      p_fee_cents: quote.feeCents,
+      p_fx_fee_cents: quote.fxFeeCents,
+      p_payout_currency: quote.payoutCurrency,
+      p_fee_details: quote.details,
     })
 
     if (error) {
@@ -718,6 +772,7 @@ export class WalletService {
     if (!replayed) {
       void notifySellerPayout(sellerId, 'requested', {
         amountCents,
+        feeCents: quote.feeCents + quote.fxFeeCents,
         currency: 'USD',
         method: dto.method,
         payoutId: String(row.payoutId),
@@ -742,11 +797,6 @@ export class WalletService {
     }
     if (Math.abs(amount * 100 - Math.round(amount * 100)) > 1e-6) {
       throw new BadRequestException('O valor do saque aceita no máximo duas casas decimais.')
-    }
-    if (amount < MIN_WITHDRAW_USD) {
-      throw new BadRequestException(
-        `O valor mínimo para saque é US$ ${MIN_WITHDRAW_USD.toFixed(2)}.`,
-      )
     }
     const methods: readonly string[] = [...VALID_METHODS, ...BLOCKED_METHODS]
     if (!methods.includes(dto.method as string)) {
