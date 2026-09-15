@@ -64,6 +64,13 @@ export class WebhookController {
         let parsed: any = {};
         try { parsed = JSON.parse(raw || '{}'); } catch { /* payload inválido */ }
 
+        // Webhook da master com "eventos de contas conectadas" ligado: o evento
+        // de uma conta conectada chega aqui e segue o fluxo dela (posse, risco,
+        // cobertura do negativo), não o da master.
+        if (await this.whopConnectedWebhook.isConnectedEvent(parsed)) {
+            return this.whopConnectedWebhook.handle(parsed, raw, headers);
+        }
+
         return this.webhookService.handleSharedWhopWebhook(parsed, raw, headers);
     }
 
@@ -107,6 +114,12 @@ export class WebhookController {
 
         let parsed: any = {};
         try { parsed = JSON.parse(raw || '{}'); } catch { /* payload inválido */ }
+
+        // Mesmo desvio da rota compartilhada: evento de conta conectada vindo
+        // pelo webhook da master.
+        if (await this.whopConnectedWebhook.isConnectedEvent(parsed)) {
+            return this.whopConnectedWebhook.handle(parsed, raw, headers);
+        }
 
         return this.webhookService.handleWhopWebhook(accountId, parsed, raw, headers);
     }

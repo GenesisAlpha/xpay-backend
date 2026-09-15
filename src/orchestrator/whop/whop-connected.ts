@@ -738,6 +738,15 @@ export function extractWhopEventAccountId(body: any): string | null {
   return typeof id === 'string' && id.startsWith('biz_') ? id : null;
 }
 
+/**
+ * Segredo dos eventos das contas conectadas. Padrão: o mesmo webhook da master
+ * com "eventos de contas conectadas" ligado, logo o mesmo WHOP_WEBHOOK_SECRET.
+ * WHOP_CONNECTED_WEBHOOK_SECRET só é preciso num webhook separado.
+ */
+export function connectedWebhookSecret(env: Record<string, string | undefined> = process.env): string | null {
+  return env.WHOP_CONNECTED_WEBHOOK_SECRET?.trim() || env.WHOP_WEBHOOK_SECRET?.trim() || null;
+}
+
 export function extractWhopEventMetadata(body: any): Record<string, any> {
   const data = body?.data ?? {};
   return data?.metadata

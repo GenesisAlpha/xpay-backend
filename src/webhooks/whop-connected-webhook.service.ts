@@ -4,6 +4,7 @@ import { WebhookService } from './webhook.service'
 import { WhopConnectService } from '../orchestrator/whop/whop-connect.service'
 import {
   checkConnectedEventOwnership,
+  connectedWebhookSecret,
   extractWhopEventAccountId,
   extractWhopEventMetadata,
   toConnectedProviderAccountId,
@@ -11,13 +12,16 @@ import {
 } from '../orchestrator/whop/whop-connected'
 
 // ══════════════════════════════════════════════════════════════════════════
-// WHOP — webhook das CONTAS CONECTADAS: /webhook/whop/connected
+// WHOP — eventos das CONTAS CONECTADAS
 // ══════════════════════════════════════════════════════════════════════════
 //
-// Um webhook criado na master com `child_resource_events: true` recebe os
-// eventos de todas as contas conectadas, com um segredo só
-// (WHOP_CONNECTED_WEBHOOK_SECRET). O envelope diz de qual conta veio
-// (`account_id`, ou `company_id` se fixado antes de 2026-08-14).
+// Padrão: o webhook da master com "eventos de contas conectadas" ligado. Os
+// eventos chegam na mesma URL da master, com o mesmo segredo
+// (WHOP_WEBHOOK_SECRET), e o controller desvia para cá os que vêm de uma
+// conta conectada (isConnectedEvent). /webhook/whop/connected continua
+// valendo para um webhook separado (WHOP_CONNECTED_WEBHOOK_SECRET). O
+// envelope diz de qual conta veio (`account_id`, ou `company_id` se fixado
+// antes de 2026-08-14).
 //
 // Pagamento, reembolso, disputa e assinatura seguem o MESMO pipeline das
 // contas do pool (WebhookService.handleWhopWebhook), com a conta 'whopc_<biz>'.
@@ -39,12 +43,25 @@ export class WhopConnectedWebhookService {
     private readonly connect: WhopConnectService,
   ) { }
 
+  /**
+   * O evento que chegou na URL da master é de uma conta conectada da Koopfy?
+   * Sem account_id, ou com o id da própria master, segue o fluxo da master.
+   * Só olha o envelope e a tabela; a assinatura é conferida em handle.
+   */
+  async isConnectedEvent(body: any): Promise<boolean> {
+    const whopAccountId = extractWhopEventAccountId(body)
+    if (!whopAccountId) return false
+    if (whopAccountId === process.env.WHOP_COMPANY_ID?.trim()) return false
+    const row = await this.connect.getRowByWhopAccount(whopAccountId).catch(() => null)
+    return Boolean(row)
+  }
+
   async handle(body: any, rawBody: string, headers: Record<string, string>) {
-    const secret = process.env.WHOP_CONNECTED_WEBHOOK_SECRET?.trim()
+    const secret = connectedWebhookSecret()
     if (!secret) {
       // THROW (5xx): com 2xx a Whop dá o evento por entregue e ele se perde.
-      console.error('[WhopConnectedWebhook] WHOP_CONNECTED_WEBHOOK_SECRET ausente — evento recusado')
-      throw new Error('Whop: WHOP_CONNECTED_WEBHOOK_SECRET ausente')
+      console.error('[WhopConnectedWebhook] WHOP_WEBHOOK_SECRET (ou WHOP_CONNECTED_WEBHOOK_SECRET) ausente — evento recusado')
+      throw new Error('Whop: WHOP_WEBHOOK_SECRET / WHOP_CONNECTED_WEBHOOK_SECRET ausente')
     }
 
     const verification = verifyWhopWebhookSignature(rawBody, headers, secret)

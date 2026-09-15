@@ -55,13 +55,57 @@ describe('WhopConnectedWebhookService', () => {
     const { service, webhooks } = setup();
     const { raw, headers } = signed(paymentBody({}));
 
+    const masterSecret = process.env.WHOP_WEBHOOK_SECRET;
     delete process.env.WHOP_CONNECTED_WEBHOOK_SECRET;
+    delete process.env.WHOP_WEBHOOK_SECRET;
     await expect(service.handle(paymentBody({}), raw, headers)).rejects.toThrow('WHOP_CONNECTED_WEBHOOK_SECRET');
+    if (masterSecret !== undefined) process.env.WHOP_WEBHOOK_SECRET = masterSecret;
 
     process.env.WHOP_CONNECTED_WEBHOOK_SECRET = SECRET;
     await expect(service.handle(paymentBody({}), raw, { ...headers, 'webhook-signature': 'v1,forjada' }))
       .rejects.toThrow('assinatura inválida');
     expect(webhooks.handleWhopWebhook).not.toHaveBeenCalled();
+  });
+
+  it('sem segredo próprio usa o da master (mesmo webhook com eventos de contas conectadas)', async () => {
+    const { service, webhooks } = setup();
+    const body = paymentBody({ koopfy_seller_id: 'seller-1' });
+    const { raw, headers } = signed(body);
+    const previous = process.env.WHOP_WEBHOOK_SECRET;
+    delete process.env.WHOP_CONNECTED_WEBHOOK_SECRET;
+    process.env.WHOP_WEBHOOK_SECRET = SECRET;
+
+    try {
+      await service.handle(body, raw, headers);
+    } finally {
+      if (previous === undefined) delete process.env.WHOP_WEBHOOK_SECRET;
+      else process.env.WHOP_WEBHOOK_SECRET = previous;
+    }
+
+    expect(webhooks.handleWhopWebhook).toHaveBeenCalledWith('whopc_biz_seller', body, raw, headers);
+  });
+
+  it('só desvia da rota da master evento de conta conectada da Koopfy', async () => {
+    const previous = process.env.WHOP_COMPANY_ID;
+    process.env.WHOP_COMPANY_ID = 'biz_master';
+    try {
+      const connected = setup();
+      expect(await connected.service.isConnectedEvent(paymentBody({}))).toBe(true);
+      expect(connected.connect.getRowByWhopAccount).toHaveBeenCalledWith('biz_seller');
+
+      expect(await connected.service.isConnectedEvent({ type: 'payment.succeeded', data: {} })).toBe(false);
+      expect(await connected.service.isConnectedEvent({ type: 'payment.succeeded', account_id: 'biz_master' })).toBe(false);
+
+      const unknown = setup(null);
+      expect(await unknown.service.isConnectedEvent(paymentBody({}))).toBe(false);
+
+      const failing = setup();
+      failing.connect.getRowByWhopAccount.mockRejectedValue(new Error('tabela ausente'));
+      expect(await failing.service.isConnectedEvent(paymentBody({}))).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.WHOP_COMPANY_ID;
+      else process.env.WHOP_COMPANY_ID = previous;
+    }
   });
 
   it('pagamento do próprio seller segue o pipeline da Whop com a conta whopc_', async () => {

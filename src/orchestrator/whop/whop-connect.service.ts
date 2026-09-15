@@ -14,6 +14,7 @@ import {
   classifyConnectedRisk,
   classifyWhopTransfer,
   connectedChargeBlocker,
+  connectedWebhookSecret,
   decideConnectedMode,
   deriveConnectedStatus,
   escalateRiskTier,
@@ -619,7 +620,7 @@ export class WhopConnectService implements OnModuleInit {
         seller_id: row.seller_id,
         // Um webhook da master com child_resource_events recebe os eventos de
         // TODAS as contas conectadas — um segredo só.
-        webhook_secret: process.env.WHOP_CONNECTED_WEBHOOK_SECRET?.trim() || undefined,
+        webhook_secret: connectedWebhookSecret() || undefined,
       },
     };
   }
