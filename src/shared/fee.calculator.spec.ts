@@ -4,11 +4,31 @@ import {
   calculatePayoutFees,
   calculateSaleFees,
   payoutCurrencyForMethod,
+  publicFeeBreakdown,
   DEFAULT_FEE_SETTINGS,
   saleFeePct,
   sellerFeesFromRow,
   sellerFeesRow,
 } from './fee.calculator'
+
+describe('publicFeeBreakdown', () => {
+  it('turns the stored breakdown into separate USD fees with their rates', () => {
+    const { breakdown } = calculateSaleFees(10000, DEFAULT_FEE_SETTINGS, { currencyConverted: true, now: new Date('2026-09-15T12:00:00Z') })
+    expect(publicFeeBreakdown(breakdown)).toEqual({
+      processing: 8.9,
+      orchestration: 0.9,
+      checkout: 1.9,
+      fixed: 0.59,
+      fx: 2,
+      rates: { processingPct: 8.9, orchestrationPct: 0.9, checkoutPct: 1.9, fixedUsd: 0.59, fxPct: 2 },
+    })
+  })
+
+  it('returns null for sales before the fee model', () => {
+    expect(publicFeeBreakdown(null)).toBeNull()
+    expect(publicFeeBreakdown({ some: 'legacy' })).toBeNull()
+  })
+})
 
 describe('calculateSaleFees', () => {
   it('applies every rate on the gross USD amount and the reserve on what is left', () => {
