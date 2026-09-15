@@ -16,6 +16,7 @@ import {
   WalletDashModule,
 } from '../dashboard/modules/dashboard.module';
 import { OnboardingModule } from '../onboarding/onboarding.module';
+import { AnticipationService } from '../wallets/anticipation.service';
 
 @Module({
   // WalletDashModule exporta o WalletService — o saldo do card da home do
@@ -32,6 +33,6 @@ import { OnboardingModule } from '../onboarding/onboarding.module';
     OnboardingModule,
   ],
   controllers: [KoopfyIntegrationController, KoopfyFinanceController],
-  providers: [KoopfyIntegrationService, KoopfyFinanceService, StorageService],
+  providers: [KoopfyIntegrationService, KoopfyFinanceService, StorageService, AnticipationService],
 })
 export class KoopfyIntegrationModule {}

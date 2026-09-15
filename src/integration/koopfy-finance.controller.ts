@@ -39,6 +39,17 @@ export class KoopfyFinanceController {
     return this.finance.getWallet(req.sellerCtx);
   }
 
+  // Antecipação do saldo a liquidar (habilitada por seller no CRM).
+  @Get('anticipation')
+  anticipationQuote(@Req() req: any) {
+    return this.finance.getAnticipationQuote(req.sellerCtx);
+  }
+
+  @Post('anticipation')
+  anticipate(@Req() req: any, @Body() body: Record<string, unknown>) {
+    return this.finance.anticipate(req.sellerCtx, body ?? {});
+  }
+
   @Get('wallet/entries')
   walletEntries(@Req() req: any, @Query() query: Record<string, unknown>) {
     return this.finance.listWalletEntries(req.sellerCtx, query);

@@ -26,6 +26,9 @@ export interface FeeSettings {
   payoutFeePct: number
   payoutFeeFixedUsd: number
   payoutFxFeePct: number
+  /** Seller pode antecipar o saldo a liquidar pagando `anticipationFeePct`. */
+  anticipationEnabled: boolean
+  anticipationFeePct: number
 }
 
 export interface SellerFees extends FeeSettings {
@@ -47,6 +50,8 @@ export const DEFAULT_FEE_SETTINGS: FeeSettings = {
   payoutFeePct: 0,
   payoutFeeFixedUsd: 0,
   payoutFxFeePct: 2,
+  anticipationEnabled: false,
+  anticipationFeePct: 4.99,
 }
 
 /** Tarifa de quem não tem linha em seller_fees (a mesma para venda e renovação). */
@@ -74,7 +79,8 @@ export function sellerFeesRow(fees: FeeSettings) {
     payout_fee_fixed_usd: fees.payoutFeeFixedUsd,
     payout_fx_fee_pct: fees.payoutFxFeePct,
     fee_percentage: saleFeePct(fees),
-    anticipation_fee_pct: 0,
+    anticipation_enabled: fees.anticipationEnabled,
+    anticipation_fee_pct: fees.anticipationFeePct,
   }
 }
 
@@ -109,6 +115,8 @@ export function sellerFeesFromRow(data: Record<string, any>): SellerFees {
     payoutFeePct: num(data.payout_fee_pct, D.payoutFeePct),
     payoutFeeFixedUsd: num(data.payout_fee_fixed_usd, D.payoutFeeFixedUsd),
     payoutFxFeePct: num(data.payout_fx_fee_pct, D.payoutFxFeePct),
+    anticipationEnabled: data.anticipation_enabled === true,
+    anticipationFeePct: num(data.anticipation_fee_pct, D.anticipationFeePct),
   }
 }
 
@@ -238,6 +246,15 @@ export function calculatePayoutFees(
     ? Math.min(amount - feeCents, Math.round(((amount - feeCents) * fees.payoutFxFeePct) / 100))
     : 0
   return { amountCents: amount, feeCents, fxFeeCents, netCents: amount - feeCents - fxFeeCents }
+}
+
+// ─── Antecipação ──────────────────────────────────────────────────────────────
+
+/** Antecipação do saldo a liquidar: a taxa incide sobre todo o valor antecipado. */
+export function calculateAnticipation(pendingCents: number, fees: FeeSettings) {
+  const pending = Math.max(0, Math.round(pendingCents))
+  const feeCents = Math.min(pending, Math.round((pending * fees.anticipationFeePct) / 100))
+  return { pendingCents: pending, feeCents, netCents: pending - feeCents }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

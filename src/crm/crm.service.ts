@@ -12,7 +12,7 @@ import { ClipAccountsService } from '../orchestrator/clip/clip-accounts.service'
 import { WebhookService } from '../webhooks/webhook.service'
 import { notifySellerAccount } from '../utils/seller-mail'
 import { DEFAULT_FEE_SETTINGS, getSellerFees, sellerFeesRow, type FeeSettings } from '../shared/fee.calculator'
-import { FEE_FIELDS, feeChanges, parseFeeSettings } from './fee-config'
+import { FEE_FIELDS, FEE_TOGGLES, feeChanges, parseFeeSettings } from './fee-config'
 import * as bcrypt from 'bcrypt'
 
 
@@ -730,7 +730,10 @@ export class CrmService {
   getFeeDefaults() {
     return {
       defaults: sellerFeesRow(DEFAULT_FEE_SETTINGS),
-      fields: FEE_FIELDS.map(({ key, column, min, max, integer, label }) => ({ key, column, min, max, integer: !!integer, label })),
+      fields: [
+        ...FEE_FIELDS.map(({ key, column, min, max, integer, label }) => ({ key, column, min, max, integer: !!integer, boolean: false, label })),
+        ...FEE_TOGGLES.map(({ key, column, label }) => ({ key, column, min: 0, max: 1, integer: true, boolean: true, label })),
+      ],
     }
   }
 

@@ -3,8 +3,10 @@
 import { BadRequestException } from '@nestjs/common'
 import { DEFAULT_FEE_SETTINGS, type FeeSettings } from '../shared/fee.calculator'
 
+type NumericFeeKey = Exclude<keyof FeeSettings, 'anticipationEnabled'>
+
 interface FeeField {
-  key: keyof FeeSettings
+  key: NumericFeeKey
   column: string
   min: number
   max: number
@@ -26,6 +28,12 @@ export const FEE_FIELDS: FeeField[] = [
   { key: 'payoutFeePct', column: 'payout_fee_pct', min: 0, max: 50, label: 'Taxa de saque (%)' },
   { key: 'payoutFeeFixedUsd', column: 'payout_fee_fixed_usd', min: 0, max: 1000, label: 'Taxa fixa de saque (USD)' },
   { key: 'payoutFxFeePct', column: 'payout_fx_fee_pct', min: 0, max: 20, label: 'Spread de saque em outra moeda (%)' },
+  { key: 'anticipationFeePct', column: 'anticipation_fee_pct', min: 0, max: 50, label: 'Taxa de antecipação (%)' },
+]
+
+/** Liga/desliga por seller. */
+export const FEE_TOGGLES: Array<{ key: 'anticipationEnabled'; column: string; label: string }> = [
+  { key: 'anticipationEnabled', column: 'anticipation_enabled', label: 'Antecipação habilitada' },
 ]
 
 /**
@@ -53,6 +61,14 @@ export function parseFeeSettings(input: unknown, base: FeeSettings = DEFAULT_FEE
     result[field.key] = Math.round(value * 100) / 100
   }
 
+  for (const toggle of FEE_TOGGLES) {
+    const raw = source[toggle.key] ?? source[toggle.column]
+    if (raw === undefined || raw === null || raw === '') continue
+    if (raw === true || raw === 1 || raw === '1' || raw === 'true') result[toggle.key] = true
+    else if (raw === false || raw === 0 || raw === '0' || raw === 'false') result[toggle.key] = false
+    else errors.push(`${toggle.label}: use sim ou não.`)
+  }
+
   // Mensagem em texto: o CRM mostra só `message`.
   if (errors.length) throw new BadRequestException(`Taxas inválidas. ${errors.join(' ')}`)
   return result
@@ -61,6 +77,8 @@ export function parseFeeSettings(input: unknown, base: FeeSettings = DEFAULT_FEE
 /** O que mudou entre duas tarifas (para o log de auditoria). */
 export function feeChanges(before: FeeSettings, after: FeeSettings) {
   return Object.fromEntries(
-    FEE_FIELDS.filter((f) => before[f.key] !== after[f.key]).map((f) => [f.column, { from: before[f.key], to: after[f.key] }]),
+    [...FEE_FIELDS, ...FEE_TOGGLES]
+      .filter((f) => before[f.key] !== after[f.key])
+      .map((f) => [f.column, { from: before[f.key], to: after[f.key] }]),
   )
 }

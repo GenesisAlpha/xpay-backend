@@ -15,6 +15,7 @@ import {
 } from '../dashboard/services/services';
 import { RequestPayoutDto } from '../dashboard/dto/request-payout.dto';
 import { SellerCtx } from './cross-service-jwt.guard';
+import { AnticipationService } from '../wallets/anticipation.service';
 import { normalizeFinanceListQuery } from './koopfy-finance-query';
 
 const TRANSACTION_STATUSES = [
@@ -127,6 +128,7 @@ export class KoopfyFinanceService {
     private readonly methods: PaymentMethodsService,
     private readonly settings: SettingsService,
     private readonly apiKeys: ApiKeysService,
+    private readonly anticipation?: AnticipationService,
   ) {}
 
   private seller(ctx: SellerCtx) {
@@ -197,6 +199,19 @@ export class KoopfyFinanceService {
       orderShipped: Boolean(entry.orderShipped),
       trackingCode: entry.trackingCode ?? null,
     }));
+  }
+
+  async getAnticipationQuote(ctx: SellerCtx) {
+    return this.anticipationService().quote(this.seller(ctx).id);
+  }
+
+  async anticipate(ctx: SellerCtx, body: Record<string, unknown>) {
+    return this.anticipationService().anticipate(this.seller(ctx).id, body ?? {});
+  }
+
+  private anticipationService() {
+    if (!this.anticipation) throw new ConflictException('Antecipação indisponível no momento.');
+    return this.anticipation;
   }
 
   async listPayouts(ctx: SellerCtx, raw: Record<string, unknown>) {

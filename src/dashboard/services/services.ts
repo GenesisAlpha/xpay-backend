@@ -245,14 +245,14 @@ export class WalletService {
       .range(from, to)
 
     if (type && type !== 'all') {
-      if (type === 'credit') q = q.in('type', ['credit_pending', 'credit_available', 'release_to_available'])
-      if (type === 'debit') q = q.in('type', ['debit_payout', 'fee_platform'])
+      if (type === 'credit') q = q.in('type', ['credit_pending', 'credit_available', 'release_to_available', 'anticipation_release'])
+      if (type === 'debit') q = q.in('type', ['debit_payout', 'fee_platform', 'anticipation_fee', 'chargeback_fee', 'chargeback_alert_fee', 'chargeback_debit', 'refund'])
     }
 
     const { data, error, count } = await q
     if (error) throw new BadRequestException(error.message)
 
-    const CREDIT_TYPES = ['credit_pending', 'credit_available', 'release_to_available']
+    const CREDIT_TYPES = ['credit_pending', 'credit_available', 'release_to_available', 'anticipation_release']
 
     // 🚚 Busca o tracking das transações de origem (só p/ entradas de crédito = venda)
     const creditTxIds = [...new Set(
@@ -410,6 +410,12 @@ export class WalletService {
       fee_platform: 'Taxa da plataforma',
       release_to_available: 'Reserva liberada',
       debit_payout: 'Saque realizado',
+      anticipation_release: 'Antecipação de valores a liquidar',
+      anticipation_fee: 'Taxa de antecipação',
+      chargeback_debit: 'Chargeback',
+      chargeback_fee: 'Taxa de chargeback',
+      chargeback_alert_fee: 'Taxa de alerta de chargeback',
+      refund: 'Estorno',
     }
     return map[type] ?? type
   }
@@ -973,13 +979,13 @@ export class PaymentMethodsService {
     const enabledMethods: string[] = profile?.enabled_methods ?? []
     const isWhopSeller = String(profile?.provider_default ?? '').toLowerCase().replace(/provider$/, '') === 'whop'
 
-    // Tarifa efetiva (a do seller ou o padrão). Antecipação saiu do modelo.
+    // Tarifa efetiva (a do seller ou o padrão).
     const sellerFees = await getEffectiveSellerFees(sellerId)
     const feePercentage = saleFeePct(sellerFees)
     const feeFixedUsd = sellerFees.feeFixedUsd
     const settlementDays = sellerFees.settlementDays
     const reservePct = sellerFees.reservePercentage
-    const anticipationPct = 0
+    const anticipationPct = sellerFees.anticipationEnabled ? sellerFees.anticipationFeePct : 0
     const feesFormatted = `${feePercentage}% + $${Number(feeFixedUsd).toFixed(2)}`
 
     const { data: providers } = await supabase
