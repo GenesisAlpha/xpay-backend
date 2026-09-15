@@ -2,7 +2,7 @@ import {
   Injectable, NotFoundException, BadRequestException, ForbiddenException,
 } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
-import { CHARGEBACK_FEE_USD } from '../shared/fee.calculator'
+import { getEffectiveSellerFees } from '../shared/fee.calculator'
 import { notifySellerPayout, type PayoutEmailInfo } from '../utils/seller-mail'
 
 // Linha do ledger (debit_payout) → dados do e-mail de saque. O destino fica em
@@ -1149,10 +1149,16 @@ export class CrmAdminService {
       resolution_notes: dto.notes ?? null,
     }).eq('id', id)
 
-    // ── Debita o seller: valor do chargeback + taxa fixa de $50 ──────────────
-    // Não trava se faltar saldo — registra para reconciliação manual.
+    // ── Debita o seller: valor do chargeback + taxa de chargeback do seller ───
+    // Não trava se faltar saldo — registra para reconciliação manual. Se a venda
+    // já pagou a taxa num alerta de chargeback (Whop), não cobra de novo.
     const now = new Date().toISOString()
-    const feeCents = CHARGEBACK_FEE_USD * 100
+    const sellerFees = await getEffectiveSellerFees(cb.seller_id)
+    const { data: alertFee } = cb.transaction_id
+      ? await supabase.from('wallet_ledger').select('id')
+        .eq('transaction_id', cb.transaction_id).eq('type', 'chargeback_alert_fee').maybeSingle()
+      : { data: null }
+    const feeCents = alertFee ? 0 : Math.round(sellerFees.chargebackFeeUsd * 100)
     const amountCents = Number(cb.amount_cents ?? 0)
     const totalCents = amountCents + feeCents
 
@@ -1181,7 +1187,7 @@ export class CrmAdminService {
         metadata: meta('amount'),
         created_at: now,
       }] : []),
-      {
+      ...(feeCents > 0 ? [{
         seller_id: cb.seller_id,
         transaction_id: cb.id,
         type: 'chargeback_fee',
@@ -1190,7 +1196,7 @@ export class CrmAdminService {
         status: ledgerStatus,
         metadata: meta('fee'),
         created_at: now,
-      },
+      }] : []),
     ])
 
     if (debitErr) {

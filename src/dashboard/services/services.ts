@@ -9,6 +9,7 @@ import * as bcrypt from 'bcrypt';
 import { generateKey, hashKey } from '../../utils/apikeys.utils';
 import * as crypto from 'crypto';
 import { notifySellerPayout } from '../../utils/seller-mail';
+import { getEffectiveSellerFees, saleFeePct } from '../../shared/fee.calculator';
 import {
   BLOCKED_METHODS,
   IDEMPOTENCY_KEY_PATTERN,
@@ -972,15 +973,14 @@ export class PaymentMethodsService {
     const enabledMethods: string[] = profile?.enabled_methods ?? []
     const isWhopSeller = String(profile?.provider_default ?? '').toLowerCase().replace(/provider$/, '') === 'whop'
 
-    const { data: sellerFees } = await supabase
-      .from('seller_fees').select('*').eq('seller_id', sellerId).maybeSingle()
-
-    const feePercentage = sellerFees?.fee_percentage ?? 0
-    const feeFixedUsd = sellerFees?.fee_fixed_usd ?? 0
-    const settlementDays = sellerFees?.settlement_days ?? 3
-    const reservePct = sellerFees?.reserve_percentage ?? 0
-    const anticipationPct = sellerFees?.anticipation_fee_pct ?? 4.99
-    const feesFormatted = sellerFees ? `${feePercentage}% + $${Number(feeFixedUsd).toFixed(2)}` : '—'
+    // Tarifa efetiva (a do seller ou o padrão). Antecipação saiu do modelo.
+    const sellerFees = await getEffectiveSellerFees(sellerId)
+    const feePercentage = saleFeePct(sellerFees)
+    const feeFixedUsd = sellerFees.feeFixedUsd
+    const settlementDays = sellerFees.settlementDays
+    const reservePct = sellerFees.reservePercentage
+    const anticipationPct = 0
+    const feesFormatted = `${feePercentage}% + $${Number(feeFixedUsd).toFixed(2)}`
 
     const { data: providers } = await supabase
       .from('provider_accounts').select('id, provider, supported_methods, status').eq('status', 'active')

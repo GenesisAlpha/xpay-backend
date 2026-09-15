@@ -12,7 +12,7 @@ import { StripeRiskService } from '../orchestrator/stripe/stripe-risk.service'
 import { StripeEfwService } from '../orchestrator/stripe/stripe-efw.service'
 import { AffiliateRiskService } from '../orchestrator/stripe/affiliate-risk.service'
 import { CurrencyService } from '../currency/currency.service'
-import { getSellerFees } from '../shared/fee.calculator'
+import { getEffectiveSellerFees } from '../shared/fee.calculator'
 import {
   isWhopRenewalPayment,
   renewalEconomics,
@@ -755,6 +755,11 @@ export class WebhookService {
       return this.handleWhopDispute(accountId, account, eventType, body)
     }
 
+    // ── 4a. Alerta antecipado de chargeback — cobra a taxa de chargeback ──
+    if (eventType === 'dispute_alert.created') {
+      return this.handleWhopDisputeAlert(accountId, account, body)
+    }
+
     // ── 4b. Renovação de assinatura ──
     // A cobrança do ciclo herda o metadata da compra e casaria com a transação
     // ORIGINAL (já aprovada). Não é ela: a renovação paga vira transação filha,
@@ -943,14 +948,16 @@ export class WebhookService {
     if (!amount || !currency) throw new Error(`Whop: renovação ${paymentId} sem valor ou moeda`)
 
     // Câmbio do dia da renovação — não o da compra original.
-    const fx = await this.currencyService.convertToUSDWithFee(amount / 100, currency)
-    const netUSDcents = Math.round(fx.netUSD * 100)
-
-    const { externalFeeDropped, ...fees } = renewalEconomics({
-      netUSDcents,
-      sellerFees: await getSellerFees(parent.seller_id),
+    const fx = await this.currencyService.convertToUSD(amount / 100, currency)
+    const sellerFees = await getEffectiveSellerFees(parent.seller_id)
+    const currencyConverted = currency !== 'USD'
+    const { externalFeeDropped, breakdown, usd, ...fees } = renewalEconomics({
+      grossUSDcents: Math.round(fx.grossUSD * 100),
+      currencyConverted,
+      sellerFees,
       parent,
     })
+    const netUSDcents = usd.netCents
     if (externalFeeDropped) {
       console.error(
         `[WebhookService] renovação ${paymentId}: comissão do parceiro maior que o líquido — ` +
@@ -974,9 +981,9 @@ export class WebhookService {
         currency,
         method: parent.method ?? 'card',
         amount_usd_net_cents: netUSDcents,
-        amount_usd_gross_cents: Math.round(fx.grossUSD * 100),
-        fx_fee_cents: Math.round(fx.feeUSD * 100),
-        fx_rate: fx.fxFinalRate,
+        amount_usd_gross_cents: usd.grossCents,
+        fx_fee_cents: usd.fxFeeCents,
+        fx_rate: currencyConverted ? fx.fxMarketRate * (1 - sellerFees.fxFeePct / 100) : 1,
         status: 'pending',
         provider: parent.provider ?? 'whop',
         provider_status: data?.status ?? null,
@@ -1013,6 +1020,11 @@ export class WebhookService {
       if (raced) return raced.id as string
       throw new Error(`Whop: falha ao criar a transação da renovação ${paymentId} (${error?.message})`)
     }
+    // Detalhe das taxas à parte: sem a coluna (migration pendente) não derruba a renovação.
+    supabase.from('transactions').update({ fee_breakdown: breakdown }).eq('id', created.id)
+      .then(({ error: breakdownError }) => {
+        if (breakdownError) console.error('[WebhookService] fee_breakdown da renovação:', breakdownError.message)
+      })
     return created.id as string
   }
 
@@ -1248,6 +1260,88 @@ export class WebhookService {
     }
 
     return { received: true, disputed: true, linked: true }
+  }
+
+  // Alerta antecipado de chargeback (Visa/Mastercard, via Whop). A Whop pode
+  // estornar a venda sozinha para não virar chargeback — o estorno chega depois
+  // em refund.created e segue o fluxo normal de reembolso. O alerta cobra do
+  // seller a taxa de chargeback (seller_fees.chargeback_fee_usd, padrão US$ 30)
+  // uma vez por venda: o ledger é idempotente por transação + tipo, e se a venda
+  // ainda virar chargeback, acceptChargeback não cobra a taxa de novo.
+  private async handleWhopDisputeAlert(
+    accountId: string,
+    account: { config?: Record<string, any> },
+    body: any,
+  ) {
+    const data = body?.data ?? {}
+    const payment = data?.payment && typeof data.payment === 'object' ? data.payment : null
+    const paymentId: string | null = payment?.id ?? data?.payment_id ?? null
+
+    const candidates = [
+      payment ? { data: payment } : null,
+      paymentId ? { data: { id: paymentId, metadata: data?.metadata ?? {} } } : null,
+      body,
+    ].filter(Boolean)
+    let ref: { id: string } | null = null
+    for (const candidate of candidates) {
+      ref = await this.resolveWhopTx(candidate)
+      if (ref) break
+    }
+    const { data: tx } = ref
+      ? await supabase.from('transactions').select('*').eq('id', ref.id).maybeSingle()
+      : { data: null as any }
+
+    const alertId = String(data?.id ?? `da_whop_${Date.now()}`)
+    const amountMajor = Number(data?.amount ?? payment?.amount ?? NaN)
+    const currency = data?.currency ?? payment?.currency ?? tx?.currency ?? null
+    const reason = data?.reason ?? data?.alert_type ?? data?.type ?? null
+
+    await this.stripeRisk.recordRiskEvent({
+      id: `alert:${alertId}`,
+      accountId,
+      kind: 'dispute',
+      reason,
+      amountCents: Number.isFinite(amountMajor) ? Math.round(amountMajor * 100) : null,
+      currency: currency ? String(currency).toLowerCase() : null,
+      paymentIntentId: paymentId,
+      transactionId: tx?.id ?? null,
+      payload: { provider: 'whop', eventType: 'dispute_alert.created', alert: true },
+    })
+
+    console.error(
+      `[WebhookService] ⚠️ ALERTA DE CHARGEBACK Whop em ${accountId} ` +
+      `(${account.config?.legal_name ?? 'titular não identificado'}): alerta=${alertId} ` +
+      `motivo="${reason ?? '?'}" tx=${tx?.id ?? 'não vinculada'}.`,
+    )
+
+    if (!tx) {
+      console.warn('[WebhookService] alerta de chargeback Whop sem transação vinculada:', JSON.stringify(data).slice(0, 500))
+      return { received: true, alert: true, linked: false }
+    }
+
+    const alert = {
+      id: alertId,
+      reason,
+      amount: Number.isFinite(amountMajor) ? amountMajor : null,
+      currency,
+      received_at: new Date().toISOString(),
+    }
+    await supabase.from('transactions')
+      .update({ metadata: { ...(tx.metadata ?? {}), whop_dispute_alert: alert } })
+      .eq('id', tx.id)
+
+    let feeCents = 0
+    if (tx.seller_id) {
+      const sellerFees = await getEffectiveSellerFees(tx.seller_id)
+      feeCents = Math.round(sellerFees.chargebackFeeUsd * 100)
+      if (feeCents > 0) {
+        await this.reverseBalance(tx.seller_id, 'available', feeCents, tx.id, 'chargeback_alert_fee')
+      }
+      await this.affiliateRisk.evaluateOne(tx.seller_id)
+        .catch(err => console.error('[WebhookService] affiliateRisk (alerta whop):', err?.message))
+    }
+
+    return { received: true, alert: true, linked: true, feeCents }
   }
 
   private warnOnWhopAmountMismatch(tx: { id: string }, data: any) {

@@ -5,7 +5,7 @@ import { supabase } from '../lib/supabase.client'
 import { CurrencyService } from '../currency/currency.service'
 import { WalletService } from '../wallets/wallet.service'
 import { AccountRouterService } from '../orchestrator/router/account-router.service'
-import { getSellerFees, calculateFees, DEFAULT_SELLER_FEES } from '../shared/fee.calculator'
+import { calculateSaleFees, getEffectiveSellerFees, saleFeePct } from '../shared/fee.calculator'
 import { validateMbwayPhone } from '../utils/mbway.validator'
 import { RetrieveResponse } from '../orchestrator/providers/provider.types'
 import { CardCryptoService } from '../crypto/card-crypto.service'
@@ -192,12 +192,18 @@ export class PaymentService {
             })
         }
 
-        const fx = await this.currencyService.convertToUSDWithFee(amount / 100, currency)
-        __mark('convertToUSDWithFee')
-        const grossUSDcents = Math.round(fx.grossUSD * 100)
-        const fxFeeUSDcents = Math.round(fx.feeUSD * 100)
-        const netUSDcents = Math.round(fx.netUSD * 100)
-        const fxFinalRate = fx.fxFinalRate
+        const fx = await this.currencyService.convertToUSD(amount / 100, currency)
+        __mark('convertToUSD')
+        // Taxas do seller (seller_fees, padrão em fee.calculator): todas sobre o
+        // bruto em USD; a de conversão só quando a venda não é em USD.
+        const sellerFees = await getEffectiveSellerFees(effectiveSellerId)
+        const currencyConverted = String(currency).toUpperCase() !== 'USD'
+        const saleFees = calculateSaleFees(Math.round(fx.grossUSD * 100), sellerFees, { currencyConverted })
+        __mark('calculateSaleFees')
+        const grossUSDcents = saleFees.grossCents
+        const fxFeeUSDcents = saleFees.fxFeeCents
+        const netUSDcents = grossUSDcents - fxFeeUSDcents
+        const fxFinalRate = currencyConverted ? fx.fxMarketRate * (1 - sellerFees.fxFeePct / 100) : 1
 
         // ─── External fee ──────────────────────────────────────────────────────
 
@@ -552,29 +558,13 @@ export class PaymentService {
             )
         }
 
-        // ─── Calcula taxas ─────────────────────────────────────────────────────
-        // ⏸️ Cross-border em STANDBY até definirmos como captar o país do cartão.
-        //    Infra pronta p/ reativar: provider-accounts.config.country (país de
-        //    settlement) + computeSurchargePct({ crossBorder }) no fee.calculator.
-        const isCrossBorder = false
-
-        const sellerFees = await getSellerFees(effectiveSellerId)
-        const baseFee = sellerFees
-            ? calculateFees(netUSDcents / 100, sellerFees, {
-                paymentMethod: dto.method,
-                cardBrand: dto.payment_data?.cardBrand,   // amex / diners → +2%
-                walletMethod: dto.method,                 // apple_pay / google_pay → +1%
-                crossBorder: isCrossBorder,               // ⏸️ standby
-                provider: providerName,                   // coinflow → +1.5% proteção
-            })
-            : this.defaultFeeResult(netUSDcents, providerName)
-
-        const platformFeeCents = Math.round(baseFee.platformFee * 100)
-        // Parcela de proteção de chargeback (já está DENTRO do platformFee acima).
-        const chargebackProtectionFeeCents = Math.round(baseFee.chargebackProtectionFee * 100)
-        const reserveAmountCents = Math.round(baseFee.reserveAmount * 100)
+        // ─── Taxas ─────────────────────────────────────────────────────────────
+        // Já calculadas junto da conversão (saleFees): checkout + processamento +
+        // orquestração + fixa, e a reserva sobre o que sobra.
+        const platformFeeCents = saleFees.platformFeeCents
+        const reserveAmountCents = saleFees.reserveCents
         const externalFeeCents = externalFee?.amount_cents ?? 0
-        const baseNetCents = Math.round(baseFee.netAmount * 100)
+        const baseNetCents = saleFees.netCents
         const sellerNetCents = baseNetCents - externalFeeCents
 
         if (sellerNetCents < 0) {
@@ -596,7 +586,7 @@ export class PaymentService {
             grossUSDcents,
             fxFeeUSDcents,
             fxFinalRate,
-            sellerFeePct: sellerFees?.feePercentage ?? 9.99,
+            sellerFeePct: saleFeePct(sellerFees),
             // Reserve é retido (não distribuído agora) — entra na sanity check
             // pra fechar net = seller + platform + external + reserve.
             reserveCents: reserveAmountCents,
@@ -803,13 +793,18 @@ export class PaymentService {
             failure_code: result.failureCode ?? null,
             failure_message: result.failureMessage ?? null,
             fee: platformFeeCents,
-            chargeback_protection_fee: chargebackProtectionFeeCents,
+            chargeback_protection_fee: 0,
             net_amount: sellerNetCents,
             reserve_amount: reserveAmountCents,
-            available_at: baseFee.availableAt.toISOString(),
-            reserve_until: baseFee.reserveUntil.toISOString(),
+            available_at: saleFees.availableAt.toISOString(),
+            reserve_until: saleFees.reserveUntil.toISOString(),
             processed_at: now,
         }).eq('id', transaction.id)
+
+        // Detalhe por tipo de taxa, em gravação separada: se a coluna ainda não
+        // existir (migration pendente), não derruba o update que credita o seller.
+        supabase.from('transactions').update({ fee_breakdown: saleFees.breakdown }).eq('id', transaction.id)
+            .then(({ error }) => { if (error) console.error('[PaymentService] fee_breakdown:', error.message) })
 
         // Aprovação imediata (simulator) precisa do update já persistido, porque
         // handleWebhookProvider (logo abaixo) RELÊ a transação do banco — sem
@@ -1922,10 +1917,6 @@ export class PaymentService {
             .select('id, status, risk_level, enabled_methods, config, metadata, user_id, provider_default, provider_mid, country')
             .eq('id', id).single()
         return data
-    }
-
-    private defaultFeeResult(netUSDcents: number, provider?: string) {
-        return calculateFees(netUSDcents / 100, DEFAULT_SELLER_FEES, { provider })
     }
 
     async registerKpi(data: { sellerId: string; method: string; amount: number; fee: number; status: string }) {

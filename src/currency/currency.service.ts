@@ -8,11 +8,8 @@ interface CacheEntry {
 
 interface FxResult {
     fxMarketRate: number;
-    fxFinalRate: number;
-    fxSource: string;   
+    fxSource: string;
     grossUSD: number;
-    feeUSD: number;
-    netUSD: number;
 }
 
 @Injectable()
@@ -22,7 +19,6 @@ export class CurrencyService {
     private cache: Map<string, CacheEntry> = new Map();
     private readonly CACHE_TTL_MS = 60_000; // 60 segundos
 
-    private readonly PLATFORM_FX_FEE = 0.02;
     private readonly APP_ID = process.env.OXR_APP_ID;
 
     // ─── Fetch de rates ───────────────────────────────────────────────────────
@@ -60,64 +56,23 @@ export class CurrencyService {
 
     // ─── Conversão principal ──────────────────────────────────────────────────
 
-    async convertToUSDWithFee(amount: number, currency: string): Promise<FxResult> {
+    /**
+     * Converte para USD pela cotação de mercado. A taxa de conversão da Koopfy
+     * não entra aqui: é do seller (seller_fees.fx_fee_pct) e só incide quando a
+     * moeda não é USD — ver calculateSaleFees.
+     */
+    async convertToUSD(amount: number, currency: string): Promise<FxResult> {
         currency = currency.toUpperCase();
 
-        // USD direto — sem chamada externa
-        if (currency === 'USD') {
-            const fxMarketRate = 1;
-            const fxFinalRate  = 1 * (1 - this.PLATFORM_FX_FEE);
-            const grossUSD     = amount;
-            const feeUSD       = grossUSD * this.PLATFORM_FX_FEE;
-            const netUSD       = grossUSD - feeUSD;
+        if (currency === 'USD') return { fxMarketRate: 1, fxSource: 'internal', grossUSD: amount };
 
-            return {
-                fxMarketRate,
-                fxFinalRate,
-                fxSource: 'internal',  // 🔥 sempre presente
-                grossUSD,
-                feeUSD,
-                netUSD,
-            };
-        }
-
-        // Cache hit
         const cached = this.getCached(currency);
-        if (cached) {
-            const fxMarketRate = cached;
-            const fxFinalRate  = fxMarketRate * (1 - this.PLATFORM_FX_FEE);
-            const grossUSD     = amount * fxMarketRate;
-            const feeUSD       = grossUSD * this.PLATFORM_FX_FEE;
-            const netUSD       = grossUSD - feeUSD;
+        if (cached) return { fxMarketRate: cached, fxSource: 'cache', grossUSD: amount * cached };
 
-            return {
-                fxMarketRate,
-                fxFinalRate,
-                fxSource: 'cache',    // 🔥 sempre presente
-                grossUSD,
-                feeUSD,
-                netUSD,
-            };
-        }
-
-        // Fetch externo
         const fxMarketRate = await this.getRate(currency, 'USD');
         if (!fxMarketRate) throw new Error('Invalid FX rate');
-
         this.setCached(currency, fxMarketRate);
 
-        const fxFinalRate = fxMarketRate * (1 - this.PLATFORM_FX_FEE);
-        const grossUSD    = amount * fxMarketRate;
-        const feeUSD      = grossUSD * this.PLATFORM_FX_FEE;
-        const netUSD      = grossUSD - feeUSD;
-
-        return {
-            fxMarketRate,
-            fxFinalRate,
-            fxSource: 'openexchangerates',  
-            grossUSD,
-            feeUSD,
-            netUSD,
-        };
+        return { fxMarketRate, fxSource: 'openexchangerates', grossUSD: amount * fxMarketRate };
     }
 }

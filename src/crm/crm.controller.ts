@@ -108,6 +108,7 @@ export class CrmController {
       riskLevel: 'WHITE' | 'GRAY' | 'BLACK'
       enabledMethods: string[]
       feeOverride?: any
+      fees?: any
       notes?: string
       /** Grupo de WhatsApp da operação logística — o grupo já existe na aprovação. */
       logisticsGroupUrl?: string | null
@@ -271,6 +272,12 @@ export class CrmController {
     @Body() body: { riskLevel: 'WHITE' | 'GRAY' | 'BLACK'; reason: string },
   ) {
     return this.crm.changeRiskLevel(id, req.manager.sub, body)
+  }
+
+  @Get('fee-defaults')
+  @UseGuards(CrmAuthGuard)
+  feeDefaults() {
+    return this.crm.getFeeDefaults()
   }
 
   @Patch('sellers/:id/fees')

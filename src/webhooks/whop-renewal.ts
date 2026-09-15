@@ -14,7 +14,7 @@
 //    USD com o câmbio do dia — nunca recalculado a partir do plano;
 //  • idempotência pelo id do payment (pay_xxx), gravado em provider_transaction_id.
 
-import { calculateFees, DEFAULT_SELLER_FEES, type SellerFees } from '../shared/fee.calculator'
+import { calculateSaleFees, DEFAULT_SELLER_FEES, type SellerFees } from '../shared/fee.calculator'
 
 export const WHOP_RENEWAL_BILLING_REASON = 'subscription_cycle'
 
@@ -67,25 +67,24 @@ export interface RenewalParentFees {
 }
 
 /**
- * Taxas da renovação — mesma conta de createPayment: taxa da plataforma sobre o
- * líquido em USD, reserva, e o external_fee (comissão do parceiro) herdado da
- * compra original. Percentual é reaplicado; valor fixo acompanha a proporção do
- * líquido, para a comissão não passar do que a renovação rende.
+ * Taxas da renovação — mesma conta de createPayment: taxas do seller sobre o
+ * bruto em USD (conversão só fora do USD), reserva, e o external_fee (comissão
+ * do parceiro) herdado da compra original. Percentual é reaplicado; valor fixo
+ * acompanha a proporção do líquido, para a comissão não passar do que a
+ * renovação rende.
  */
 export function renewalEconomics(args: {
-  netUSDcents: number
+  grossUSDcents: number
+  currencyConverted: boolean
   sellerFees: SellerFees | null
   parent: RenewalParentFees
 }) {
-  const { netUSDcents, parent } = args
-  const base = calculateFees(netUSDcents / 100, args.sellerFees ?? DEFAULT_SELLER_FEES, {
-    cardBrand: parent.payment_brand ?? undefined,
-    walletMethod: parent.method ?? undefined,
-    provider: parent.provider ?? undefined,
+  const { parent } = args
+  const base = calculateSaleFees(args.grossUSDcents, args.sellerFees ?? DEFAULT_SELLER_FEES, {
+    currencyConverted: args.currencyConverted,
   })
-
-  const platformFeeCents = Math.round(base.platformFee * 100)
-  const baseNetCents = Math.round(base.netAmount * 100)
+  const netUSDcents = base.grossCents - base.fxFeeCents
+  const baseNetCents = base.netCents
 
   let externalFeeCents = 0
   if (parent.external_fee_recipient_id) {
@@ -101,9 +100,9 @@ export function renewalEconomics(args: {
   if (externalFeeDropped) externalFeeCents = 0
 
   return {
-    fee: platformFeeCents,
-    chargeback_protection_fee: Math.round(base.chargebackProtectionFee * 100),
-    reserve_amount: Math.round(base.reserveAmount * 100),
+    fee: base.platformFeeCents,
+    chargeback_protection_fee: 0,
+    reserve_amount: base.reserveCents,
     net_amount: baseNetCents - externalFeeCents,
     available_at: base.availableAt.toISOString(),
     reserve_until: base.reserveUntil.toISOString(),
@@ -111,5 +110,8 @@ export function renewalEconomics(args: {
     external_fee_pct: externalFeeCents > 0 ? parent.external_fee_pct ?? null : null,
     external_fee_recipient_id: externalFeeCents > 0 ? parent.external_fee_recipient_id : null,
     externalFeeDropped,
+    /** Não são colunas do insert: quem chama grava à parte. */
+    breakdown: base.breakdown,
+    usd: { grossCents: base.grossCents, fxFeeCents: base.fxFeeCents, netCents: netUSDcents },
   }
 }

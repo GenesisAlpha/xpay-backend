@@ -879,6 +879,9 @@ export class WhopProvider {
           'membership.cancel_at_period_end_changed',
           'refund.created',
           'dispute.created',
+          // Alerta antecipado de chargeback (Visa/Mastercard): a Whop pode estornar
+          // a venda sozinha — a taxa de chargeback é cobrada do seller.
+          'dispute_alert.created',
         ],
         api_version: 'v1',
         enabled: true,

@@ -11,12 +11,10 @@ import { WhopProvider } from '../orchestrator/providers/whop.provider'
 import { ClipAccountsService } from '../orchestrator/clip/clip-accounts.service'
 import { WebhookService } from '../webhooks/webhook.service'
 import { notifySellerAccount } from '../utils/seller-mail'
+import { DEFAULT_FEE_SETTINGS, getSellerFees, sellerFeesRow, type FeeSettings } from '../shared/fee.calculator'
+import { FEE_FIELDS, feeChanges, parseFeeSettings } from './fee-config'
 import * as bcrypt from 'bcrypt'
 
-const FEE_TABLE = {
-  WHITE: { fee_percentage: 9.99, fee_fixed_usd: 0.59, settlement_days: 3, reserve_percentage: 10.00, reserve_hold_days: 90, anticipation_fee_pct: 4.99 },
-  GRAY: { fee_percentage: 14.99, fee_fixed_usd: 0.59, settlement_days: 3, reserve_percentage: 10.00, reserve_hold_days: 90, anticipation_fee_pct: 4.99 },
-} as const
 
 const VALID_PROVIDERS = ['stripe', 'viva', 'sibs', 'stripe_crypto', 'onramp', 'setinel_gate', 'approvebly', 'coinflow', 'rox_pay', 'whop', 'clip', 'simulator'] as const
 type ProviderDefault = typeof VALID_PROVIDERS[number] | null
@@ -422,13 +420,10 @@ export class CrmService {
   async approveSeller(sellerId: string, managerId: string, dto: {
     riskLevel: 'WHITE' | 'GRAY' | 'BLACK'
     enabledMethods: string[]
-    feeOverride?: {
-      fee_percentage?: number
-      fee_fixed_usd?: number
-      settlement_days?: number
-      reserve_percentage?: number
-      anticipation_fee_pct?: number
-    }
+    /** Taxas editadas na aprovação (camelCase ou nome da coluna); o resto fica no padrão. */
+    fees?: Record<string, unknown>
+    /** Nome antigo de `fees`. */
+    feeOverride?: Record<string, unknown>
     notes?: string
     /**
      * Grupo de WhatsApp da operação logística deste merchant. O grupo já existe
@@ -450,8 +445,11 @@ export class CrmService {
 
     const logisticsGroupUrl = normalizeWhatsappUrl(dto.logisticsGroupUrl)
 
-    const baseFees = FEE_TABLE[dto.riskLevel]
-    const fees = { ...baseFees, ...(dto.feeOverride ?? {}) }
+    // O risco não define mais a taxa: a aprovação parte do padrão (ou do que já
+    // está gravado) com o que o gerente editou no formulário.
+    const currentFees = await getSellerFees(sellerId)
+    const fees: FeeSettings = parseFeeSettings(dto.fees ?? dto.feeOverride, currentFees ?? DEFAULT_FEE_SETTINGS)
+    const customized = Object.keys(feeChanges(DEFAULT_FEE_SETTINGS, fees)).length > 0
 
     // 🔥 1. Atualiza seller_profile — new Date() para timestamps
     const { error: profileError } = await supabase
@@ -479,15 +477,10 @@ export class CrmService {
       .upsert({
         seller_id: sellerId,
         risk_level: dto.riskLevel,
-        fee_percentage: fees.fee_percentage,
-        fee_fixed_usd: fees.fee_fixed_usd,
-        settlement_days: fees.settlement_days,
-        reserve_percentage: fees.reserve_percentage,
-        reserve_hold_days: fees.reserve_hold_days ?? 90,
-        anticipation_fee_pct: fees.anticipation_fee_pct,
+        ...sellerFeesRow(fees),
         anticipation_days: 0,
-        overridden_by: dto.feeOverride ? managerId : null,
-        override_notes: dto.feeOverride ? (dto.notes ?? null) : null,
+        overridden_by: customized ? managerId : null,
+        override_notes: customized ? (dto.notes ?? null) : null,
         updated_at: new Date(),
       }, { onConflict: 'seller_id' })
 
@@ -513,15 +506,15 @@ export class CrmService {
     await this.log(sellerId, managerId, 'approved', {
       riskLevel: dto.riskLevel,
       enabledMethods: dto.enabledMethods,
-      feeOverride: dto.feeOverride,
+      fees: sellerFeesRow(fees),
       notes: dto.notes,
       logisticsGroupUrl,
     })
 
     // Vendedor sabe que já pode vender: métodos, taxas e primeiros passos.
-    void notifySellerAccount(sellerId, 'approved', { enabledMethods: dto.enabledMethods, fees })
+    void notifySellerAccount(sellerId, 'approved', { enabledMethods: dto.enabledMethods, fees: sellerFeesRow(fees) })
 
-    return { message: 'Seller aprovado', fees, logisticsGroupUrl }
+    return { message: 'Seller aprovado', fees: sellerFeesRow(fees), logisticsGroupUrl }
   }
 
   // =========================================
@@ -683,7 +676,6 @@ export class CrmService {
     const { data: seller } = await supabase
       .from('seller_profiles').select('risk_level').eq('id', sellerId).single()
 
-    const newFees = FEE_TABLE[dto.riskLevel]
 
     const { error: riskError } = await supabase
       .from('seller_profiles')
@@ -692,50 +684,54 @@ export class CrmService {
 
     if (riskError) throw new BadRequestException('Erro ao atualizar risco: ' + riskError.message)
 
-    await supabase.from('seller_fees').upsert({
-      seller_id: sellerId,
-      risk_level: dto.riskLevel,
-      fee_percentage: newFees.fee_percentage,
-      fee_fixed_usd: newFees.fee_fixed_usd,
-      settlement_days: newFees.settlement_days,
-      reserve_percentage: newFees.reserve_percentage,
-      reserve_hold_days: newFees.reserve_hold_days,
-      anticipation_fee_pct: newFees.anticipation_fee_pct,
-      anticipation_days: 0,
-      overridden_by: null,
-      updated_at: new Date(), // 🔥
-    }, { onConflict: 'seller_id' })
+    // Só registra o risco na tarifa: as taxas são definidas à parte, no CRM.
+    await supabase.from('seller_fees').update({ risk_level: dto.riskLevel, updated_at: new Date() }).eq('seller_id', sellerId)
 
     await this.log(sellerId, managerId, 'risk_changed', {
       from: seller?.risk_level, to: dto.riskLevel, reason: dto.reason,
     })
 
-    return { message: 'Nível de risco atualizado', fees: newFees }
+    return { message: 'Nível de risco atualizado' }
   }
 
   // =========================================
   // OVERRIDE DE TAXAS
   // =========================================
 
-  async overrideFees(sellerId: string, managerId: string, dto: {
-    fee_percentage?: number
-    fee_fixed_usd?: number
-    settlement_days?: number
-    reserve_percentage?: number
-    anticipation_fee_pct?: number
-    notes: string
-  }) {
-    const { notes, ...feeFields } = dto
+  async overrideFees(sellerId: string, managerId: string, dto: Record<string, unknown> & { notes?: string }) {
+    const notes = String(dto?.notes ?? '').trim()
+    if (!notes) throw new BadRequestException('Informe o motivo da alteração das taxas.')
 
-    await supabase.from('seller_fees').update({
-      ...feeFields,
+    const [before, { data: profile }] = await Promise.all([
+      getSellerFees(sellerId),
+      supabase.from('seller_profiles').select('risk_level').eq('id', sellerId).maybeSingle(),
+    ])
+    if (!profile) throw new NotFoundException('Seller não encontrado')
+
+    const base: FeeSettings = before ?? DEFAULT_FEE_SETTINGS
+    const after = parseFeeSettings(dto, base)
+    const changes = feeChanges(base, after)
+
+    const { error } = await supabase.from('seller_fees').upsert({
+      seller_id: sellerId,
+      risk_level: before?.riskLevel ?? profile.risk_level ?? 'WHITE',
+      ...sellerFeesRow(after),
       overridden_by: managerId,
       override_notes: notes,
-      updated_at: new Date(), // 🔥
-    }).eq('seller_id', sellerId)
+      updated_at: new Date(),
+    }, { onConflict: 'seller_id' })
+    if (error) throw new BadRequestException('Erro ao salvar taxas: ' + error.message)
 
-    await this.log(sellerId, managerId, 'fee_overridden', { ...feeFields, notes })
-    return { message: 'Taxas atualizadas' }
+    await this.log(sellerId, managerId, 'fee_overridden', { changes, notes })
+    return { message: 'Taxas atualizadas', fees: sellerFeesRow(after) }
+  }
+
+  /** Padrões e faixas aceitas — o CRM monta o formulário de taxas com isto. */
+  getFeeDefaults() {
+    return {
+      defaults: sellerFeesRow(DEFAULT_FEE_SETTINGS),
+      fields: FEE_FIELDS.map(({ key, column, min, max, integer, label }) => ({ key, column, min, max, integer: !!integer, label })),
+    }
   }
 
   // =========================================

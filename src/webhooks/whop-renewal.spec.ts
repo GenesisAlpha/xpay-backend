@@ -1,5 +1,6 @@
 jest.mock('../lib/supabase.client', () => ({ supabase: {} }))
 
+import { DEFAULT_SELLER_FEES } from '../shared/fee.calculator'
 import {
   isWhopRenewalPayment,
   renewalEconomics,
@@ -11,10 +12,14 @@ import {
 // Renovação da Whop: transação própria, com taxa da Koopfy e crédito do seller.
 
 const FEES = {
-  sellerId: 'seller-1', riskLevel: 'WHITE' as const,
-  feePercentage: 10, feeFixedUsd: 0.30,
-  settlementDays: 3, reservePercentage: 0,
-  reserveHoldDays: 0, anticipationFeePct: 0,
+  ...DEFAULT_SELLER_FEES,
+  sellerId: 'seller-1',
+  checkoutFeePct: 0,
+  processingFeePct: 10,
+  orchestrationFeePct: 0,
+  feeFixedUsd: 0.30,
+  reservePercentage: 0,
+  reserveHoldDays: 0,
 }
 
 const PARENT = {
@@ -29,7 +34,7 @@ const PARENT = {
 
 describe('renewalEconomics', () => {
   it('charges the Koopfy fee and credits the seller like a sale', () => {
-    const result = renewalEconomics({ netUSDcents: 10000, sellerFees: FEES, parent: PARENT })
+    const result = renewalEconomics({ grossUSDcents: 10000, currencyConverted: false, sellerFees: FEES, parent: PARENT })
     // 10% + US$ 0,30 = 1030; comissão do parceiro 2,5% de 10000 = 250.
     expect(result).toMatchObject({
       fee: 1030,
@@ -39,25 +44,42 @@ describe('renewalEconomics', () => {
       external_fee_pct: 2.5,
       external_fee_recipient_id: 'koopfy-partner',
       externalFeeDropped: false,
+      usd: { grossCents: 10000, fxFeeCents: 0, netCents: 10000 },
     })
   })
 
-  it('uses the default fee when the seller has no fee row', () => {
+  it('uses the default fees when the seller has no fee row', () => {
     const result = renewalEconomics({
-      netUSDcents: 10000,
+      grossUSDcents: 10000,
+      currencyConverted: false,
       sellerFees: null,
       parent: { ...PARENT, external_fee_recipient_id: null },
     })
-    // 9,99% + US$ 0,30 = 1029; reserva 5% de 8971 = 448,55 → 449.
-    expect(result.fee).toBe(1029)
-    expect(result.reserve_amount).toBe(449)
-    expect(result.net_amount).toBe(10000 - 1029 - 449)
+    // 1,9% + 8,9% + 0,9% + US$ 0,59 = 1229; reserva 10% de 8771 = 877.
+    expect(result.fee).toBe(1229)
+    expect(result.reserve_amount).toBe(877)
+    expect(result.net_amount).toBe(10000 - 1229 - 877)
     expect(result.external_fee_cents).toBeNull()
+  })
+
+  it('charges the conversion fee only when the renewal is not in USD', () => {
+    const result = renewalEconomics({
+      grossUSDcents: 10000,
+      currencyConverted: true,
+      sellerFees: null,
+      parent: { ...PARENT, external_fee_recipient_id: null },
+    })
+    // câmbio 2% = 200; taxas 1229; reserva 10% de 8571 = 857.
+    expect(result.usd).toEqual({ grossCents: 10000, fxFeeCents: 200, netCents: 9800 })
+    expect(result.fee).toBe(1229)
+    expect(result.reserve_amount).toBe(857)
+    expect(result.net_amount).toBe(8571 - 857)
   })
 
   it('scales a fixed partner fee with the renewal net', () => {
     const result = renewalEconomics({
-      netUSDcents: 5000,
+      grossUSDcents: 5000,
+      currencyConverted: false,
       sellerFees: FEES,
       parent: { ...PARENT, external_fee_pct: null, external_fee_cents: 1000, net_amount: 9000 },
     })
@@ -68,7 +90,8 @@ describe('renewalEconomics', () => {
 
   it('never leaves the seller negative', () => {
     const result = renewalEconomics({
-      netUSDcents: 100,
+      grossUSDcents: 100,
+      currencyConverted: false,
       sellerFees: FEES,
       parent: { ...PARENT, external_fee_pct: 99 },
     })
