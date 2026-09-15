@@ -141,4 +141,25 @@ export class StorageService {
     if (error || !data) return null;
     return data.signedUrl;
   }
+
+  /**
+   * Baixa um documento do bucket privado. Usado para mandar documento e selfie
+   * à verificação da Whop — o arquivo nunca sai por URL, nem assinada.
+   * Retorna null se o path for vazio ou se o Supabase falhar.
+   */
+  async downloadDocument(
+    path: string | null | undefined,
+  ): Promise<{ base64: string; mime: string; byteLength: number } | null> {
+    if (!path) return null;
+
+    const { data, error } = await supabase.storage.from(DOC_BUCKET).download(path);
+    if (error || !data) return null;
+
+    const buffer = Buffer.from(await data.arrayBuffer());
+    return {
+      base64: buffer.toString('base64'),
+      mime: data.type || 'application/octet-stream',
+      byteLength: buffer.byteLength,
+    };
+  }
 }

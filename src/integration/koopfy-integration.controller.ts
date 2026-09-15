@@ -16,8 +16,9 @@ import {
 } from '@nestjs/common';
 import { CrossServiceJwtGuard, CrossServiceTokenGuard } from './cross-service-jwt.guard';
 import { KoopfyIntegrationService } from './koopfy-integration.service';
-import { DocumentsDto, KycDto, OperationDto } from '../onboarding/onboarding.dto';
+import { DocumentsDto, KycDto, OperationDto, RequirementsDto } from '../onboarding/onboarding.dto';
 import { OnboardingService } from '../onboarding/onboarding.service';
+import { ActivationRequestDto } from '../activation/activation-request.dto';
 
 @Controller('integration/koopfy')
 export class KoopfyIntegrationController {
@@ -70,6 +71,28 @@ export class KoopfyIntegrationController {
   @UsePipes(new ValidationPipe({ transform: true, whitelist: true, forbidNonWhitelisted: true }))
   saveDocuments(@Req() req: any, @Body() body: DocumentsDto) {
     return this.onboarding.saveDocuments(req.sellerCtx.userId, body);
+  }
+
+  // Liberação de CNPJ e última solicitação (CNPJ / empresa americana).
+  @Get('onboarding/activation-request')
+  @UseGuards(CrossServiceJwtGuard)
+  activationRequest(@Req() req: any) {
+    return this.svc.getActivationRequest(req.sellerCtx);
+  }
+
+  @Post('onboarding/activation-request')
+  @UseGuards(CrossServiceJwtGuard)
+  @UsePipes(new ValidationPipe({ transform: true, whitelist: true, forbidNonWhitelisted: true }))
+  requestActivation(@Req() req: any, @Body() body: ActivationRequestDto) {
+    return this.svc.requestActivation(req.sellerCtx, body);
+  }
+
+  // Pendências do cadastro e pedidos da Whop, enviadas pelo painel do seller.
+  @Post('onboarding/requirements')
+  @UseGuards(CrossServiceJwtGuard)
+  @UsePipes(new ValidationPipe({ transform: true, whitelist: true, forbidNonWhitelisted: true }))
+  submitRequirements(@Req() req: any, @Body() body: RequirementsDto) {
+    return this.onboarding.submitRequirements(req.sellerCtx.userId, body);
   }
 
   // Emite um token curto p/ SSO no dash-pay (seller já deve existir — provision antes).

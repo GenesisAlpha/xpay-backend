@@ -1,6 +1,8 @@
 import { Module } from '@nestjs/common';
 import { AccountRouterService } from './router/account-router.service';
 import { WhopAccountsService } from './whop/whop-accounts.service';
+import { WhopConnectService } from './whop/whop-connect.service';
+import { WhopPlatformClient } from './whop/whop-platform.client';
 import { StripeAccountsService } from './stripe/stripe-accounts.service';
 import { ClipAccountsService } from './clip/clip-accounts.service';
 import { SpeiReceiptService } from './clip/spei-receipt.service';
@@ -20,6 +22,10 @@ import { CryptoModule } from '../crypto/crypto.module';
     // privado — precisa assinar uma URL curta antes de chamar.
     StorageService,
     WhopAccountsService,
+    // Contas conectadas da Whop: o router cobra na conta do seller e o
+    // WhopAccountsService resolve os ids 'whopc_…' por aqui.
+    WhopPlatformClient,
+    WhopConnectService,
     StripeAccountsService,
     StripeRiskService,
     StripeEfwService,
@@ -40,6 +46,9 @@ import { CryptoModule } from '../crypto/crypto.module';
     SpeiReceiptService,
     AccountRouterService,
     WhopAccountsService,
+    // WhopConnectService: o CRM cria/suspende a conta conectada e o webhook das
+    // contas conectadas sincroniza status e risco.
+    WhopConnectService,
     StripeAccountsService,
     StripeRiskService,
     StripeEfwService,

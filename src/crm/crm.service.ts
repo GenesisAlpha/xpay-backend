@@ -290,7 +290,7 @@ export class CrmService {
       .eq('id', sellerId)
       .single()
 
-    const [offersRes, feesRes, notesRes, logRes, kycRes, docsRes] = await Promise.all([
+    const [offersRes, feesRes, notesRes, logRes, kycRes, docsRes, activationRes] = await Promise.all([
       supabase.from('offers').select('*').eq('seller_id', sellerId).order('created_at', { ascending: false }),
       supabase.from('seller_fees').select('*').eq('seller_id', sellerId).maybeSingle(),
       supabase.from('crm_notes').select('*, crm_managers(name, avatar_url)').eq('seller_id', sellerId).order('is_pinned', { ascending: false }).order('created_at', { ascending: false }),
@@ -301,6 +301,10 @@ export class CrmService {
       sp?.user_id
         ? supabase.from('seller_documents').select('*').eq('user_id', sp.user_id).maybeSingle()
         : Promise.resolve({ data: null }),
+      // Solicitações de ativação (CNPJ / empresa americana) deste seller.
+      sp?.user_id
+        ? supabase.from('seller_activation_requests').select('*').eq('user_id', sp.user_id).order('created_at', { ascending: false })
+        : Promise.resolve({ data: [] }),
     ])
 
     return {
@@ -322,6 +326,7 @@ export class CrmService {
       log: logRes.data ?? [],
       kyc: kycRes.data,
       documents: await this.buildDocumentsPayload(docsRes.data),
+      activation_requests: (activationRes as any).data ?? [],
     }
   }
 
@@ -335,12 +340,22 @@ export class CrmService {
       ein_document_url,
       identity_document_url,
       proof_of_residence_url,
+      articles_of_organization_url,
+      operating_agreement_url,
+      identity_front_url,
+      identity_back_url,
+      selfie_url,
     ] = await Promise.all([
       this.storageService.getSignedDocumentUrl(doc.contrato_social_path),
       this.storageService.getSignedDocumentUrl(doc.cartao_cnpj_path),
       this.storageService.getSignedDocumentUrl(doc.ein_document_path),
       this.storageService.getSignedDocumentUrl(doc.identity_document_path),
       this.storageService.getSignedDocumentUrl(doc.proof_of_residence_path),
+      this.storageService.getSignedDocumentUrl(doc.articles_of_organization_path),
+      this.storageService.getSignedDocumentUrl(doc.operating_agreement_path),
+      this.storageService.getSignedDocumentUrl(doc.identity_front_path),
+      this.storageService.getSignedDocumentUrl(doc.identity_back_path),
+      this.storageService.getSignedDocumentUrl(doc.selfie_path),
     ])
 
     return {
@@ -352,6 +367,19 @@ export class CrmService {
       ein_document_url,
       identity_document_url,
       proof_of_residence_url,
+      // LLC — dados e documentos da verificação de empresa na Whop
+      company_legal_name:      doc.company_legal_name ?? null,
+      company_ein:             doc.company_ein ?? null,
+      company_structure:       doc.company_structure ?? null,
+      company_formation_state: doc.company_formation_state ?? null,
+      company_address:         doc.company_address ?? null,
+      company_website:         doc.company_website ?? null,
+      identity_document_type:  doc.identity_document_type ?? null,
+      articles_of_organization_url,
+      operating_agreement_url,
+      identity_front_url,
+      identity_back_url,
+      selfie_url,
     }
   }
 
@@ -446,6 +474,28 @@ export class CrmService {
 
     if (sellerError || !seller) throw new NotFoundException('Seller não encontrado')
     if (seller.status === 'active') throw new BadRequestException('Seller já está ativo')
+
+    // O cadastro padrão é LLC americana. Seller com CNPJ só é aprovado com a
+    // solicitação de ativação por CNPJ liberada — é essa decisão que diz que
+    // ele vende pela conta master.
+    const { data: sellerDocs } = await supabase
+      .from('seller_documents')
+      .select('company_type')
+      .eq('user_id', seller.user_id)
+      .maybeSingle()
+    if (sellerDocs?.company_type === 'BR') {
+      const { data: cnpjRelease } = await supabase
+        .from('seller_activation_requests')
+        .select('id')
+        .eq('user_id', seller.user_id)
+        .eq('status', 'approved')
+        .limit(1)
+      if (!cnpjRelease?.length) {
+        throw new BadRequestException(
+          'Seller cadastrado com CNPJ sem liberação. Aprove antes a solicitação de ativação por CNPJ.',
+        )
+      }
+    }
 
     const logisticsGroupUrl = normalizeWhatsappUrl(dto.logisticsGroupUrl)
 

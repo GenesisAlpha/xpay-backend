@@ -1,9 +1,13 @@
 import { Controller, Post, Req, Headers, Param } from '@nestjs/common';
 import { WebhookService } from './webhook.service';
+import { WhopConnectedWebhookService } from './whop-connected-webhook.service';
 
 @Controller('webhook')
 export class WebhookController {
-    constructor(private readonly webhookService: WebhookService) { }
+    constructor(
+        private readonly webhookService: WebhookService,
+        private readonly whopConnectedWebhook: WhopConnectedWebhookService,
+    ) { }
 
     // NEXFLOW
     @Post('nexflow')
@@ -61,6 +65,26 @@ export class WebhookController {
         try { parsed = JSON.parse(raw || '{}'); } catch { /* payload inválido */ }
 
         return this.webhookService.handleSharedWhopWebhook(parsed, raw, headers);
+    }
+
+    // WHOP — contas conectadas (webhook da master com child_resource_events).
+    //
+    // ⚠️ DECLARADO ANTES de 'whop/:accountId': as rotas casam na ordem de
+    // registro, e depois dele 'connected' viraria um accountId. O prefixo
+    // /webhook/whop já recebe express.raw em main.ts.
+    @Post('whop/connected')
+    async handleWhopConnectedWebhook(
+        @Req() req: any,
+        @Headers() headers: Record<string, string>,
+    ) {
+        const raw = Buffer.isBuffer(req.body)
+            ? req.body.toString('utf8')
+            : JSON.stringify(req.body ?? {});
+
+        let parsed: any = {};
+        try { parsed = JSON.parse(raw || '{}'); } catch { /* payload inválido */ }
+
+        return this.whopConnectedWebhook.handle(parsed, raw, headers);
     }
 
     // WHOP legado — a conta vai no PATH.

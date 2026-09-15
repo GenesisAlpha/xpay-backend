@@ -1,5 +1,6 @@
 import { ChargeResponse } from './provider.types';
 import { supabase } from '../../lib/supabase.client';
+import { connectedApplicationFee } from '../whop/whop-connected';
 
 // ============================================================================
 // WHOP — checkout hospedado/embedado, uma company por conta do pool
@@ -241,10 +242,24 @@ export class WhopProvider {
       ctx?.billing_address?.country ?? ctx?.customer?.country ?? metadata?.country ?? '',
     ).toUpperCase() || null;
 
+    // ── Conta conectada (cobrança direta na conta do seller) ─────────────────
+    // A Koopfy só recebe o que for application fee. Sem fee válida a venda
+    // sairia de graça — por isso falha fechado em vez de cobrar sem ela.
+    const connected = config?.connected === true;
+
     // ── Upsell de um clique: cobra o meio de pagamento salvo ─────────────────
     // Não cria checkout configuration — não há embed. Ver chargeSavedPaymentMethod.
     if (ctx?.offSession?.memberId && ctx?.offSession?.paymentMethodId) {
+      let upsellFee: number | null = null;
+      if (connected) {
+        const computed = this.connectedFee(initialPrice);
+        if ('error' in computed) {
+          return this.failure(id, transactionId, `Whop: taxa da plataforma inválida (${computed.error})`);
+        }
+        upsellFee = computed.fee;
+      }
       return this.chargeSavedPaymentMethod({
+        applicationFee: upsellFee,
         accountId: id,
         apiUrl,
         apiKey,
@@ -331,10 +346,32 @@ export class WhopProvider {
       koopfy_pricing_plan_id: metadata?.pricing_plan?.id ?? null,
     };
 
+    // ── Taxa da plataforma na conta conectada ────────────────────────────────
+    // Recorrente: a Whop aplica a MESMA fee a cada renovação e exige que ela
+    // seja menor que o renewal_price — a base é a renovação. Se a cobrança de
+    // hoje passar da renovação (adesão sem teste), a diferença ficaria na
+    // conta do seller e a liberação pagaria de novo pela carteira: recusa.
+    let applicationFee: number | null = null;
+    if (connected) {
+      if (subscriptionTerms && initialPrice > subscriptionTerms.renewalPrice) {
+        return this.failure(
+          id,
+          transactionId,
+          'Whop: assinatura com cobrança inicial maior que a renovação não é suportada em conta conectada',
+        );
+      }
+      const computed = this.connectedFee(subscriptionTerms ? subscriptionTerms.renewalPrice : initialPrice);
+      if ('error' in computed) {
+        return this.failure(id, transactionId, `Whop: taxa da plataforma inválida (${computed.error})`);
+      }
+      applicationFee = computed.fee;
+    }
+
     // ── Whop Elements: o navegador já escolheu o método e gerou o token ──────
     // Sem checkout configuration nem embed: POST /payments confirma o token.
     if (typeof ctx?.confirmation_token === 'string' && ctx.confirmation_token.startsWith('ctok_')) {
       return this.chargeConfirmationToken({
+        applicationFee,
         accountId: id,
         apiUrl,
         apiKey,
@@ -355,6 +392,11 @@ export class WhopProvider {
 
     const body: Record<string, any> = {
       mode: 'payment',
+      // Cobrança direta (docs "Collect payments for connected accounts"): a
+      // Account API key da MASTER cria a checkout configuration e o
+      // `account_id` do topo diz em qual conta conectada a venda nasce.
+      // `plan.company_id` sozinho só define onde o plano é criado.
+      ...(connected ? { account_id: companyId } : {}),
       plan: {
         company_id: companyId,
         currency: cur,
@@ -381,6 +423,8 @@ export class WhopProvider {
         // Sem isto o plano nasce 'visible' e cada compra publica um item na
         // vitrine da company. Ver bloco de achados no topo.
         visibility: 'quick_link',
+        // Conta conectada: a parte da Koopfy (taxas + reserva). Na moeda do plano.
+        ...(applicationFee != null ? { application_fee_amount: applicationFee } : {}),
         // Comprador paga na moeda dele. Vem true por padrão; explicitamos pra
         // não depender de default de terceiro num ponto que muda conversão.
         adaptive_pricing_enabled: config?.adaptive_pricing === false ? false : true,
@@ -524,6 +568,13 @@ export class WhopProvider {
   // no metadata), igual ao embed.
   // ─────────────────────────────────────────────
 
+  // Application fee da conta conectada: tudo menos 1 centavo, para o dinheiro
+  // ficar na master (ver connectedApplicationFee). A parte do seller vai para
+  // a conta dele na liberação, pela carteira da Koopfy.
+  private connectedFee(chargeAmount: number) {
+    return connectedApplicationFee(chargeAmount);
+  }
+
   private async chargeConfirmationToken(args: {
     accountId: string;
     apiUrl: string;
@@ -544,6 +595,8 @@ export class WhopProvider {
     metadata: Record<string, any>;
     returnUrl: string;
     config: any;
+    // Só em conta conectada; null na master.
+    applicationFee: number | null;
   }): Promise<ChargeResponse> {
     const { accountId, transactionId, subscriptionTerms } = args;
 
@@ -565,6 +618,7 @@ export class WhopProvider {
         billing_period: subscriptionTerms.billingPeriodDays,
         trial_period_days: subscriptionTerms.trialPeriodDays || null,
       } : {}),
+      ...(args.applicationFee != null ? { application_fee_amount: args.applicationFee } : {}),
       ...this.buildProductLink(args.config),
     };
 
@@ -649,6 +703,8 @@ export class WhopProvider {
     productId: string | null;
     returnUrl: string;
     config: any;
+    // Só em conta conectada; null na master.
+    applicationFee: number | null;
   }): Promise<ChargeResponse> {
     const { accountId, transactionId } = args;
 
@@ -660,6 +716,7 @@ export class WhopProvider {
         currency: args.currency,
         initial_price: args.initialPrice,
         plan_type: 'one_time',
+        ...(args.applicationFee != null ? { application_fee_amount: args.applicationFee } : {}),
         ...this.buildProductLink(args.config),
       },
       metadata: {

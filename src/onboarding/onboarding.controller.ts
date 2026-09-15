@@ -1,11 +1,16 @@
-import { Controller, Post, Body, Req, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Body, Req, UseGuards } from '@nestjs/common';
 import { OnboardingService } from './onboarding.service';
 import { KycDto, OperationDto, DocumentsDto } from './onboarding.dto';
 import { JwtOnly } from '../auth/guards/jtw.auth.guard';
+import { ActivationRequestsService } from '../activation/activation-requests.service';
+import { ActivationRequestDto } from '../activation/activation-request.dto';
 
 @Controller('onboarding')
 export class OnboardingController {
-  constructor(private readonly onboardingService: OnboardingService) {}
+  constructor(
+    private readonly onboardingService: OnboardingService,
+    private readonly activationRequests: ActivationRequestsService,
+  ) {}
 
   // POST /onboarding/kyc
   @Post('kyc')
@@ -26,5 +31,20 @@ export class OnboardingController {
   @JwtOnly()
   async saveDocuments(@Req() req: any, @Body() dto: DocumentsDto) {
     return this.onboardingService.saveDocuments(req.user.sub, dto);
+  }
+
+  // GET /onboarding/activation-request — CNPJ liberado? + última solicitação
+  @Get('activation-request')
+  @JwtOnly()
+  async getActivationRequest(@Req() req: any) {
+    return this.activationRequests.getForUser(req.user.sub);
+  }
+
+  // POST /onboarding/activation-request — pede ativação por CNPJ ou
+  // orientação para abrir uma empresa americana
+  @Post('activation-request')
+  @JwtOnly()
+  async requestActivation(@Req() req: any, @Body() dto: ActivationRequestDto) {
+    return this.activationRequests.request(req.user.sub, dto);
   }
 }

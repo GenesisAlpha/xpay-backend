@@ -101,6 +101,70 @@ export class MailService {
     }
 
     // =========================================
+    // DECISÃO DA SOLICITAÇÃO DE ATIVAÇÃO (CNPJ / LLC)
+    // =========================================
+    async sendActivationDecisionEmail({
+        to,
+        name,
+        decision,
+        message,
+    }: {
+        to: string;
+        name: string;
+        decision: 'approve_cnpj' | 'direct_to_llc' | 'reject';
+        message: string | null;
+    }) {
+        const documentsUrl = `${this.FRONTEND_URL}/onboarding/documents`;
+        const firstName = name.split(' ')[0] || 'tudo bem';
+        // A mensagem vem do gestor: escapada para não virar HTML no e-mail.
+        const note = message ? this.escapeHtml(message).replace(/\n/g, '<br>') : null;
+
+        const copy = {
+            approve_cnpj: {
+                eyebrow: 'Ativação com CNPJ',
+                heading: `Cadastro com CNPJ liberado, ${firstName}`,
+                intro: 'Nossa equipe liberou o cadastro da sua conta com empresa brasileira. Volte ao cadastro e envie os documentos do CNPJ para concluir.',
+                ctaLabel: 'Continuar cadastro',
+                ctaUrl: documentsUrl,
+                icon: '✅',
+            },
+            direct_to_llc: {
+                eyebrow: 'Empresa americana (LLC)',
+                heading: `Próximo passo: abrir sua LLC, ${firstName}`,
+                intro: 'Para ativar sua conta, o caminho recomendado é abrir uma empresa americana (LLC). Veja as orientações da nossa equipe abaixo.',
+                ctaLabel: process.env.LLC_GUIDE_URL ? 'Ver como abrir a LLC' : 'Voltar ao cadastro',
+                ctaUrl: process.env.LLC_GUIDE_URL || documentsUrl,
+                icon: '🏢',
+            },
+            reject: {
+                eyebrow: 'Solicitação de ativação',
+                heading: `Sobre sua solicitação, ${firstName}`,
+                intro: 'Analisamos sua solicitação de ativação e, por enquanto, não conseguimos aprová-la. Veja o motivo abaixo.',
+                ctaLabel: 'Voltar ao cadastro',
+                ctaUrl: documentsUrl,
+                icon: 'ℹ️',
+            },
+        }[decision];
+
+        const html = this.buildLayout({
+            ...copy,
+            notice: note ?? 'Qualquer dúvida, responda este e-mail ou fale com o suporte.',
+            fallbackUrl: copy.ctaUrl,
+        });
+
+        await this.send({ to, subject: `${copy.eyebrow} — ${BRAND.name}`, html });
+    }
+
+    private escapeHtml(value: string): string {
+        return value
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    // =========================================
     // SEND HELPER
     // =========================================
     private async send({

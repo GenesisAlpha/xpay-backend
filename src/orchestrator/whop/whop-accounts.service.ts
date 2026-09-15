@@ -1,7 +1,9 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
 import { supabase } from '../../lib/supabase.client';
 import { CryptoService } from '../../crypto/crypto.service';
 import { ProviderAccountConfig } from '../provider-accounts.config';
+import { ConnectedRouting, WhopConnectService } from './whop-connect.service';
+import { isConnectedProviderAccountId } from './whop-connected';
 
 // ============================================================================
 // WHOP ACCOUNTS — pool dinâmico (tabela `whop_accounts`)
@@ -60,7 +62,12 @@ const SELECT_COLUMNS =
 
 @Injectable()
 export class WhopAccountsService {
-  constructor(private readonly crypto: CryptoService) { }
+  // WhopConnectService é opcional só para os testes que montam o serviço à
+  // mão; no Nest ele sempre vem (mesmo módulo).
+  constructor(
+    private readonly crypto: CryptoService,
+    @Optional() private readonly connected?: WhopConnectService,
+  ) { }
 
   private cache: ProviderAccountConfig[] | null = null;
   private hydratedAt = 0;
@@ -122,6 +129,11 @@ export class WhopAccountsService {
   async getById(id: string): Promise<ProviderAccountConfig | null> {
     if (id === WHOP_ENV_ACCOUNT_ID) return this.getEnvAccount();
 
+    // Conta conectada de um seller ('whopc_<biz>'): não mora em whop_accounts.
+    if (isConnectedProviderAccountId(id)) {
+      return this.connected ? this.connected.getProviderAccountById(id) : null;
+    }
+
     const cached = this.cache?.find(a => a.id === id);
     if (cached && Date.now() - this.hydratedAt < this.CACHE_TTL_MS) return cached;
 
@@ -145,6 +157,12 @@ export class WhopAccountsService {
     const account = await this.getById(id);
     const secret = account?.config?.webhook_secret;
     return typeof secret === 'string' && secret.length > 0 ? secret : null;
+  }
+
+  // Modo do seller na Whop: master (pool/env), conta conectada ou bloqueado.
+  // Sem o serviço de contas conectadas (testes), todo seller é master.
+  async resolveSellerRouting(sellerId: string): Promise<ConnectedRouting> {
+    return this.connected ? this.connected.getChargeRouting(sellerId) : { mode: 'master' };
   }
 
   invalidate() {

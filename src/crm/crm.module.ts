@@ -50,6 +50,9 @@ import { StorageService } from '../lib/storage.service'
 import { CryptoModule } from '../crypto/crypto.module'
 import { OrchestratorModule } from '../orchestrator/orchestrator.module'
 import { WebhookModule } from '../webhooks/webhook.module'
+import { WhopConnectController } from './whop-connect.controller'
+import { ActivationRequestsController } from './activation-requests.controller'
+import { ActivationModule } from '../activation/activation.module'
 
 @Module({
   imports: [
@@ -67,8 +70,12 @@ import { WebhookModule } from '../webhooks/webhook.module'
     // de PAID que um pagamento normal (carteira, KPI, postback). Marcar o status
     // direto deixaria o pedido pago no CRM e pendente em todo o resto.
     WebhookModule,
+    // ActivationModule: fila de solicitações de ativação (CNPJ / LLC).
+    ActivationModule,
   ],
-  controllers: [CrmController, CrmAdminController],
+  // WhopConnectController: conta conectada da Whop por seller (serviço vem do
+  // OrchestratorModule).
+  controllers: [CrmController, CrmAdminController, WhopConnectController, ActivationRequestsController],
   providers:   [CrmService, CrmAdminService, CrmAuthGuard, StorageService],
   exports:     [CrmService, CrmAdminService],
 })

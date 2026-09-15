@@ -837,6 +837,20 @@ export class AccountRouterService implements OnModuleInit {
     // pedido JÁ tem conta — ver resolveStickyAccountId.
     orderRef?: string | null;
   }): Promise<ProviderAccount | null> {
+    // ── Whop em modo conectado ──
+    // Seller com conta conectada ativa cobra SÓ nela: nem sticky, nem pool.
+    // Com a conta fora do ar, o WhopConnectService decide: 'master' (fallback
+    // de até 72h, segue para o pool abaixo) ou 'blocked' (reserva acionada,
+    // fallback cortado no CRM ou janela vencida).
+    if (args.provider.toLowerCase() === 'whop') {
+      const routing = await this.whopAccounts.resolveSellerRouting(args.sellerId);
+      if (routing.mode === 'connected') return routing.account as unknown as ProviderAccount;
+      if (routing.mode === 'blocked') {
+        console.warn(`[AccountRouter] Whop bloqueada para o seller ${args.sellerId}: ${routing.reason}`);
+        return null;
+      }
+    }
+
     const accounts = await this.getAccounts();
 
     // ── Stickiness por pedido ──
@@ -947,6 +961,19 @@ export class AccountRouterService implements OnModuleInit {
     degraded: boolean;
     attempted: string[];
   } | null> {
+    // ── 0. Whop em modo conectado ──
+    // Seller isolado numa conta conectada e bloqueado lá não vende por outro
+    // PSP: o failover levaria o risco dele para um pool compartilhado — o
+    // contágio que a conta conectada existe para evitar.
+    const whopRouting = await this.whopAccounts.resolveSellerRouting(args.sellerId);
+    if (whopRouting.mode === 'blocked') {
+      console.error(
+        `[AccountRouter] 🚫 seller ${args.sellerId}: conta conectada da Whop bloqueada `
+        + `(${whopRouting.reason}) — pagamento recusado, sem failover`,
+      );
+      return null;
+    }
+
     // ── 1. Stickiness cross-provider ──
     if (args.orderRef) {
       const sticky = await this.resolveStickyAccountAnyProvider({
@@ -956,7 +983,13 @@ export class AccountRouterService implements OnModuleInit {
 
       if (sticky) {
         const account = await this.resolveAccountById(sticky.accountId);
-        if (account && account.status === 'active') {
+        // Pedido que começou na master antes de o seller entrar no modo
+        // conectado não volta para a master. Cai no aviso abaixo (atenção no
+        // reembolso) e segue para a conta conectada.
+        const leavesConnectedAccount = whopRouting.mode === 'connected'
+          && String(account?.provider) === 'whop'
+          && account?.id !== whopRouting.account.id;
+        if (account && account.status === 'active' && !leavesConnectedAccount) {
           console.log(
             `[AccountRouter] sticky cross-PSP: pedido ${args.orderRef} → `
             + `${sticky.provider}/${sticky.accountId}`,

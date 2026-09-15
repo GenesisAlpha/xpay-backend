@@ -20,6 +20,8 @@ import { StorageService } from '../lib/storage.service';
 import { generateKey, hashKey } from '../utils/apikeys.utils';
 import { SellerCtx } from './cross-service-jwt.guard';
 import { WalletService } from '../dashboard/services/services';
+import { ActivationRequestsService } from '../activation/activation-requests.service';
+import { WhopConnectService } from '../orchestrator/whop/whop-connect.service';
 import {
   buildSubscriptionReport,
   filterTransactionsByWorkspace,
@@ -48,7 +50,44 @@ export class KoopfyIntegrationService {
   constructor(
     private readonly storage: StorageService,
     private readonly wallet: WalletService,
+    private readonly activationRequests: ActivationRequestsService,
+    private readonly whopConnect: WhopConnectService,
   ) {}
+
+  getActivationRequest(ctx: SellerCtx) {
+    return this.activationRequests.getForUser(ctx.userId);
+  }
+
+  requestActivation(ctx: SellerCtx, dto: { kind: 'cnpj' | 'us_company'; message?: string }) {
+    return this.activationRequests.request(ctx.userId, dto);
+  }
+
+  /**
+   * O que o painel do checkout precisa para o seller se destravar sozinho:
+   * liberação de CNPJ, última solicitação, motivo da recusa e pendências
+   * (faltantes do cadastro da LLC + pedidos da Whop). Falha aqui não derruba o
+   * status — sem pendências o painel segue o fluxo normal.
+   */
+  private async loadRequirements(userId: string, sellerId: string | null, documentsSubmitted: boolean, rejectionReason: string | null) {
+    try {
+      const [activation, requirements] = await Promise.all([
+        this.activationRequests.getForUser(userId),
+        // Antes de enviar os documentos a etapa do onboarding já pede tudo.
+        sellerId && documentsSubmitted ? this.whopConnect.getSellerRequirements(sellerId) : Promise.resolve(null),
+      ]);
+      return {
+        cnpjAllowed: activation.cnpjAllowed,
+        activationRequest: activation.latest,
+        rejectionReason,
+        companyType: requirements?.companyType ?? null,
+        connectedStatus: requirements?.connectedStatus ?? null,
+        items: requirements?.items ?? [],
+      };
+    } catch (err: any) {
+      console.error('[integration] requirements:', err?.message);
+      return { cnpjAllowed: false, activationRequest: null, rejectionReason, companyType: null, connectedStatus: null, items: [] };
+    }
+  }
 
   /**
    * Provisiona (cria/atualiza) a conta do seller no Koopfy Pay a partir da
@@ -199,7 +238,7 @@ export class KoopfyIntegrationService {
 
     const { data: seller } = await supabase
       .from('seller_profiles')
-      .select('id, status, kyc_status')
+      .select('id, status, kyc_status, rejection_reason')
       .eq('user_id', user.id)
       .maybeSingle();
 
@@ -232,6 +271,10 @@ export class KoopfyIntegrationService {
         }
       : null;
 
+    const requirements = seller
+      ? await this.loadRequirements(user.id, seller.id, documentsSubmitted, seller.rejection_reason ?? null)
+      : null;
+
     return {
       state,
       sellerId: seller?.id ?? null,
@@ -244,6 +287,7 @@ export class KoopfyIntegrationService {
         documents: !!user?.documents_completed,
         completed: !!user?.onboarding_completed,
       },
+      requirements,
     };
   }
 

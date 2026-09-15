@@ -16,10 +16,14 @@ import {
   WalletDashModule,
 } from '../dashboard/modules/dashboard.module';
 import { OnboardingModule } from '../onboarding/onboarding.module';
+import { ActivationModule } from '../activation/activation.module';
+import { OrchestratorModule } from '../orchestrator/orchestrator.module';
 
 @Module({
   // WalletDashModule exporta o WalletService — o saldo do card da home do
   // checkout sai da MESMA fonte que o dash-pay, sem duplicar a lógica.
+  // ActivationModule + OrchestratorModule: o status leva as pendências do
+  // cadastro (liberação de CNPJ, pedidos da Whop) para o painel do checkout.
   imports: [
     DashboardModule,
     TransactionsModule,
@@ -30,6 +34,8 @@ import { OnboardingModule } from '../onboarding/onboarding.module';
     SettingsModule,
     ApiKeysModule,
     OnboardingModule,
+    ActivationModule,
+    OrchestratorModule,
   ],
   controllers: [KoopfyIntegrationController, KoopfyFinanceController],
   providers: [KoopfyIntegrationService, KoopfyFinanceService, StorageService],
