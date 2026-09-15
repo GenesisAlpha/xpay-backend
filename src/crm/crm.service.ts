@@ -1,6 +1,7 @@
 import {
   Injectable, UnauthorizedException, NotFoundException,
-  BadRequestException, ForbiddenException
+  BadRequestException, ForbiddenException,
+  HttpException, HttpStatus, ServiceUnavailableException,
 } from '@nestjs/common'
 import { JwtService } from '@nestjs/jwt'
 import { supabase } from '../lib/supabase.client'
@@ -14,6 +15,10 @@ import { notifySellerAccount } from '../utils/seller-mail'
 import { DEFAULT_FEE_SETTINGS, getSellerFees, sellerFeesRow, type FeeSettings } from '../shared/fee.calculator'
 import { FEE_FIELDS, FEE_TOGGLES, feeChanges, parseFeeSettings } from './fee-config'
 import * as bcrypt from 'bcrypt'
+import { LoginAttemptLimiter } from './crm-login-limiter'
+import { currentCrmRequest } from './crm-request-context'
+
+const loginLimiter = new LoginAttemptLimiter()
 
 
 // Provedores que o CRM pode atribuir. Sellers antigos com outro provider seguem
@@ -131,18 +136,38 @@ export class CrmService {
   // AUTH
   // =========================================
 
-  async login(email: string, password: string) {
+  async login(email: string, password: string, ip: string | null = null) {
+    if (!process.env.CRM_JWT_SECRET) {
+      throw new ServiceUnavailableException('Login do CRM indisponível: configuração ausente.')
+    }
+
+    // Força bruta: 5 erros por e-mail ou 20 por IP em 15 min bloqueiam o login.
+    const normalizedEmail = String(email ?? '').trim().toLowerCase()
+    const waitMs = loginLimiter.retryAfterMs(normalizedEmail, ip)
+    if (waitMs > 0) {
+      throw new HttpException(
+        `Muitas tentativas de login. Tente de novo em ${Math.ceil(waitMs / 60_000)} min.`,
+        HttpStatus.TOO_MANY_REQUESTS,
+      )
+    }
+    const invalid = () => {
+      loginLimiter.recordFailure(normalizedEmail, ip)
+      return new UnauthorizedException('Credenciais inválidas')
+    }
+    if (!normalizedEmail || typeof password !== 'string' || !password) throw invalid()
+
     const { data: manager } = await supabase
       .from('crm_managers')
       .select('*')
-      .eq('email', email.toLowerCase())
+      .eq('email', normalizedEmail)
       .eq('is_active', true)
       .maybeSingle()
 
-    if (!manager) throw new UnauthorizedException('Credenciais inválidas')
+    if (!manager) throw invalid()
 
     const valid = await bcrypt.compare(password, manager.password_hash)
-    if (!valid) throw new UnauthorizedException('Credenciais inválidas')
+    if (!valid) throw invalid()
+    loginLimiter.reset(normalizedEmail)
 
     // 🔥 new Date() em vez de .toISOString() para campos timestamp
     await supabase.from('crm_managers')
@@ -222,7 +247,22 @@ export class CrmService {
 
     const { count: unassigned } = await unassignedQuery
 
-    return { ...counts, myAssignments: myCount ?? 0, unassigned: unassigned ?? 0 }
+    // Contadores do menu de Administração (saques e chargebacks esperando ação).
+    let adminCounts: { pendingWithdrawals?: number; openChargebacks?: number } = {}
+    if (isAdmin) {
+      const [withdrawals, chargebacks] = await Promise.all([
+        supabase.from('wallet_ledger').select('id', { count: 'exact', head: true })
+          .eq('type', 'debit_payout').eq('status', 'pending'),
+        supabase.from('chargebacks').select('id', { count: 'exact', head: true })
+          .in('status', ['open', 'evidence_required']),
+      ])
+      adminCounts = {
+        pendingWithdrawals: withdrawals.count ?? 0,
+        openChargebacks: chargebacks.count ?? 0,
+      }
+    }
+
+    return { ...counts, myAssignments: myCount ?? 0, unassigned: unassigned ?? 0, ...adminCounts }
   }
 
   // =========================================
@@ -891,6 +931,12 @@ export class CrmService {
   // HELPERS PRIVADOS
   // =========================================
 
+  /** Admin e supervisor agem em qualquer seller; gerente só nos que assumiu. */
+  async assertCanManage(sellerId: string, manager: { sub: string; role: string }) {
+    if (manager?.role === 'admin' || manager?.role === 'supervisor') return
+    await this.assertAssigned(sellerId, manager?.sub)
+  }
+
   private async assertAssigned(sellerId: string, managerId: string) {
     const { data } = await supabase
       .from('crm_assignments')
@@ -913,13 +959,19 @@ export class CrmService {
     action: string,
     payload: Record<string, any>,
   ) {
-    await supabase.from('crm_action_log').insert({
+    const request = currentCrmRequest()
+    const { error } = await supabase.from('crm_action_log').insert({
       seller_id: sellerId,
       manager_id: managerId,
       action,
+      resource_type: 'seller',
+      resource_id: sellerId,
       payload,
+      ip_address: request?.ip ?? null,
+      user_agent: request?.userAgent ?? null,
       created_at: new Date(), // 🔥
-    }).then(() => { })
+    })
+    if (error) console.error(`[CrmService.log] ação ${action} não registrada:`, error.message)
   }
 
   // =========================================

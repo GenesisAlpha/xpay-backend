@@ -7,7 +7,14 @@ import {
 import { CrmService } from './crm.service'
 import { CrmAuthGuard } from './crm.module'
 import { Roles } from './crm.module';
+import { requestMetaFrom } from './crm-request-context'
 
+// Permissões:
+// - leitura de sellers e fila de risco: qualquer gerente logado;
+// - ações sobre um seller: admin/supervisor, ou o gerente que assumiu o seller
+//   (assertCanManage);
+// - suspender/ativar: supervisor ou admin;
+// - SPEI, contas Whop e MIDs: admin.
 @Controller('crm')
 export class CrmController {
   constructor(private readonly crm: CrmService) { }
@@ -15,8 +22,8 @@ export class CrmController {
   // ─── Auth ─────────────────────────────────────────────────────────────────
   @Post('auth/login')
   @HttpCode(HttpStatus.OK)
-  login(@Body() body: { email: string; password: string }) {
-    return this.crm.login(body.email, body.password)
+  login(@Req() req: any, @Body() body: { email: string; password: string }) {
+    return this.crm.login(body?.email, body?.password, requestMetaFrom(req).ip)
   }
 
   @Get('auth/me')
@@ -142,6 +149,7 @@ export class CrmController {
   // na mão no banco.
   @Get('spei/accounts')
   @UseGuards(CrmAuthGuard)
+  @Roles('admin')
   speiAccounts() {
     return this.crm.listSpeiAccounts()
   }
@@ -157,6 +165,7 @@ export class CrmController {
    */
   @Post('spei/accounts/:accountId/withdraw')
   @UseGuards(CrmAuthGuard)
+  @Roles('admin')
   @HttpCode(HttpStatus.OK)
   speiWithdraw(
     @Param('accountId') accountId: string,
@@ -172,6 +181,7 @@ export class CrmController {
   // agendada, centavos que não batem, leitura ruim.
   @Get('spei/proofs')
   @UseGuards(CrmAuthGuard)
+  @Roles('admin')
   speiProofs(@Query('page') page?: string, @Query('status') status?: string) {
     return this.crm.listSpeiProofs({ page: page ? Number(page) : 1, status })
   }
@@ -186,6 +196,7 @@ export class CrmController {
    */
   @Post('spei/proofs/:transactionId/decide')
   @UseGuards(CrmAuthGuard)
+  @Roles('admin')
   @HttpCode(HttpStatus.OK)
   decideSpeiProof(
     @Param('transactionId') transactionId: string,
@@ -248,6 +259,7 @@ export class CrmController {
 
   @Post('sellers/:id/suspend')
   @UseGuards(CrmAuthGuard)
+  @Roles('supervisor', 'admin')
   @HttpCode(HttpStatus.OK)
   suspend(
     @Param('id') id: string,
@@ -259,6 +271,7 @@ export class CrmController {
 
   @Post('sellers/:id/activate')
   @UseGuards(CrmAuthGuard)
+  @Roles('supervisor', 'admin')
   @HttpCode(HttpStatus.OK)
   activate(@Param('id') id: string, @Req() req: any) {
     return this.crm.activateSeller(id, req.manager.sub)
@@ -268,11 +281,12 @@ export class CrmController {
 
   @Patch('sellers/:id/risk')
   @UseGuards(CrmAuthGuard)
-  changeRisk(
+  async changeRisk(
     @Param('id') id: string,
     @Req() req: any,
     @Body() body: { riskLevel: 'WHITE' | 'GRAY' | 'BLACK'; reason: string },
   ) {
+    await this.crm.assertCanManage(id, req.manager)
     return this.crm.changeRiskLevel(id, req.manager.sub, body)
   }
 
@@ -284,21 +298,23 @@ export class CrmController {
 
   @Patch('sellers/:id/fees')
   @UseGuards(CrmAuthGuard)
-  overrideFees(
+  async overrideFees(
     @Param('id') id: string,
     @Req() req: any,
     @Body() body: any,
   ) {
+    await this.crm.assertCanManage(id, req.manager)
     return this.crm.overrideFees(id, req.manager.sub, body)
   }
 
   @Patch('sellers/:id/methods')
   @UseGuards(CrmAuthGuard)
-  updateMethods(
+  async updateMethods(
     @Param('id') id: string,
     @Req() req: any,
     @Body() body: { enabledMethods: string[]; notes?: string },
   ) {
+    await this.crm.assertCanManage(id, req.manager)
     return this.crm.updateEnabledMethods(id, req.manager.sub, body)
   }
 
@@ -307,24 +323,26 @@ export class CrmController {
   @Post('sellers/:sellerId/offers/:offerId/approve')
   @UseGuards(CrmAuthGuard)
   @HttpCode(HttpStatus.OK)
-  approveOffer(
+  async approveOffer(
     @Param('sellerId') sellerId: string,
     @Param('offerId') offerId: string,
     @Req() req: any,
     @Body() body: { notes?: string },
   ) {
+    await this.crm.assertCanManage(sellerId, req.manager)
     return this.crm.approveOffer(offerId, sellerId, req.manager.sub, body.notes)
   }
 
   @Post('sellers/:sellerId/offers/:offerId/reject')
   @UseGuards(CrmAuthGuard)
   @HttpCode(HttpStatus.OK)
-  rejectOffer(
+  async rejectOffer(
     @Param('sellerId') sellerId: string,
     @Param('offerId') offerId: string,
     @Req() req: any,
     @Body() body: { reason: string },
   ) {
+    await this.crm.assertCanManage(sellerId, req.manager)
     return this.crm.rejectOffer(offerId, sellerId, req.manager.sub, body.reason)
   }
 
@@ -376,7 +394,7 @@ export class CrmController {
 
   @Patch('sellers/:id/provider')
   @UseGuards(CrmAuthGuard)
-  updateProvider(
+  async updateProvider(
     @Param('id') id: string,
     @Req() req: any,
     @Body() body: {
@@ -384,6 +402,7 @@ export class CrmController {
       notes?: string
     },
   ) {
+    await this.crm.assertCanManage(id, req.manager)
     return this.crm.updateProviderDefault(id, req.manager.sub, body)
   }
 
@@ -394,6 +413,7 @@ export class CrmController {
 
   @Get('whop-accounts')
   @UseGuards(CrmAuthGuard)
+  @Roles('supervisor', 'admin')
   listWhopAccounts() {
     return this.crm.listWhopAccounts()
   }
@@ -448,10 +468,11 @@ export class CrmController {
     return this.crm.upsertWhopAccount(req.manager.sub, body)
   }
 
-  // Controles de roteamento (pausar, peso, tetos, cooldown). Sem credencial —
-  // por isso não exige admin: tirar uma conta do ar é operação, não cadastro.
+  // Controles de roteamento (pausar, peso, tetos, cooldown). Sem credencial,
+  // mas mexe no volume de todos os sellers: só admin.
   @Patch('whop-accounts/:id')
   @UseGuards(CrmAuthGuard)
+  @Roles('admin')
   updateWhopAccountRouting(
     @Param('id') id: string,
     @Req() req: any,
@@ -473,6 +494,7 @@ export class CrmController {
   // Lista os MIDs do Sentinel disponíveis (sem segredos) p/ atribuir ao seller.
   @Get('sentinel-mids')
   @UseGuards(CrmAuthGuard)
+  @Roles('admin')
   listSentinelMids() {
     return this.crm.listSentinelMids()
   }
@@ -499,11 +521,12 @@ export class CrmController {
   // Atribui (ou limpa) o MID do Sentinel de um seller.
   @Patch('sellers/:id/mid')
   @UseGuards(CrmAuthGuard)
-  updateSellerMid(
+  async updateSellerMid(
     @Param('id') id: string,
     @Req() req: any,
     @Body() body: { mid: string | null; notes?: string },
   ) {
+    await this.crm.assertCanManage(id, req.manager)
     return this.crm.updateSellerMid(id, req.manager.sub, body)
   }
 
