@@ -2,6 +2,7 @@ jest.mock('../lib/supabase.client', () => ({ supabase: {} }))
 
 import {
   calculatePayoutFees,
+  calculateProviderCost,
   calculateSaleFees,
   payoutCurrencyForMethod,
   DEFAULT_FEE_SETTINGS,
@@ -9,6 +10,27 @@ import {
   sellerFeesFromRow,
   sellerFeesRow,
 } from './fee.calculator'
+
+describe('calculateProviderCost', () => {
+  it('charges processing, fixed and orchestration, plus conversion outside USD', () => {
+    expect(calculateProviderCost(10000, { currencyConverted: true })).toEqual({
+      processing_cents: 270,
+      fixed_cents: 30,
+      orchestration_cents: 80,
+      fx_cents: 150,
+      total_cents: 530,
+      rates: { processing_pct: 2.7, fixed_usd: 0.3, orchestration_pct: 0.8, fx_pct: 1.5 },
+    })
+    expect(calculateProviderCost(10000, { currencyConverted: false })).toMatchObject({ fx_cents: 0, total_cents: 380 })
+  })
+
+  it('is stored in the sale breakdown without changing what the seller pays', () => {
+    const r = calculateSaleFees(10000, DEFAULT_FEE_SETTINGS, { currencyConverted: false })
+    expect(r.providerCostCents).toBe(380)
+    expect((r.breakdown.provider_cost as any).total_cents).toBe(380)
+    expect(r.netCents).toBe(10000 - 1229 - 877)
+  })
+})
 
 describe('calculateSaleFees', () => {
   it('applies every rate on the gross USD amount and the reserve on what is left', () => {

@@ -3,6 +3,7 @@ import {
 } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
 import { getEffectiveSellerFees } from '../shared/fee.calculator'
+import { providerCostCents, saleProfitCents } from '../orchestrator/fees/provider-fees'
 import { notifySellerPayout, type PayoutEmailInfo } from '../utils/seller-mail'
 
 // Linha do ledger (debit_payout) → dados do e-mail de saque. O destino fica em
@@ -29,6 +30,13 @@ interface RevenueBreakdown {
   anticipation_fee_cents: number
   chargeback_fee_cents: number
   payout_fee_cents: number
+  /** Custo do provider (modelo fixo, gravado na venda) das vendas que o têm. */
+  provider_fee_cents: number
+  provider_fee_sales: number
+  /** Receita da Koopfy (taxa + câmbio) só das vendas com custo do provider. */
+  provider_fee_revenue_cents: number
+  negative_margin_sales: number
+  sales_count: number
 }
 
 interface AdminContext {
@@ -208,6 +216,19 @@ export class CrmAdminService {
           anticipation: c2u(revenueCurr.anticipation_fee_cents),
           chargeback: c2u(revenueCurr.chargeback_fee_cents),
           payout: c2u(revenueCurr.payout_fee_cents),
+        },
+        // Lucro: receita e custo das MESMAS vendas (as que têm o custo do provider
+        // gravado). `sales_with_cost` / `sales_total` diz a cobertura.
+        provider: revenueCurr && {
+          cost_usd: c2u(revenueCurr.provider_fee_cents),
+          revenue_usd: c2u(revenueCurr.provider_fee_revenue_cents),
+          profit_usd: c2u(revenueCurr.provider_fee_revenue_cents - revenueCurr.provider_fee_cents),
+          margin_pct: revenueCurr.provider_fee_revenue_cents > 0
+            ? Math.round(((revenueCurr.provider_fee_revenue_cents - revenueCurr.provider_fee_cents) / revenueCurr.provider_fee_revenue_cents) * 1000) / 10
+            : null,
+          sales_with_cost: revenueCurr.provider_fee_sales,
+          sales_total: revenueCurr.sales_count,
+          negative_margin_sales: revenueCurr.negative_margin_sales,
         },
       },
       sellers: {
@@ -941,6 +962,12 @@ export class CrmAdminService {
       anticipation_fee_cents: n(row.anticipation_fee_cents),
       chargeback_fee_cents: n(row.chargeback_fee_cents),
       payout_fee_cents: n(row.payout_fee_cents),
+      // Antes da migration do custo do provider essas colunas não existem: zero.
+      provider_fee_cents: n(row.provider_fee_cents),
+      provider_fee_sales: n(row.provider_fee_sales),
+      provider_fee_revenue_cents: n(row.provider_fee_revenue_cents),
+      negative_margin_sales: n(row.negative_margin_sales),
+      sales_count: n(row.sales_count),
     }
   }
 
@@ -1031,7 +1058,7 @@ export class CrmAdminService {
       .from('transactions')
       .select(`
         id, created_at, seller_id, offer_id, customer_email, customer_name, customer_country,
-        amount_usd_gross_cents, amount_usd_net_cents, fee,
+        amount_usd_gross_cents, amount_usd_net_cents, fee, fee_breakdown,
         method, provider, status, risk_score
       `, { count: 'exact' })
       .order('created_at', { ascending: false })
@@ -1093,6 +1120,9 @@ export class CrmAdminService {
         customer_name: tx.customer_name,
         amount_usd: c2u(tx.amount_usd_gross_cents),
         fee_usd: c2u(tx.fee),
+        // Custo do provider e lucro da Koopfy na venda (nulo em venda anterior ao modelo).
+        provider_fee_usd: providerCostCents(tx.fee_breakdown) == null ? null : c2u(providerCostCents(tx.fee_breakdown)),
+        profit_usd: saleProfitCents(tx) == null ? null : c2u(saleProfitCents(tx)),
         net_usd: c2u(tx.amount_usd_net_cents),
         method: tx.method,
         provider: tx.provider,
