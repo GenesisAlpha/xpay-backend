@@ -2,7 +2,34 @@ import {
   Injectable, NotFoundException, BadRequestException, ForbiddenException,
 } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
-import { CHARGEBACK_FEE_USD } from '../shared/fee.calculator'
+import { getEffectiveSellerFees } from '../shared/fee.calculator'
+import { notifySellerPayout, type PayoutEmailInfo } from '../utils/seller-mail'
+
+// Linha do ledger (debit_payout) → dados do e-mail de saque. O destino fica em
+// metadata.destination (camelCase), igual ao que o CRM exibe.
+function payoutEmailInfo(id: string, w: any): PayoutEmailInfo {
+  return {
+    amountCents: Number(w.amount),
+    currency: w.currency,
+    method: w.metadata?.method ?? w.method ?? null,
+    payoutId: id,
+    destination: w.metadata?.destination ?? null,
+    feeCents: Number(w.fee) || null,
+    requestedAt: w.created_at ?? null,
+  }
+}
+
+/** Receita por tipo de taxa no período (função crm_revenue_breakdown). */
+interface RevenueBreakdown {
+  fx_fee_cents: number
+  checkout_fee_cents: number
+  processing_fee_cents: number
+  orchestration_fee_cents: number
+  fixed_fee_cents: number
+  anticipation_fee_cents: number
+  chargeback_fee_cents: number
+  payout_fee_cents: number
+}
 
 interface AdminContext {
   managerId: string
@@ -144,25 +171,18 @@ export class CrmAdminService {
     const { count: failedCount } = await failedQ
 
     // ── Saldos consolidados (Float da plataforma)
-    let balanceQ = supabase
-      .from('wallet_balance')
-      .select('available_balance, pending_balance, reserved_balance, withdrawing_balance')
+    const [totals, revenueCurr, revenuePrev, timeseries, topSellers] = await Promise.all([
+      this.balanceTotals(),
+      this.revenueBreakdown(from, to),
+      this.revenueBreakdown(prevFrom, prevTo),
+      this.getTimeseries(from, to),
+      this.getTopSellers(from, to, 10),
+    ])
 
-    if (EXCLUDED_FROM_METRICS.length > 0) {
-      balanceQ = balanceQ.not('seller_id', 'in', `(${EXCLUDED_FROM_METRICS.join(',')})`)
-    }
-
-    const { data: balanceAgg } = await balanceQ
-
-    const totals = (balanceAgg ?? []).reduce((acc, b) => ({
-      available: acc.available + Number(b.available_balance ?? 0),
-      pending: acc.pending + Number(b.pending_balance ?? 0),
-      reserved: acc.reserved + Number(b.reserved_balance ?? 0),
-      withdrawing: acc.withdrawing + Number(b.withdrawing_balance ?? 0),
-    }), { available: 0, pending: 0, reserved: 0, withdrawing: 0 })
-
-    const timeseries = await this.getTimeseries(from, to)
-    const topSellers = await this.getTopSellers(from, to, 10)
+    // Receita da Koopfy: taxas da venda (seller_kpis) + câmbio, antecipação,
+    // chargeback e saque. Sem a função no banco, fica só a taxa da venda.
+    const extraRevenue = (r: RevenueBreakdown | null) =>
+      r ? r.fx_fee_cents + r.anticipation_fee_cents + r.chargeback_fee_cents + r.payout_fee_cents : 0
 
     return {
       range,
@@ -175,10 +195,20 @@ export class CrmAdminService {
       },
       revenue: {
         platform_fees_usd: c2u(gmvCurr.platformFeesCents),
-        platform_fixed_usd: 0,
-        anticipation_fees_usd: 0,
-        total_usd: c2u(gmvCurr.platformFeesCents),
-        prev_total_usd: c2u(gmvPrev.platformFeesCents),
+        platform_fixed_usd: c2u(revenueCurr?.fixed_fee_cents ?? 0),
+        anticipation_fees_usd: c2u(revenueCurr?.anticipation_fee_cents ?? 0),
+        total_usd: c2u(gmvCurr.platformFeesCents + extraRevenue(revenueCurr)),
+        prev_total_usd: c2u(gmvPrev.platformFeesCents + extraRevenue(revenuePrev)),
+        breakdown_usd: revenueCurr && {
+          fx: c2u(revenueCurr.fx_fee_cents),
+          checkout: c2u(revenueCurr.checkout_fee_cents),
+          processing: c2u(revenueCurr.processing_fee_cents),
+          orchestration: c2u(revenueCurr.orchestration_fee_cents),
+          fixed: c2u(revenueCurr.fixed_fee_cents),
+          anticipation: c2u(revenueCurr.anticipation_fee_cents),
+          chargeback: c2u(revenueCurr.chargeback_fee_cents),
+          payout: c2u(revenueCurr.payout_fee_cents),
+        },
       },
       sellers: {
         active: activeSellers,
@@ -195,6 +225,8 @@ export class CrmAdminService {
       balances: {
         total_available_usd: c2u(totals.available),
         total_pending_usd: c2u(totals.pending + totals.reserved),
+        total_reserved_usd: c2u(totals.reserved),
+        total_withdrawing_usd: c2u(totals.withdrawing),
         platform_float_usd: c2u(totals.available + totals.pending + totals.reserved + totals.withdrawing),
       },
       timeseries,
@@ -652,6 +684,8 @@ export class CrmAdminService {
       notes: dto.notes,
     })
 
+    void notifySellerPayout(w.seller_id, 'approved', payoutEmailInfo(id, w))
+
     return { message: 'Saque aprovado e saldo debitado' }
   }
 
@@ -702,6 +736,8 @@ export class CrmAdminService {
       seller_id: w.seller_id,
     })
 
+    void notifySellerPayout(w.seller_id, 'rejected', { ...payoutEmailInfo(id, w), reason: dto.reason.trim() })
+
     return { message: 'Saque rejeitado e saldo devolvido' }
   }
 
@@ -745,6 +781,11 @@ export class CrmAdminService {
       seller_id: w.seller_id,
     })
 
+    void notifySellerPayout(w.seller_id, 'completed', {
+      ...payoutEmailInfo(id, w),
+      providerPayoutId: dto.provider_tx_id.trim(),
+    })
+
     return { message: 'Saque concluído' }
   }
 
@@ -786,6 +827,8 @@ export class CrmAdminService {
       amount_cents: w.amount,
       seller_id: w.seller_id,
     })
+
+    void notifySellerPayout(w.seller_id, 'failed', { ...payoutEmailInfo(id, w), reason: dto.reason.trim() })
 
     return { message: 'Saque marcado como falhou e saldo devolvido' }
   }
@@ -848,12 +891,70 @@ export class CrmAdminService {
   // BALANCES
   // ════════════════════════════════════════════════════════════════════════
 
-  async listBalances(ctx: AdminContext, params: { search?: string; sort?: string }) {
-    this.assertAdmin(ctx.role)
-    const { search, sort = 'available_desc' } = params
+  // Somas no banco (crm_balance_totals). Sem a função aplicada, soma no Node
+  // o que vier — pode faltar seller acima de 1000 linhas.
+  private async balanceTotals() {
+    const { data, error } = await supabase.rpc('crm_balance_totals', { p_excluded: EXCLUDED_FROM_METRICS })
+    const row = Array.isArray(data) ? data[0] : data
+    if (!error && row) {
+      return {
+        available: Number(row.available_cents ?? 0),
+        pending: Number(row.pending_cents ?? 0),
+        reserved: Number(row.reserved_cents ?? 0),
+        withdrawing: Number(row.withdrawing_cents ?? 0),
+      }
+    }
+    console.error('[crm-admin] crm_balance_totals indisponível, somando no service:', error?.message)
+    let q = supabase
+      .from('wallet_balance')
+      .select('available_balance, pending_balance, reserved_balance, withdrawing_balance')
+    if (EXCLUDED_FROM_METRICS.length > 0) {
+      q = q.not('seller_id', 'in', `(${EXCLUDED_FROM_METRICS.join(',')})`)
+    }
+    const { data: rows } = await q
+    return (rows ?? []).reduce((acc, b) => ({
+      available: acc.available + Number(b.available_balance ?? 0),
+      pending: acc.pending + Number(b.pending_balance ?? 0),
+      reserved: acc.reserved + Number(b.reserved_balance ?? 0),
+      withdrawing: acc.withdrawing + Number(b.withdrawing_balance ?? 0),
+    }), { available: 0, pending: 0, reserved: 0, withdrawing: 0 })
+  }
 
-    let q = supabase.from('v_admin_seller_balances').select('*')
-    if (search) q = q.or(`name.ilike.%${search}%,email.ilike.%${search}%`)
+  private async revenueBreakdown(from: Date, to: Date): Promise<RevenueBreakdown | null> {
+    const { data, error } = await supabase.rpc('crm_revenue_breakdown', {
+      p_from: from.toISOString(),
+      p_to: to.toISOString(),
+      p_excluded: EXCLUDED_FROM_METRICS,
+    })
+    const row = Array.isArray(data) ? data[0] : data
+    if (error || !row) {
+      if (error) console.error('[crm-admin] crm_revenue_breakdown indisponível:', error.message)
+      return null
+    }
+    const n = (v: unknown) => Number(v ?? 0)
+    return {
+      fx_fee_cents: n(row.fx_fee_cents),
+      checkout_fee_cents: n(row.checkout_fee_cents),
+      processing_fee_cents: n(row.processing_fee_cents),
+      orchestration_fee_cents: n(row.orchestration_fee_cents),
+      fixed_fee_cents: n(row.fixed_fee_cents),
+      anticipation_fee_cents: n(row.anticipation_fee_cents),
+      chargeback_fee_cents: n(row.chargeback_fee_cents),
+      payout_fee_cents: n(row.payout_fee_cents),
+    }
+  }
+
+  async listBalances(ctx: AdminContext, params: { search?: string; sort?: string; page?: number; pageSize?: number }) {
+    this.assertAdmin(ctx.role)
+    const { search, sort = 'available_desc', page } = params
+    // Chamada sem página = tela antiga: devolve só a lista (até 200), como antes.
+    const legacy = page === undefined
+    const pageSize = legacy ? 200 : (params.pageSize ?? 50)
+
+    let q = supabase.from('v_admin_seller_balances').select('*', { count: 'exact' })
+    // Vírgula e parênteses quebram o filtro `or` do PostgREST.
+    const term = (search ?? '').replace(/[,()%*\\]/g, ' ').trim()
+    if (term) q = q.or(`name.ilike.%${term}%,email.ilike.%${term}%`)
 
     const sortMap: Record<string, [string, boolean]> = {
       available_desc: ['available_cents', false],
@@ -864,10 +965,15 @@ export class CrmAdminService {
     const [col, asc] = sortMap[sort] ?? sortMap.available_desc
     q = q.order(col, { ascending: asc })
 
-    const { data, error } = await q.limit(200)
+    const safePage = Math.max(1, page ?? 1)
+    const start = (safePage - 1) * pageSize
+    const [{ data, error, count }, totals] = await Promise.all([
+      q.range(start, start + pageSize - 1),
+      legacy ? Promise.resolve(null) : this.balanceTotals(),
+    ])
     if (error) throw new BadRequestException(error.message)
 
-    return (data ?? []).map(b => ({
+    const rows = (data ?? []).map(b => ({
       seller_id: b.seller_id,
       name: b.name,
       avatar_url: b.avatar_url,
@@ -884,6 +990,22 @@ export class CrmAdminService {
       chargebacks_30d_count: Number(b.chargebacks_30d_count ?? 0),
       last_withdrawal_at: b.last_withdrawal_at,
     }))
+
+    if (legacy || !totals) return rows
+
+    return {
+      data: rows,
+      total: count ?? 0,
+      page: safePage,
+      totalPages: Math.ceil((count ?? 0) / pageSize),
+      // Totais da plataforma inteira, não só da página.
+      totals: {
+        available_usd: c2u(totals.available),
+        pending_usd: c2u(totals.pending),
+        reserve_usd: c2u(totals.reserved),
+        withdrawing_usd: c2u(totals.withdrawing),
+      },
+    }
   }
 
   // ════════════════════════════════════════════════════════════════════════
@@ -1123,10 +1245,22 @@ export class CrmAdminService {
       resolution_notes: dto.notes ?? null,
     }).eq('id', id)
 
-    // ── Debita o seller: valor do chargeback + taxa fixa de $50 ──────────────
-    // Não trava se faltar saldo — registra para reconciliação manual.
+    // Reserva da venda com chargeback não volta ao seller.
+    if (cb.transaction_id) {
+      const { error: reserveError } = await supabase.rpc('cancel_reserve_hold', { p_transaction_id: cb.transaction_id, p_reason: 'chargeback' })
+      if (reserveError) console.error('[crm-admin] chargeback: reserva não cancelada (reconciliar):', reserveError.message)
+    }
+
+    // ── Debita o seller: valor do chargeback + taxa de chargeback do seller ───
+    // Não trava se faltar saldo — registra para reconciliação manual. Se a venda
+    // já pagou a taxa num alerta de chargeback (Whop), não cobra de novo.
     const now = new Date().toISOString()
-    const feeCents = CHARGEBACK_FEE_USD * 100
+    const sellerFees = await getEffectiveSellerFees(cb.seller_id)
+    const { data: alertFee } = cb.transaction_id
+      ? await supabase.from('wallet_ledger').select('id')
+        .eq('transaction_id', cb.transaction_id).eq('type', 'chargeback_alert_fee').maybeSingle()
+      : { data: null }
+    const feeCents = alertFee ? 0 : Math.round(sellerFees.chargebackFeeUsd * 100)
     const amountCents = Number(cb.amount_cents ?? 0)
     const totalCents = amountCents + feeCents
 
@@ -1155,7 +1289,7 @@ export class CrmAdminService {
         metadata: meta('amount'),
         created_at: now,
       }] : []),
-      {
+      ...(feeCents > 0 ? [{
         seller_id: cb.seller_id,
         transaction_id: cb.id,
         type: 'chargeback_fee',
@@ -1164,7 +1298,7 @@ export class CrmAdminService {
         status: ledgerStatus,
         metadata: meta('fee'),
         created_at: now,
-      },
+      }] : []),
     ])
 
     if (debitErr) {

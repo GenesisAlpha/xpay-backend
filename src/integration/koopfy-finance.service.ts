@@ -15,6 +15,7 @@ import {
 } from '../dashboard/services/services';
 import { RequestPayoutDto } from '../dashboard/dto/request-payout.dto';
 import { SellerCtx } from './cross-service-jwt.guard';
+import { AnticipationService } from '../wallets/anticipation.service';
 import { normalizeFinanceListQuery } from './koopfy-finance-query';
 
 const TRANSACTION_STATUSES = [
@@ -51,6 +52,9 @@ const PAYOUT_FIELDS = [
   'swift',
   'cryptoAddress',
   'cryptoNetwork',
+  // Faltavam: sem eles todo saque Pix pelo fluxo unificado falhava no buildDestination.
+  'pixKey',
+  'pixKeyType',
 ] as const;
 
 function publicTransaction(transaction: any) {
@@ -127,6 +131,7 @@ export class KoopfyFinanceService {
     private readonly methods: PaymentMethodsService,
     private readonly settings: SettingsService,
     private readonly apiKeys: ApiKeysService,
+    private readonly anticipation?: AnticipationService,
   ) {}
 
   private seller(ctx: SellerCtx) {
@@ -197,6 +202,29 @@ export class KoopfyFinanceService {
       orderShipped: Boolean(entry.orderShipped),
       trackingCode: entry.trackingCode ?? null,
     }));
+  }
+
+  async getPayoutQuote(ctx: SellerCtx, query: Record<string, unknown>) {
+    const method = String(query?.method ?? 'ach').toLowerCase();
+    const amount = Number(String(query?.amount ?? '0').replace(',', '.'));
+    return this.wallet.quotePayout(
+      this.seller(ctx).id,
+      Number.isFinite(amount) ? amount : 0,
+      ['ach', 'iban', 'pix', 'crypto'].includes(method) ? method : 'ach',
+    );
+  }
+
+  async getAnticipationQuote(ctx: SellerCtx) {
+    return this.anticipationService().quote(this.seller(ctx).id);
+  }
+
+  async anticipate(ctx: SellerCtx, body: Record<string, unknown>) {
+    return this.anticipationService().anticipate(this.seller(ctx).id, body ?? {});
+  }
+
+  private anticipationService() {
+    if (!this.anticipation) throw new ConflictException('Antecipação indisponível no momento.');
+    return this.anticipation;
   }
 
   async listPayouts(ctx: SellerCtx, raw: Record<string, unknown>) {

@@ -1,11 +1,11 @@
 // nexor/src/payments/payment.service.ts
 
-import { Injectable, BadRequestException, ForbiddenException } from '@nestjs/common'
+import { Injectable, BadRequestException, ForbiddenException, ServiceUnavailableException } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
 import { CurrencyService } from '../currency/currency.service'
 import { WalletService } from '../wallets/wallet.service'
 import { AccountRouterService } from '../orchestrator/router/account-router.service'
-import { getSellerFees, calculateFees } from '../shared/fee.calculator'
+import { calculateSaleFees, getEffectiveSellerFees, saleFeePct } from '../shared/fee.calculator'
 import { validateMbwayPhone } from '../utils/mbway.validator'
 import { RetrieveResponse } from '../orchestrator/providers/provider.types'
 import { CardCryptoService } from '../crypto/card-crypto.service'
@@ -13,6 +13,8 @@ import { WebhookService } from '../webhooks/webhook.service'
 import { ClipAccountsService } from '../orchestrator/clip/clip-accounts.service'
 import { SpeiReceiptService } from '../orchestrator/clip/spei-receipt.service'
 import { StorageService } from '../lib/storage.service'
+import { WhopProvider, type WhopMembershipState } from '../orchestrator/providers/whop.provider'
+import { customerSubscriptionView, isSubscriptionTransaction } from './customer-subscription'
 
 export interface ExternalFeeInput {
     recipient_id: string
@@ -190,12 +192,18 @@ export class PaymentService {
             })
         }
 
-        const fx = await this.currencyService.convertToUSDWithFee(amount / 100, currency)
-        __mark('convertToUSDWithFee')
-        const grossUSDcents = Math.round(fx.grossUSD * 100)
-        const fxFeeUSDcents = Math.round(fx.feeUSD * 100)
-        const netUSDcents = Math.round(fx.netUSD * 100)
-        const fxFinalRate = fx.fxFinalRate
+        const fx = await this.currencyService.convertToUSD(amount / 100, currency)
+        __mark('convertToUSD')
+        // Taxas do seller (seller_fees, padrão em fee.calculator): todas sobre o
+        // bruto em USD; a de conversão só quando a venda não é em USD.
+        const sellerFees = await getEffectiveSellerFees(effectiveSellerId)
+        const currencyConverted = String(currency).toUpperCase() !== 'USD'
+        const saleFees = calculateSaleFees(Math.round(fx.grossUSD * 100), sellerFees, { currencyConverted })
+        __mark('calculateSaleFees')
+        const grossUSDcents = saleFees.grossCents
+        const fxFeeUSDcents = saleFees.fxFeeCents
+        const netUSDcents = grossUSDcents - fxFeeUSDcents
+        const fxFinalRate = currencyConverted ? fx.fxMarketRate * (1 - sellerFees.fxFeePct / 100) : 1
 
         // ─── External fee ──────────────────────────────────────────────────────
 
@@ -550,29 +558,13 @@ export class PaymentService {
             )
         }
 
-        // ─── Calcula taxas ─────────────────────────────────────────────────────
-        // ⏸️ Cross-border em STANDBY até definirmos como captar o país do cartão.
-        //    Infra pronta p/ reativar: provider-accounts.config.country (país de
-        //    settlement) + computeSurchargePct({ crossBorder }) no fee.calculator.
-        const isCrossBorder = false
-
-        const sellerFees = await getSellerFees(effectiveSellerId)
-        const baseFee = sellerFees
-            ? calculateFees(netUSDcents / 100, sellerFees, {
-                paymentMethod: dto.method,
-                cardBrand: dto.payment_data?.cardBrand,   // amex / diners → +2%
-                walletMethod: dto.method,                 // apple_pay / google_pay → +1%
-                crossBorder: isCrossBorder,               // ⏸️ standby
-                provider: providerName,                   // coinflow → +1.5% proteção
-            })
-            : this.defaultFeeResult(netUSDcents, providerName)
-
-        const platformFeeCents = Math.round(baseFee.platformFee * 100)
-        // Parcela de proteção de chargeback (já está DENTRO do platformFee acima).
-        const chargebackProtectionFeeCents = Math.round(baseFee.chargebackProtectionFee * 100)
-        const reserveAmountCents = Math.round(baseFee.reserveAmount * 100)
+        // ─── Taxas ─────────────────────────────────────────────────────────────
+        // Já calculadas junto da conversão (saleFees): checkout + processamento +
+        // orquestração + fixa, e a reserva sobre o que sobra.
+        const platformFeeCents = saleFees.platformFeeCents
+        const reserveAmountCents = saleFees.reserveCents
         const externalFeeCents = externalFee?.amount_cents ?? 0
-        const baseNetCents = Math.round(baseFee.netAmount * 100)
+        const baseNetCents = saleFees.netCents
         const sellerNetCents = baseNetCents - externalFeeCents
 
         if (sellerNetCents < 0) {
@@ -594,7 +586,7 @@ export class PaymentService {
             grossUSDcents,
             fxFeeUSDcents,
             fxFinalRate,
-            sellerFeePct: sellerFees?.feePercentage ?? 9.99,
+            sellerFeePct: saleFeePct(sellerFees),
             // Reserve é retido (não distribuído agora) — entra na sanity check
             // pra fechar net = seller + platform + external + reserve.
             reserveCents: reserveAmountCents,
@@ -801,13 +793,18 @@ export class PaymentService {
             failure_code: result.failureCode ?? null,
             failure_message: result.failureMessage ?? null,
             fee: platformFeeCents,
-            chargeback_protection_fee: chargebackProtectionFeeCents,
+            chargeback_protection_fee: 0,
             net_amount: sellerNetCents,
             reserve_amount: reserveAmountCents,
-            available_at: baseFee.availableAt.toISOString(),
-            reserve_until: baseFee.reserveUntil.toISOString(),
+            available_at: saleFees.availableAt.toISOString(),
+            reserve_until: saleFees.reserveUntil.toISOString(),
             processed_at: now,
         }).eq('id', transaction.id)
+
+        // Detalhe por tipo de taxa, em gravação separada: se a coluna ainda não
+        // existir (migration pendente), não derruba o update que credita o seller.
+        supabase.from('transactions').update({ fee_breakdown: saleFees.breakdown }).eq('id', transaction.id)
+            .then(({ error }) => { if (error) console.error('[PaymentService] fee_breakdown:', error.message) })
 
         // Aprovação imediata (simulator) precisa do update já persistido, porque
         // handleWebhookProvider (logo abaixo) RELÊ a transação do banco — sem
@@ -1697,7 +1694,7 @@ export class PaymentService {
 
     async getTransactionStatus(sellerId: string, transactionId: string) {
         const { data } = await supabase.from('transactions')
-            .select('id, status, provider_status, provider_transaction_id, failure_message, metadata')
+            .select('id, status, provider_status, provider_transaction_id, failure_message, metadata, amount, currency')
             .eq('id', transactionId).eq('seller_id', sellerId).single()
         if (!data) throw new BadRequestException('Transação não encontrada.')
         return {
@@ -1710,11 +1707,149 @@ export class PaymentService {
             recoveryUrl: data.metadata?.whop_recovery_url ?? null,
             // Disputa aberta na Whop (webhook dispute.*). O checkout só aceita o
             // aviso payment.disputed se isto existir.
-            disputeStatus: data.metadata?.whop_dispute?.status ?? null,
+            // Stripe grava em stripe_dispute (charge.dispute.*) — mesmo aviso.
+            disputeStatus: data.metadata?.whop_dispute?.status
+                ?? data.metadata?.stripe_dispute?.status
+                ?? null,
             // Nome da cobrança (Whop). O checkout usa quando o pedido não tem nome
             // — produto digital só coleta e-mail no formulário da loja.
             customerName: data.metadata?.whop_billing_name ?? null,
+            // Renovação de assinatura: transação filha. O checkout só cria o pedido
+            // de renovação se isto apontar para a compra do pedido original.
+            renewalOf: data.metadata?.renewal_of_transaction_id ?? null,
+            renewalCycle: data.metadata?.renewal_cycle ?? null,
+            amount: data.amount ?? null,
+            currency: data.currency ?? null,
         }
+    }
+
+    // ─── Assinatura do comprador (área do cliente) ───────────────────────────
+    //
+    // O checkout confere que o pedido é do comprador logado; aqui a transação
+    // ainda é filtrada pelo vendedor dono da chave. Regras em customer-subscription.ts.
+
+    async getCustomerSubscription(sellerId: string, transactionId: string) {
+        const ctx = await this.loadWhopSubscription(sellerId, transactionId)
+        return { subscription: ctx ? customerSubscriptionView(ctx.membership, ctx.tx.metadata) : null }
+    }
+
+    async cancelCustomerSubscription(sellerId: string, transactionId: string) {
+        const ctx = await this.requireWhopSubscription(sellerId, transactionId)
+        const current = customerSubscriptionView(ctx.membership, ctx.tx.metadata)
+        // Clique duplo ou outra aba: já está agendado, não é erro.
+        if (current.status === 'canceling') return { subscription: current }
+        if (!current.canCancel) {
+            const installments = current.installments !== null
+            throw new BadRequestException({
+                message: installments
+                    ? 'Plano parcelado: o cancelamento é feito pelo suporte.'
+                    : 'Esta assinatura não pode ser cancelada.',
+                code: installments ? 'SUBSCRIPTION_INSTALLMENTS' : 'SUBSCRIPTION_NOT_CANCELLABLE',
+            })
+        }
+        const membership = await this.callWhopMembership(() =>
+            ctx.whop.cancelMembershipAtPeriodEnd(ctx.membership.id, ctx.account))
+        await this.mirrorWhopMembership(ctx, membership)
+        return { subscription: customerSubscriptionView(membership, ctx.tx.metadata) }
+    }
+
+    async reactivateCustomerSubscription(sellerId: string, transactionId: string) {
+        const ctx = await this.requireWhopSubscription(sellerId, transactionId)
+        const current = customerSubscriptionView(ctx.membership, ctx.tx.metadata)
+        if (current.status === 'active' || current.status === 'trialing') return { subscription: current }
+        if (!current.canReactivate) {
+            throw new BadRequestException({
+                message: 'Esta assinatura não pode ser reativada.',
+                code: 'SUBSCRIPTION_NOT_REACTIVATABLE',
+            })
+        }
+        const membership = await this.callWhopMembership(() =>
+            ctx.whop.uncancelMembership(ctx.membership.id, ctx.account))
+        await this.mirrorWhopMembership(ctx, membership)
+        return { subscription: customerSubscriptionView(membership, ctx.tx.metadata) }
+    }
+
+    private async requireWhopSubscription(sellerId: string, transactionId: string) {
+        const ctx = await this.loadWhopSubscription(sellerId, transactionId)
+        if (!ctx) {
+            throw new BadRequestException({
+                message: 'Assinatura não encontrada para esta compra.',
+                code: 'SUBSCRIPTION_NOT_FOUND',
+            })
+        }
+        return ctx
+    }
+
+    private async loadWhopSubscription(sellerId: string, transactionId: string) {
+        const { data: tx } = await supabase.from('transactions')
+            .select('id, provider, provider_account_id, metadata')
+            .eq('id', transactionId).eq('seller_id', sellerId).maybeSingle()
+        if (!tx) throw new BadRequestException('Transação não encontrada.')
+        if (this.normalizeProviderName(tx.provider) !== 'whop' || !isSubscriptionTransaction(tx.metadata)) {
+            return null
+        }
+
+        // Espelho gravado pelo webhook membership.* — pode faltar (evento não
+        // assinado na conta, ou ainda não chegou).
+        const { data: row } = await supabase.from('whop_subscriptions')
+            .select('whop_membership_id, whop_account_id')
+            .eq('koopfy_transaction_id', tx.id)
+            .order('updated_at', { ascending: false })
+            .limit(1)
+            .maybeSingle()
+
+        const accountId = row?.whop_account_id ?? tx.provider_account_id
+        const account: any = accountId ? await this.accountRouter.resolveAccountById(accountId) : null
+        if (!account?.apiKey) {
+            console.error(`[PaymentService] assinatura ${tx.id}: conta Whop ${accountId ?? '-'} indisponível`)
+            throw new ServiceUnavailableException({
+                message: 'Assinatura indisponível no momento.',
+                code: 'SUBSCRIPTION_UNAVAILABLE',
+            })
+        }
+
+        const whop = new WhopProvider()
+        let membershipId: string | null = row?.whop_membership_id ?? null
+        // Sem o espelho: o payment da compra aponta a membership.
+        if (!membershipId && tx.metadata?.whop_payment_id) {
+            const { raw } = await this.callWhopMembership(() =>
+                whop.getPaymentStatus(String(tx.metadata.whop_payment_id), account))
+            membershipId = raw?.membership?.id ?? raw?.membership_id ?? null
+        }
+        if (!membershipId) return null
+
+        const membership = await this.callWhopMembership(() => whop.getMembership(String(membershipId), account))
+        return { tx, account, whop, membership }
+    }
+
+    private async callWhopMembership<T>(call: () => Promise<T>): Promise<T> {
+        try {
+            return await call()
+        } catch (err: any) {
+            console.error('[PaymentService] Whop membership:', err?.message)
+            throw new ServiceUnavailableException({
+                message: 'Assinatura indisponível no momento.',
+                code: 'SUBSCRIPTION_UNAVAILABLE',
+            })
+        }
+    }
+
+    // Espelho local; a Whop segue sendo a fonte. Falhar aqui não desfaz o que a
+    // Whop já aceitou.
+    private async mirrorWhopMembership(
+        ctx: { tx: { id: string }; account: { id: string } },
+        membership: WhopMembershipState,
+    ) {
+        const { error } = await supabase.from('whop_subscriptions').upsert({
+            whop_membership_id: membership.id,
+            whop_account_id: ctx.account.id,
+            koopfy_transaction_id: ctx.tx.id,
+            status: membership.status ?? 'active',
+            cancel_at_period_end: membership.cancelAtPeriodEnd,
+            current_period_end: membership.renewalPeriodEnd,
+            updated_at: new Date().toISOString(),
+        }, { onConflict: 'whop_membership_id' })
+        if (error) console.warn('[PaymentService] whop_subscriptions não atualizada:', error.message)
     }
 
     private async analyzeSpeiProof(tx: any) {
@@ -1782,15 +1917,6 @@ export class PaymentService {
             .select('id, status, risk_level, enabled_methods, config, metadata, user_id, provider_default, provider_mid, country')
             .eq('id', id).single()
         return data
-    }
-
-    private defaultFeeResult(netUSDcents: number, provider?: string) {
-        return calculateFees(netUSDcents / 100, {
-            sellerId: '', riskLevel: 'WHITE' as const,
-            feePercentage: 9.99, feeFixedUsd: 0.30,
-            settlementDays: 3, reservePercentage: 5.00,
-            reserveHoldDays: 90, anticipationFeePct: 4.99,
-        }, { provider })
     }
 
     async registerKpi(data: { sellerId: string; method: string; amount: number; fee: number; status: string }) {

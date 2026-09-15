@@ -2,6 +2,16 @@ import { ChargeResponse } from './provider.types';
 import { supabase } from '../../lib/supabase.client';
 import { connectedApplicationFee } from '../whop/whop-connected';
 
+/** Membership da Whop reduzida ao que a área do cliente usa. */
+export interface WhopMembershipState {
+  id: string;
+  /** trialing | active | past_due | completed | canceled | expired | unresolved | drafted | canceling */
+  status: string | null;
+  cancelAtPeriodEnd: boolean;
+  /** Fim do período pago (ISO): próxima cobrança, ou fim do acesso se cancelando. */
+  renewalPeriodEnd: string | null;
+}
+
 // ============================================================================
 // WHOP — checkout hospedado/embedado, uma company por conta do pool
 // ----------------------------------------------------------------------------
@@ -822,6 +832,68 @@ export class WhopProvider {
   }
 
   // ─────────────────────────────────────────────
+  // ASSINATURA — membership da Whop (área do cliente)
+  //
+  // Cancelar é sempre no fim do período (`at_period_end`): o comprador já pagou
+  // o ciclo e mantém o acesso até lá. Reativar (uncancel) desfaz o agendamento
+  // enquanto o período não acabou.
+  // ─────────────────────────────────────────────
+
+  async getMembership(
+    membershipId: string,
+    providerConfig: { api_url?: string; apiKey?: string },
+  ): Promise<WhopMembershipState> {
+    return this.membershipRequest('GET', membershipId, '', providerConfig);
+  }
+
+  async cancelMembershipAtPeriodEnd(
+    membershipId: string,
+    providerConfig: { api_url?: string; apiKey?: string },
+  ): Promise<WhopMembershipState> {
+    return this.membershipRequest('POST', membershipId, '/cancel', providerConfig, {
+      cancellation_mode: 'at_period_end',
+    });
+  }
+
+  async uncancelMembership(
+    membershipId: string,
+    providerConfig: { api_url?: string; apiKey?: string },
+  ): Promise<WhopMembershipState> {
+    return this.membershipRequest('POST', membershipId, '/uncancel', providerConfig);
+  }
+
+  private async membershipRequest(
+    method: 'GET' | 'POST',
+    membershipId: string,
+    action: '' | '/cancel' | '/uncancel',
+    providerConfig: { api_url?: string; apiKey?: string },
+    body?: Record<string, unknown>,
+  ): Promise<WhopMembershipState> {
+    const apiUrl = providerConfig.api_url ?? WHOP_API_URL_DEFAULT;
+    const res = await fetch(`${apiUrl}/api/v1/memberships/${encodeURIComponent(membershipId)}${action}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${providerConfig.apiKey}`,
+        Accept: 'application/json',
+        ...(body ? { 'Content-Type': 'application/json' } : {}),
+      },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+
+    const json: any = await res.json().catch(() => ({}));
+    if (!res.ok || !json?.id) {
+      throw new Error(json?.error?.message ?? json?.message ?? `Whop HTTP ${res.status}`);
+    }
+
+    return {
+      id: String(json.id),
+      status: typeof json.status === 'string' ? json.status : null,
+      cancelAtPeriodEnd: json.cancel_at_period_end === true,
+      renewalPeriodEnd: typeof json.renewal_period_end === 'string' ? json.renewal_period_end : null,
+    };
+  }
+
+  // ─────────────────────────────────────────────
   // Registro do webhook da conta (usado no onboarding de uma company nova).
   //
   // N contas = N webhooks = N segredos. Fazer isso na mão em cada company é
@@ -864,6 +936,9 @@ export class WhopProvider {
           'membership.cancel_at_period_end_changed',
           'refund.created',
           'dispute.created',
+          // Alerta antecipado de chargeback (Visa/Mastercard): a Whop pode estornar
+          // a venda sozinha — a taxa de chargeback é cobrada do seller.
+          'dispute_alert.created',
         ],
         api_version: 'v1',
         enabled: true,

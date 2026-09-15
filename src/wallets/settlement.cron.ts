@@ -42,6 +42,17 @@ export class SettlementCronService {
         if (released < BATCH_SIZE) break; // não há mais o que liberar
       }
 
+      // Reservas vencidas voltam ao disponível; as de vendas estornadas são canceladas.
+      const { data: reserveData, error: reserveError } = await supabase.rpc('run_reserve_release_batch', { p_limit: 500 });
+      if (reserveError) {
+        this.logger.error('run_reserve_release_batch error', reserveError);
+      } else {
+        const reserveRow = Array.isArray(reserveData) ? reserveData[0] : reserveData;
+        if (Number(reserveRow?.released_count ?? 0) > 0) {
+          this.logger.log(`Reservas liberadas: ${reserveRow.released_count} (${reserveRow.total_amount} cents)`);
+        }
+      }
+
       this.logger.log(
         `Settlement: ${totalReleased} liberadas (${totalAmount} cents) — apenas pedidos com rastreio`,
       );

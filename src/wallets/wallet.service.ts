@@ -153,6 +153,16 @@ export class WalletService {
       throw new Error('Failed to update pending balance: ' + balanceError.message)
     }
 
+    // A reserva entra no saldo "em reserva" e volta ao disponível no prazo
+    // (run_reserve_release_batch). Falha aqui não desfaz o crédito: a linha fica
+    // sem reserve_counted e a liberação a devolve direto ao disponível.
+    if (reserveAmount > 0) {
+      const { error: reserveError } = await supabase.rpc('count_reserve_hold', { p_transaction_id: transactionId })
+      if (reserveError) {
+        console.error('[WalletService] reserva não somada ao saldo em reserva:', reserveError.message, { transactionId })
+      }
+    }
+
     if (platformFee && platformFee.amount > 0) {
       const { error: platBalanceError } = await supabase.rpc('add_available_balance', {
         p_seller_id: platformFee.walletRef,

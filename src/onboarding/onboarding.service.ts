@@ -1,6 +1,6 @@
 import { Injectable, BadRequestException } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
-import { getSellerFees, calculateFees } from '../shared/fee.calculator'
+import { DEFAULT_FEE_SETTINGS, sellerFeesRow } from '../shared/fee.calculator'
 import { StorageService } from '../lib/storage.service'
 import { DocumentsDto, RequirementsDto } from './onboarding.dto'
 import { ActivationRequestsService } from '../activation/activation-requests.service'
@@ -21,10 +21,6 @@ export const AVAILABLE_METHODS = [
   'webpay', 'rapipago', 'pagofacil', 'bank_transfer',
 ] as const
 
-const FEE_TABLE = {
-  WHITE: { fee_percentage: 9.99,  fee_fixed_usd: 0.59, settlement_days: 3, reserve_percentage: 10.00, reserve_hold_days: 90, anticipation_fee_pct: 4.99, anticipation_days: 0 },
-  GRAY:  { fee_percentage: 14.99, fee_fixed_usd: 0.59, settlement_days: 3, reserve_percentage: 10.00, reserve_hold_days: 90, anticipation_fee_pct: 4.99, anticipation_days: 0 },
-} as const
 
 // Formatos da verificação da Whop: documento em JPEG/PNG/PDF e selfie só
 // JPEG/PNG. O storage aceita WebP, a Whop não — recusar aqui evita um seller
@@ -137,18 +133,13 @@ export class OnboardingService {
     )
 
     // ─── 5. Provisiona seller_fees (tarifas por risco) ─────────────────────────
-    const fees = FEE_TABLE[dto.overallRiskLevel]
+    // Tarifa padrão; o CRM confirma ou ajusta na aprovação.
     await supabase.from('seller_fees').upsert({
-      seller_id:            sellerProfile.id,
-      risk_level:           dto.overallRiskLevel,
-      fee_percentage:       fees.fee_percentage,
-      fee_fixed_usd:        fees.fee_fixed_usd,
-      settlement_days:      fees.settlement_days,
-      reserve_percentage:   fees.reserve_percentage,
-      reserve_hold_days:    fees.reserve_hold_days,
-      anticipation_fee_pct: fees.anticipation_fee_pct,
-      anticipation_days:    fees.anticipation_days,
-      updated_at:           new Date().toISOString(),
+      seller_id:         sellerProfile.id,
+      risk_level:        dto.overallRiskLevel,
+      ...sellerFeesRow(DEFAULT_FEE_SETTINGS),
+      anticipation_days: 0,
+      updated_at:        new Date().toISOString(),
     }, { onConflict: 'seller_id' })
 
     // ─── 6. Marca onboarding como "submetido" ──────────────────────────────────

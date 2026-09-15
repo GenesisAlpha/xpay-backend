@@ -18,11 +18,11 @@ export class CrmAuthGuard implements CanActivate {
     if (!token) throw new UnauthorizedException('Token ausente')
 
     try {
-      const payload = this.jwtService.verify(token, { secret: process.env.CRM_JWT_SECRET })
+      const payload = this.jwtService.verify(token)
       req.manager   = payload
 
-      // Verifica roles se decorador @Roles() estiver presente
-      const roles = this.reflector.get<string[]>('roles', ctx.getHandler())
+      // @Roles() na rota vale; sem ele, vale o @Roles() do controller.
+      const roles = this.reflector.getAllAndOverride<string[]>('roles', [ctx.getHandler(), ctx.getClass()])
       if (roles?.length && !roles.includes(payload.role)) {
         throw new ForbiddenException('Permissão insuficiente')
       }
@@ -40,7 +40,7 @@ import { SetMetadata } from '@nestjs/common'
 export const Roles = (...roles: string[]) => SetMetadata('roles', roles)
 
 // crm-backend/crm.module.ts
-import { Module } from '@nestjs/common'
+import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common'
 import { JwtModule } from '@nestjs/jwt'
 import { CrmController } from './crm.controller'
 import { CrmService }    from './crm.service'
@@ -53,12 +53,19 @@ import { WebhookModule } from '../webhooks/webhook.module'
 import { WhopConnectController } from './whop-connect.controller'
 import { ActivationRequestsController } from './activation-requests.controller'
 import { ActivationModule } from '../activation/activation.module'
+import { crmRequestContext } from './crm-request-context'
 
 @Module({
   imports: [
-    JwtModule.register({
-      secret:       process.env.CRM_JWT_SECRET ?? 'crm-secret-change-me',
-      signOptions:  { expiresIn: '8h' },
+    // Sem segredo padrão: sem CRM_JWT_SECRET o login do CRM recusa e nenhum
+    // token é aceito (antes caía numa senha fixa conhecida).
+    JwtModule.registerAsync({
+      useFactory: () => {
+        if (!process.env.CRM_JWT_SECRET) {
+          console.error('[CrmModule] CRM_JWT_SECRET não definido: login do CRM desativado.')
+        }
+        return { secret: process.env.CRM_JWT_SECRET, signOptions: { expiresIn: '8h' } }
+      },
     }),
     // CryptoModule: cifra api_key/webhook_secret das contas Whop em repouso.
     // OrchestratorModule: WhopAccountsService, pra invalidar o cache do pool na
@@ -79,4 +86,9 @@ import { ActivationModule } from '../activation/activation.module'
   providers:   [CrmService, CrmAdminService, CrmAuthGuard, StorageService],
   exports:     [CrmService, CrmAdminService],
 })
-export class CrmModule {}
+export class CrmModule implements NestModule {
+  // IP e navegador de cada requisição do CRM, para o log de ações.
+  configure(consumer: MiddlewareConsumer) {
+    consumer.apply(crmRequestContext).forRoutes(CrmController, CrmAdminController)
+  }
+}

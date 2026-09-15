@@ -121,6 +121,29 @@ export class PaymentController {
     return this.paymentService.checkUpsellEligibility(req.sellerId as string, transactionId);
   }
 
+  // Assinatura do comprador (área do cliente). O checkout chama com a sk_live_
+  // do vendedor, depois de conferir que o pedido é do comprador logado.
+  // Cancelar vale no fim do período pago; reativar desfaz até lá.
+  @Get(':transactionId/subscription')
+  @UseGuards(ApiKeyGuard)
+  customerSubscription(@Req() req: Request, @Param('transactionId') transactionId: string) {
+    return this.paymentService.getCustomerSubscription(req.sellerId as string, transactionId);
+  }
+
+  @Post(':transactionId/subscription/cancel')
+  @UseGuards(ApiKeyGuard)
+  @HttpCode(HttpStatus.OK)
+  cancelCustomerSubscription(@Req() req: Request, @Param('transactionId') transactionId: string) {
+    return this.paymentService.cancelCustomerSubscription(req.sellerId as string, transactionId);
+  }
+
+  @Post(':transactionId/subscription/reactivate')
+  @UseGuards(ApiKeyGuard)
+  @HttpCode(HttpStatus.OK)
+  reactivateCustomerSubscription(@Req() req: Request, @Param('transactionId') transactionId: string) {
+    return this.paymentService.reactivateCustomerSubscription(req.sellerId as string, transactionId);
+  }
+
   // Comprovante de transferência SPEI. Autenticado com a sk_live_ do seller.
   //
   // Devolve só o ESTADO (paid | in_review | rejected). O detalhe da avaliação

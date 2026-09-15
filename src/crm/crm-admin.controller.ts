@@ -108,8 +108,10 @@ export class CrmAdminController {
     @Req() req: any,
     @Query('search') search?: string,
     @Query('sort') sort?: string,
+    @Query('page') page?: string,
   ) {
-    return this.admin.listBalances(ctxFromReq(req), { search, sort })
+    // Sem `page` (tela antiga do CRM) volta a lista simples.
+    return this.admin.listBalances(ctxFromReq(req), { search, sort, page: page ? parseInt(page) : undefined })
   }
 
   // ── Transactions ─────────────────────────────────────────────────────

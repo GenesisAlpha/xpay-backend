@@ -46,9 +46,8 @@ export class RequestPayoutDto {
   // EM DÓLARES — convertido para centavos no service.
   @IsNumber({ maxDecimalPlaces: 2 })
   @IsPositive()
-  @Min(MIN_WITHDRAW_USD, {
-    message: `O valor mínimo para saque é US$ ${MIN_WITHDRAW_USD.toFixed(2)}.`,
-  })
+  // Mínimo por seller (seller_fees.payout_min_usd, padrão MIN_WITHDRAW_USD),
+  // conferido no service junto das taxas.
   amount: number
 
   @IsIn([...VALID_METHODS, ...BLOCKED_METHODS], {

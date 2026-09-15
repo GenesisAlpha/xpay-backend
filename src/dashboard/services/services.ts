@@ -8,6 +8,8 @@ import { supabase } from '../../lib/supabase.client'
 import * as bcrypt from 'bcrypt';
 import { generateKey, hashKey } from '../../utils/apikeys.utils';
 import * as crypto from 'crypto';
+import { notifySellerPayout } from '../../utils/seller-mail';
+import { calculatePayoutFees, getEffectiveSellerFees, payoutCurrencyForMethod, saleFeePct } from '../../shared/fee.calculator';
 import {
   BLOCKED_METHODS,
   IDEMPOTENCY_KEY_PATTERN,
@@ -243,14 +245,14 @@ export class WalletService {
       .range(from, to)
 
     if (type && type !== 'all') {
-      if (type === 'credit') q = q.in('type', ['credit_pending', 'credit_available', 'release_to_available'])
-      if (type === 'debit') q = q.in('type', ['debit_payout', 'fee_platform'])
+      if (type === 'credit') q = q.in('type', ['credit_pending', 'credit_available', 'release_to_available', 'anticipation_release'])
+      if (type === 'debit') q = q.in('type', ['debit_payout', 'fee_platform', 'anticipation_fee', 'chargeback_fee', 'chargeback_alert_fee', 'chargeback_debit', 'refund'])
     }
 
     const { data, error, count } = await q
     if (error) throw new BadRequestException(error.message)
 
-    const CREDIT_TYPES = ['credit_pending', 'credit_available', 'release_to_available']
+    const CREDIT_TYPES = ['credit_pending', 'credit_available', 'release_to_available', 'anticipation_release']
 
     // 🚚 Busca o tracking das transações de origem (só p/ entradas de crédito = venda)
     const creditTxIds = [...new Set(
@@ -408,6 +410,12 @@ export class WalletService {
       fee_platform: 'Taxa da plataforma',
       release_to_available: 'Reserva liberada',
       debit_payout: 'Saque realizado',
+      anticipation_release: 'Antecipação de valores a liquidar',
+      anticipation_fee: 'Taxa de antecipação',
+      chargeback_debit: 'Chargeback',
+      chargeback_fee: 'Taxa de chargeback',
+      chargeback_alert_fee: 'Taxa de alerta de chargeback',
+      refund: 'Estorno',
     }
     return map[type] ?? type
   }
@@ -561,6 +569,46 @@ export class WalletService {
   }
 
 
+  // ── Taxas do saque ─────────────────────────────────────────────────────────
+  // Mínimo, % e fixa sobre o valor, e spread quando o saque é pago em outra
+  // moeda (Pix em BRL, IBAN em EUR) — tudo da tarifa do seller no CRM.
+  async quotePayout(sellerId: string, amountUsd: number, method: string) {
+    const fees = await getEffectiveSellerFees(sellerId)
+    const payoutCurrency = payoutCurrencyForMethod(method)
+    const converted = payoutCurrency !== 'USD'
+    const amountCents = Number.isFinite(amountUsd) && amountUsd > 0 ? this.usdToCents(amountUsd) : 0
+    const calc = calculatePayoutFees(amountCents, fees, { currencyConverted: converted })
+    return {
+      minUsd: fees.payoutMinUsd,
+      payoutCurrency,
+      feePct: fees.payoutFeePct,
+      feeFixedUsd: fees.payoutFeeFixedUsd,
+      fxFeePct: converted ? fees.payoutFxFeePct : 0,
+      amountCents: calc.amountCents,
+      feeCents: calc.feeCents,
+      fxFeeCents: calc.fxFeeCents,
+      netCents: calc.netCents,
+      amount: calc.amountCents / 100,
+      fee: calc.feeCents / 100,
+      fxFee: calc.fxFeeCents / 100,
+      net: calc.netCents / 100,
+      details: {
+        payout_fee_pct: fees.payoutFeePct,
+        payout_fee_fixed_usd: fees.payoutFeeFixedUsd,
+        payout_fx_fee_pct: converted ? fees.payoutFxFeePct : 0,
+      },
+    }
+  }
+
+  private assertPayoutQuote(amountUsd: number, quote: { minUsd: number; netCents: number }) {
+    if (amountUsd < quote.minUsd) {
+      throw new BadRequestException(`O valor mínimo para saque é US$ ${quote.minUsd.toFixed(2)}.`)
+    }
+    if (quote.netCents <= 0) {
+      throw new BadRequestException('O valor não cobre as taxas de saque.')
+    }
+  }
+
   // ── Caso de uso principal ──────────────────────────────────────────────────
   async requestPayout(
     dto: RequestPayoutDto,
@@ -591,11 +639,18 @@ export class WalletService {
 
     // 4. Chama a RPC — toda a lógica de saldo (ler, travar, debitar
     //    available→pending, inserir no ledger) roda atômica no banco.
+    const quote = await this.quotePayout(dto.sellerId, dto.amount, dto.method)
+    this.assertPayoutQuote(dto.amount, quote)
+
     const { data, error } = await supabase.rpc('request_payout', {
       p_seller_id: dto.sellerId,
       p_amount_cents: amountCents,
       p_method: dto.method,
       p_destination: destination,
+      p_fee_cents: quote.feeCents,
+      p_fx_fee_cents: quote.fxFeeCents,
+      p_payout_currency: quote.payoutCurrency,
+      p_fee_details: quote.details,
     })
 
     // 5. Tratamento de erro.
@@ -626,6 +681,17 @@ export class WalletService {
       `Saque criado: payoutId=${row.payout_id} method=${dto.method} amountCents=${amountCents}`,
     )
 
+    // Aviso ao vendedor (fire-and-forget: e-mail nunca derruba o saque).
+    void notifySellerPayout(dto.sellerId, 'requested', {
+      amountCents,
+      feeCents: quote.feeCents + quote.fxFeeCents,
+      currency: 'USD',
+      method: dto.method,
+      payoutId: row.payout_id,
+      destination,
+      requestedAt: new Date().toISOString(),
+    })
+
     // 6. Resposta — mantém o shape que a modal espera.
     return {
       payoutId: row.payout_id,
@@ -651,6 +717,8 @@ export class WalletService {
 
     const amountCents = this.usdToCents(dto.amount)
     const destination = this.buildDestination(dto)
+    const quote = await this.quotePayout(sellerId, dto.amount, dto.method)
+    this.assertPayoutQuote(dto.amount, quote)
 
     const { data, error } = await supabase.rpc('request_payout_idempotent', {
       p_seller_id: sellerId,
@@ -659,6 +727,10 @@ export class WalletService {
       p_amount_cents: amountCents,
       p_method: dto.method,
       p_destination: destination,
+      p_fee_cents: quote.feeCents,
+      p_fx_fee_cents: quote.fxFeeCents,
+      p_payout_currency: quote.payoutCurrency,
+      p_fee_details: quote.details,
     })
 
     if (error) {
@@ -696,6 +768,19 @@ export class WalletService {
       `Saque ${replayed ? 'repetido' : 'criado'}: payoutId=${row.payoutId} method=${dto.method} amountCents=${amountCents}`,
     )
 
+    // Repetição com a mesma chave devolve o saque já criado: não avisa de novo.
+    if (!replayed) {
+      void notifySellerPayout(sellerId, 'requested', {
+        amountCents,
+        feeCents: quote.feeCents + quote.fxFeeCents,
+        currency: 'USD',
+        method: dto.method,
+        payoutId: String(row.payoutId),
+        destination,
+        requestedAt: new Date().toISOString(),
+      })
+    }
+
     return {
       payoutId: String(row.payoutId),
       status: String(row.status ?? 'processing'),
@@ -712,11 +797,6 @@ export class WalletService {
     }
     if (Math.abs(amount * 100 - Math.round(amount * 100)) > 1e-6) {
       throw new BadRequestException('O valor do saque aceita no máximo duas casas decimais.')
-    }
-    if (amount < MIN_WITHDRAW_USD) {
-      throw new BadRequestException(
-        `O valor mínimo para saque é US$ ${MIN_WITHDRAW_USD.toFixed(2)}.`,
-      )
     }
     const methods: readonly string[] = [...VALID_METHODS, ...BLOCKED_METHODS]
     if (!methods.includes(dto.method as string)) {
@@ -949,15 +1029,14 @@ export class PaymentMethodsService {
     const enabledMethods: string[] = profile?.enabled_methods ?? []
     const isWhopSeller = String(profile?.provider_default ?? '').toLowerCase().replace(/provider$/, '') === 'whop'
 
-    const { data: sellerFees } = await supabase
-      .from('seller_fees').select('*').eq('seller_id', sellerId).maybeSingle()
-
-    const feePercentage = sellerFees?.fee_percentage ?? 0
-    const feeFixedUsd = sellerFees?.fee_fixed_usd ?? 0
-    const settlementDays = sellerFees?.settlement_days ?? 3
-    const reservePct = sellerFees?.reserve_percentage ?? 0
-    const anticipationPct = sellerFees?.anticipation_fee_pct ?? 4.99
-    const feesFormatted = sellerFees ? `${feePercentage}% + $${Number(feeFixedUsd).toFixed(2)}` : '—'
+    // Tarifa efetiva (a do seller ou o padrão).
+    const sellerFees = await getEffectiveSellerFees(sellerId)
+    const feePercentage = saleFeePct(sellerFees)
+    const feeFixedUsd = sellerFees.feeFixedUsd
+    const settlementDays = sellerFees.settlementDays
+    const reservePct = sellerFees.reservePercentage
+    const anticipationPct = sellerFees.anticipationEnabled ? sellerFees.anticipationFeePct : 0
+    const feesFormatted = `${feePercentage}% + $${Number(feeFixedUsd).toFixed(2)}`
 
     const { data: providers } = await supabase
       .from('provider_accounts').select('id, provider, supported_methods, status').eq('status', 'active')
