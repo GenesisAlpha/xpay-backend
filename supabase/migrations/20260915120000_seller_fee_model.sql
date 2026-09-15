@@ -88,15 +88,18 @@ begin
     raise exception 'anticipation fee out of range';
   end if;
 
+  -- Mesma ordem de trava do run_settlement_batch (linhas do ledger, depois o
+  -- saldo): em ordem invertida as duas se bloqueariam e o Postgres abortaria uma.
+  -- Linha que a liquidação já pegou espera o commit dela e sai da soma abaixo.
+  perform 1 from public.wallet_ledger
+  where seller_id = p_seller_id and type = 'credit_pending' and status = 'pending'
+  for update;
+
   select pending_balance into v_balance_pending
   from public.wallet_balance where seller_id = p_seller_id for update;
   if not found then
     raise exception 'wallet not found';
   end if;
-
-  perform 1 from public.wallet_ledger
-  where seller_id = p_seller_id and type = 'credit_pending' and status = 'pending'
-  for update;
 
   select coalesce(sum(amount), 0), count(*) into v_pending, v_count
   from public.wallet_ledger
@@ -117,8 +120,9 @@ begin
   update public.wallet_ledger
      set status = 'completed',
          available_at = v_now,
+         updated_at = v_now,
          metadata = coalesce(metadata, '{}'::jsonb)
-           || jsonb_build_object('anticipated_at', v_now, 'anticipation_ref', v_ref)
+           || jsonb_build_object('anticipated_at', v_now, 'anticipation_ref', v_ref::text)
    where seller_id = p_seller_id and type = 'credit_pending' and status = 'pending';
 
   update public.wallet_balance
@@ -128,12 +132,12 @@ begin
    where seller_id = p_seller_id;
 
   insert into public.wallet_ledger (seller_id, transaction_id, type, amount, currency, status, created_at, metadata)
-  values (p_seller_id, v_ref, 'anticipation_release', v_pending, 'USD', 'completed', v_now,
+  values (p_seller_id, v_ref::text, 'anticipation_release', v_pending, 'USD', 'completed', v_now,
           jsonb_build_object('entries', v_count));
 
   if v_fee > 0 then
     insert into public.wallet_ledger (seller_id, transaction_id, type, amount, currency, status, created_at, metadata)
-    values (p_seller_id, v_ref, 'anticipation_fee', v_fee, 'USD', 'completed', v_now,
+    values (p_seller_id, v_ref::text, 'anticipation_fee', v_fee, 'USD', 'completed', v_now,
             jsonb_build_object('fee_pct', p_fee_pct));
   end if;
 
