@@ -137,6 +137,53 @@ export async function getEffectiveSellerFees(sellerId: string): Promise<SellerFe
   return (await getSellerFees(sellerId)) ?? { ...DEFAULT_SELLER_FEES, sellerId }
 }
 
+// ─── Custo do provider ───────────────────────────────────────────────────────
+//
+// Quanto a Koopfy paga ao provider por venda (modelo definido pelo dono em
+// 2026-09-16, igual para Whop e Stripe): processamento + fixa + orquestração,
+// e conversão de moeda quando a venda não é em USD. É o custo que se desconta
+// da receita da Koopfy para chegar ao lucro da venda. Não é cobrado do seller.
+
+export interface ProviderCostSettings {
+  processingPct: number
+  fixedUsd: number
+  orchestrationPct: number
+  fxPct: number
+}
+
+export const PROVIDER_COST_SETTINGS: ProviderCostSettings = {
+  processingPct: 2.7,
+  fixedUsd: 0.3,
+  orchestrationPct: 0.8,
+  fxPct: 1.5,
+}
+
+export function calculateProviderCost(
+  grossCents: number,
+  options: { currencyConverted: boolean },
+  settings: ProviderCostSettings = PROVIDER_COST_SETTINGS,
+) {
+  const gross = Math.max(0, Math.round(grossCents))
+  const pct = (rate: number) => Math.round((gross * rate) / 100)
+  const processingCents = pct(settings.processingPct)
+  const fixedCents = Math.round(settings.fixedUsd * 100)
+  const orchestrationCents = pct(settings.orchestrationPct)
+  const fxCents = options.currencyConverted ? pct(settings.fxPct) : 0
+  return {
+    processing_cents: processingCents,
+    fixed_cents: fixedCents,
+    orchestration_cents: orchestrationCents,
+    fx_cents: fxCents,
+    total_cents: processingCents + fixedCents + orchestrationCents + fxCents,
+    rates: {
+      processing_pct: settings.processingPct,
+      fixed_usd: settings.fixedUsd,
+      orchestration_pct: settings.orchestrationPct,
+      fx_pct: options.currencyConverted ? settings.fxPct : 0,
+    },
+  }
+}
+
 // ─── Venda ────────────────────────────────────────────────────────────────────
 
 export interface SaleFeeResult {
@@ -151,6 +198,8 @@ export interface SaleFeeResult {
   reserveCents: number
   /** Crédito do seller (vai para `transactions.net_amount`). */
   netCents: number
+  /** Custo do provider para a Koopfy (fica em `fee_breakdown.provider_cost`). */
+  providerCostCents: number
   availableAt: Date
   reserveUntil: Date
   breakdown: Record<string, unknown>
@@ -189,6 +238,7 @@ export function calculateSaleFees(
   const now = options.now ?? new Date()
   const availableAt = nextReleaseDay(addCalendarDays(now, fees.settlementDays))
   const reserveUntil = fees.reserveHoldDays > 0 ? addCalendarDays(now, fees.reserveHoldDays) : now
+  const providerCost = calculateProviderCost(gross, { currencyConverted: options.currencyConverted })
 
   return {
     grossCents: gross,
@@ -200,6 +250,7 @@ export function calculateSaleFees(
     platformFeeCents,
     reserveCents,
     netCents,
+    providerCostCents: providerCost.total_cents,
     availableAt,
     reserveUntil,
     breakdown: {
@@ -221,6 +272,9 @@ export function calculateSaleFees(
         fee_fixed_usd: fees.feeFixedUsd,
         reserve_percentage: fees.reservePercentage,
       },
+      // Custo do provider desta venda, com as taxas do momento: mudar o modelo
+      // depois não reescreve o lucro das vendas passadas.
+      provider_cost: providerCost,
     },
   }
 }
