@@ -946,7 +946,10 @@ export class CrmAdminService {
 
   async listBalances(ctx: AdminContext, params: { search?: string; sort?: string; page?: number; pageSize?: number }) {
     this.assertAdmin(ctx.role)
-    const { search, sort = 'available_desc', page = 1, pageSize = 50 } = params
+    const { search, sort = 'available_desc', page } = params
+    // Chamada sem página = tela antiga: devolve só a lista (até 200), como antes.
+    const legacy = page === undefined
+    const pageSize = legacy ? 200 : (params.pageSize ?? 50)
 
     let q = supabase.from('v_admin_seller_balances').select('*', { count: 'exact' })
     // Vírgula e parênteses quebram o filtro `or` do PostgREST.
@@ -962,11 +965,11 @@ export class CrmAdminService {
     const [col, asc] = sortMap[sort] ?? sortMap.available_desc
     q = q.order(col, { ascending: asc })
 
-    const safePage = Math.max(1, page)
+    const safePage = Math.max(1, page ?? 1)
     const start = (safePage - 1) * pageSize
     const [{ data, error, count }, totals] = await Promise.all([
       q.range(start, start + pageSize - 1),
-      this.balanceTotals(),
+      legacy ? Promise.resolve(null) : this.balanceTotals(),
     ])
     if (error) throw new BadRequestException(error.message)
 
@@ -987,6 +990,8 @@ export class CrmAdminService {
       chargebacks_30d_count: Number(b.chargebacks_30d_count ?? 0),
       last_withdrawal_at: b.last_withdrawal_at,
     }))
+
+    if (legacy || !totals) return rows
 
     return {
       data: rows,
