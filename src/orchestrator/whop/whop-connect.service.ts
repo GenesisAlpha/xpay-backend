@@ -402,21 +402,34 @@ export class WhopConnectService implements OnModuleInit {
   // ─────────────────────────────────────────────
 
   /**
-   * O que o seller precisa corrigir ou enviar: faltantes do cadastro da LLC e
-   * pedidos da Whop sem resposta automática. Seller com CNPJ vende pela master
-   * e não tem pendência de conta conectada.
+   * O que falta para a conta conectada: dados e documentos da LLC que o
+   * cadastro ainda não tem e pedidos da Whop sem resposta automática.
+   *
+   * Vale para toda conta que não é CNPJ — inclusive a aprovada antes do
+   * onboarding novo, sem tipo de empresa gravado. Seller com CNPJ liberado no
+   * CRM vende pela master e não tem conta conectada a criar.
+   *
+   * `connected.ready`: cadastro completo para o CRM criar a conta conectada.
    */
   async getSellerRequirements(sellerId: string) {
     const [row, source] = await Promise.all([this.getRow(sellerId), this.loadSellerSource(sellerId)]);
     const companyType = source.documents?.company_type ?? null;
-    if (companyType !== 'US') {
-      return { companyType, connectedStatus: row?.status ?? null, items: [] as SellerRequirementItem[] };
+    const connectedStatus = row?.status ?? null;
+
+    if (companyType === 'BR') {
+      return {
+        companyType,
+        connectedStatus,
+        connected: { required: false, ready: false, status: connectedStatus },
+        items: [] as SellerRequirementItem[],
+      };
     }
 
     const plan = planBusinessVerification(source.kyc, source.documents, { website: source.website });
     return {
       companyType,
-      connectedStatus: row?.status ?? null,
+      connectedStatus,
+      connected: { required: true, ready: plan.missing.length === 0, status: connectedStatus },
       items: sellerRequirementItems(plan.gaps, row?.rfi_unanswered ?? []),
     };
   }

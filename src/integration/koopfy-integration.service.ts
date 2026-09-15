@@ -19,6 +19,15 @@ import { supabase } from '../lib/supabase.client';
 import { StorageService } from '../lib/storage.service';
 import { generateKey, hashKey } from '../utils/apikeys.utils';
 import { SellerCtx } from './cross-service-jwt.guard';
+import {
+  AccountState,
+  accountAliasEmail,
+  accountState,
+  listSellerAccounts,
+  resolveAccountUserId,
+} from './seller-accounts';
+
+const CREATE_ACCOUNT_FAILED = 'Não foi possível criar a conta financeira agora. Tente novamente.';
 import { WalletService } from '../dashboard/services/services';
 import { ActivationRequestsService } from '../activation/activation-requests.service';
 import { WhopConnectService } from '../orchestrator/whop/whop-connect.service';
@@ -68,12 +77,22 @@ export class KoopfyIntegrationService {
    * (faltantes do cadastro da LLC + pedidos da Whop). Falha aqui não derruba o
    * status — sem pendências o painel segue o fluxo normal.
    */
-  private async loadRequirements(userId: string, sellerId: string | null, documentsSubmitted: boolean, rejectionReason: string | null) {
+  private async loadRequirements(
+    userId: string,
+    sellerId: string | null,
+    documentsSubmitted: boolean,
+    sellerActive: boolean,
+    rejectionReason: string | null,
+  ) {
     try {
       const [activation, requirements] = await Promise.all([
         this.activationRequests.getForUser(userId),
-        // Antes de enviar os documentos a etapa do onboarding já pede tudo.
-        sellerId && documentsSubmitted ? this.whopConnect.getSellerRequirements(sellerId) : Promise.resolve(null),
+        // Durante o onboarding a etapa de documentos já pede tudo. Conta ativa é
+        // verificada sempre: pode ter sido aprovada antes do cadastro da LLC e
+        // ainda não ter o que a conta conectada exige.
+        sellerId && (documentsSubmitted || sellerActive)
+          ? this.whopConnect.getSellerRequirements(sellerId)
+          : Promise.resolve(null),
       ]);
       return {
         cnpjAllowed: activation.cnpjAllowed,
@@ -81,11 +100,12 @@ export class KoopfyIntegrationService {
         rejectionReason,
         companyType: requirements?.companyType ?? null,
         connectedStatus: requirements?.connectedStatus ?? null,
+        connected: requirements?.connected ?? null,
         items: requirements?.items ?? [],
       };
     } catch (err: any) {
       console.error('[integration] requirements:', err?.message);
-      return { cnpjAllowed: false, activationRequest: null, rejectionReason, companyType: null, connectedStatus: null, items: [] };
+      return { cnpjAllowed: false, activationRequest: null, rejectionReason, companyType: null, connectedStatus: null, connected: null, items: [] };
     }
   }
 
@@ -205,6 +225,124 @@ export class KoopfyIntegrationService {
 
     return { provisioned: true, alreadyExisted: false, userId: user.id };
   }
+
+  /** Contas Koopfy Payments do usuário: a principal (do e-mail) e as criadas a mais. */
+  listAccounts(email: string) {
+    return listSellerAccounts(email);
+  }
+
+  /**
+   * Conta nova, do zero: cadastro, documentos, saldo e repasses próprios.
+   *
+   * A primeira conta do e-mail é a principal (igual ao provisionamento). As
+   * seguintes ganham um usuário interno ligado ao dono (users.owner_user_id),
+   * para os dados gravados por user_id não se misturarem com os da principal.
+   */
+  async createAccount(email: string, body: { name?: unknown }) {
+    const normEmail = (email ?? '').toLowerCase().trim();
+    const name = typeof body?.name === 'string' && body.name.trim() ? body.name.trim().slice(0, 120) : null;
+
+    const { data: owner } = await supabase
+      .from('users')
+      .select('id, name')
+      .eq('email', normEmail)
+      .maybeSingle();
+
+    if (!owner) {
+      const created = await this.provision(normEmail, name ? { name } : {});
+      const { data: seller } = await supabase
+        .from('seller_profiles')
+        .select('id')
+        .eq('user_id', created.userId)
+        .maybeSingle();
+      if (!seller) throw new BadRequestException(CREATE_ACCOUNT_FAILED);
+      return { sellerId: seller.id as string, primary: true };
+    }
+
+    // Usuário do e-mail sem seller (cadastro antigo incompleto): a nova conta é a principal.
+    const { data: ownerSeller } = await supabase
+      .from('seller_profiles')
+      .select('id')
+      .eq('user_id', owner.id)
+      .maybeSingle();
+    if (!ownerSeller) {
+      const sellerId = await this.insertSellerProfile(owner.id, name ?? owner.name ?? normEmail.split('@')[0], normEmail, null);
+      return { sellerId, primary: true };
+    }
+
+    const accountEmail = accountAliasEmail(normEmail);
+    const accountName = name ?? owner.name ?? normEmail.split('@')[0];
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .insert({
+        email: accountEmail,
+        password_hash: await bcrypt.hash(uuidv4() + uuidv4(), 12),
+        name: accountName,
+        email_verified: true,
+        kyc_completed: false,
+        operation_setup_completed: false,
+        onboarding_completed: false,
+        owner_user_id: owner.id,
+        created_at: new Date().toISOString(),
+      })
+      .select('id')
+      .single();
+
+    if (userError || !user) {
+      console.error('[integration] createAccount user:', userError);
+      throw new BadRequestException(CREATE_ACCOUNT_FAILED);
+    }
+
+    try {
+      const sellerId = await this.insertSellerProfile(user.id, accountName, normEmail, accountEmail);
+      return { sellerId, primary: false };
+    } catch (err) {
+      await supabase.from('users').delete().eq('id', user.id); // rollback
+      throw err;
+    }
+  }
+
+  /**
+   * seller_profiles + carteira, como no provisionamento. O e-mail do perfil é o
+   * do dono (é para onde vão os e-mails ao seller); se o banco recusar e-mail
+   * repetido, usa o interno da conta.
+   */
+  private async insertSellerProfile(userId: string, name: string, email: string, fallbackEmail: string | null) {
+    const row = (profileEmail: string) => ({
+      user_id: userId,
+      name,
+      email: profileEmail,
+      enabled_methods: [],
+      risk_level: 'WHITE',
+      kyc_status: 'pending',
+      status: 'pending_review',
+      config: {
+        settlement: { delayDays: 3 },
+        reserve: { percentage: 0, holdDays: 0 },
+      },
+      metadata: {},
+      created_at: new Date().toISOString(),
+    });
+
+    let { data: profile, error } = await supabase.from('seller_profiles').insert(row(email)).select('id').single();
+    if (error?.code === '23505' && fallbackEmail) {
+      ({ data: profile, error } = await supabase.from('seller_profiles').insert(row(fallbackEmail)).select('id').single());
+    }
+    if (error || !profile) {
+      console.error('[integration] createAccount profile:', error);
+      throw new BadRequestException(CREATE_ACCOUNT_FAILED);
+    }
+
+    const { error: walletError } = await supabase.from('wallet_balance').insert({
+      seller_id: profile.id,
+      available_balance: 0,
+      pending_balance: 0,
+      reserved_balance: 0,
+    });
+    if (walletError) console.error('[integration] createAccount wallet:', walletError.message);
+
+    return profile.id as string;
+  }
   /**
    * Status do seller para o checkout decidir o estado do card "Koopfy Pay".
    * - notFound: não tem conta no pay
@@ -212,16 +350,20 @@ export class KoopfyIntegrationService {
    * - active:   aprovado, pode ativar/usar
    * - rejected/suspended: bloqueado
    */
-  async getStatus(email: string) {
+  async getStatus(email: string, sellerId: string | null = null) {
     const normEmail = (email ?? '').toLowerCase().trim();
 
-    const { data: user } = await supabase
-      .from('users')
-      .select(
-        'id, name, email, avatar_url, instagram, created_at, kyc_completed, operation_setup_completed, documents_completed, onboarding_completed',
-      )
-      .eq('email', normEmail)
-      .maybeSingle();
+    // Conta que o workspace usa (header) ou a principal do e-mail.
+    const accountUserId = await resolveAccountUserId(normEmail, sellerId);
+    const { data: user } = accountUserId
+      ? await supabase
+          .from('users')
+          .select(
+            'id, name, email, avatar_url, instagram, created_at, kyc_completed, operation_setup_completed, documents_completed, onboarding_completed',
+          )
+          .eq('id', accountUserId)
+          .maybeSingle()
+      : { data: null as any };
 
     // Email ainda não tem conta no Koopfy Pay → o checkout deve oferecer criar
     // (onboarding), não tratar como erro de comunicação.
@@ -250,13 +392,7 @@ export class KoopfyIntegrationService {
     // Usamos documents_completed (último passo) p/ distinguir.
     const documentsSubmitted = !!user?.documents_completed;
 
-    let state: 'not_found' | 'onboarding' | 'pending' | 'active' | 'rejected' | 'suspended';
-    if (!seller) state = 'not_found';
-    else if (sellerStatus === 'active') state = 'active';
-    else if (sellerStatus === 'rejected') state = 'rejected';
-    else if (sellerStatus === 'suspended') state = 'suspended';
-    else if (!documentsSubmitted) state = 'onboarding'; // provisionada, KYC ainda não enviado
-    else state = 'pending'; // KYC enviado, aguardando aprovação
+    const state: 'not_found' | AccountState = seller ? accountState(sellerStatus, documentsSubmitted) : 'not_found';
 
     // Dados da conta detectada (login unificado por email) — usados na UI para
     // oferecer "associar esta conta" em vez de criar uma nova.
@@ -264,7 +400,8 @@ export class KoopfyIntegrationService {
       ? {
           sellerId: seller.id,
           name: user?.name ?? null,
-          email: user?.email ?? normEmail,
+          // Conta a mais tem e-mail interno: mostra o do usuário logado.
+          email: normEmail,
           avatarUrl: user?.avatar_url ?? null,
           instagram: user?.instagram ?? null,
           createdAt: user?.created_at ?? null,
@@ -272,7 +409,7 @@ export class KoopfyIntegrationService {
       : null;
 
     const requirements = seller
-      ? await this.loadRequirements(user.id, seller.id, documentsSubmitted, seller.rejection_reason ?? null)
+      ? await this.loadRequirements(user.id, seller.id, documentsSubmitted, sellerStatus === 'active', seller.rejection_reason ?? null)
       : null;
 
     return {
@@ -356,16 +493,10 @@ export class KoopfyIntegrationService {
    * Produtos. Sem conta ou sem grupo definido devolve `url: null` — a UI
    * desabilita o botão explicando o motivo, em vez de abrir aba em branco.
    */
-  async getLogisticsChannel(email: string) {
-    const normEmail = (email ?? '').toLowerCase().trim();
-
-    const { data: user } = await supabase
-      .from('users')
-      .select('id')
-      .eq('email', normEmail)
-      .maybeSingle();
-
-    if (!user) return { url: null as string | null };
+  async getLogisticsChannel(email: string, sellerId: string | null = null) {
+    const userId = await resolveAccountUserId(email, sellerId);
+    if (!userId) return { url: null as string | null };
+    const user = { id: userId };
 
     const { data: seller } = await supabase
       .from('seller_profiles')
@@ -386,14 +517,9 @@ export class KoopfyIntegrationService {
    * usa). Sem conta provisionada devolve `not_found`: o checkout mostra o CTA
    * de ativação em vez de zeros, que seriam enganosos.
    */
-  async getBalance(email: string) {
-    const normEmail = (email ?? '').toLowerCase().trim();
-
-    const { data: user } = await supabase
-      .from('users')
-      .select('id')
-      .eq('email', normEmail)
-      .maybeSingle();
+  async getBalance(email: string, sellerId: string | null = null) {
+    const userId = await resolveAccountUserId(email, sellerId);
+    const user = userId ? { id: userId } : null;
 
     const { data: seller } = user
       ? await supabase
@@ -432,19 +558,12 @@ export class KoopfyIntegrationService {
    * Isso mantém `whop_subscriptions` privada e evita IDOR mesmo usando service
    * role nesta integração server-to-server.
    */
-  async getSubscriptions(email: string, query: Record<string, any> = {}) {
-    const normEmail = (email ?? '').toLowerCase().trim();
+  async getSubscriptions(email: string, query: Record<string, any> = {}, sellerId: string | null = null) {
     const workspaceId = String(query.workspaceId ?? '').trim();
     if (!workspaceId) throw new BadRequestException('Workspace obrigatório.');
 
-    const { data: user, error: userError } = await supabase
-      .from('users')
-      .select('id')
-      .eq('email', normEmail)
-      .maybeSingle();
-    if (userError) {
-      throw new BadRequestException('Não foi possível localizar a conta no Koopfy Pay.');
-    }
+    const userId = await resolveAccountUserId(email, sellerId);
+    const user = userId ? { id: userId } : null;
 
     const { data: seller, error: sellerError } = user
       ? await supabase

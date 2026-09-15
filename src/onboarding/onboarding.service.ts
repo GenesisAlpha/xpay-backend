@@ -303,12 +303,16 @@ export class OnboardingService {
       throw new BadRequestException('Selfie deve ser JPEG ou PNG.')
     }
 
+    // Conta ativa aprovada antes do cadastro da LLC pode não ter a linha de
+    // documentos (ou não ter o tipo de empresa): o que ela envia aqui é da LLC.
     const { data: current } = await supabase
       .from('seller_documents')
-      .select('company_address')
+      .select('company_address, company_type')
       .eq('user_id', userId)
       .maybeSingle()
-    if (!current) throw new BadRequestException('Envie os documentos do cadastro antes das pendências.')
+    if (current?.company_type === 'BR') {
+      throw new BadRequestException('Contas com CNPJ vendem pela Koopfy e não precisam de conta conectada.')
+    }
 
     const upload = (field: string, file?: { base64: string; mime: string }) =>
       file
@@ -343,7 +347,7 @@ export class OnboardingService {
     set('company_formation_state', 'company_formation_state', dto.companyFormationState)
     if (dto.companyAddressLine1 || dto.companyCity || dto.companyState || dto.companyPostalCode) {
       // Endereço vem por partes: o que não veio fica como estava.
-      const previous = current.company_address ?? {}
+      const previous = current?.company_address ?? {}
       set('company_address', 'company_address', {
         line1: dto.companyAddressLine1?.trim() || previous.line1 || null,
         line2: dto.companyAddressLine2 !== undefined ? (dto.companyAddressLine2.trim() || null) : (previous.line2 ?? null),
@@ -365,10 +369,15 @@ export class OnboardingService {
     const now = new Date().toISOString()
 
     if (Object.keys(patch).length > 0) {
-      const { error } = await supabase
-        .from('seller_documents')
-        .update({ ...patch, updated_at: now })
-        .eq('user_id', userId)
+      // Sem linha ou sem tipo de empresa: o que chega aqui é da LLC.
+      const { error } = current
+        ? await supabase
+            .from('seller_documents')
+            .update({ ...patch, ...(current.company_type ? {} : { company_type: 'US' }), updated_at: now })
+            .eq('user_id', userId)
+        : await supabase
+            .from('seller_documents')
+            .insert({ user_id: userId, company_type: 'US', ...patch, updated_at: now })
       if (error) {
         console.error('[onboarding] submitRequirements documents:', error)
         throw new BadRequestException('Não foi possível salvar as pendências agora. Tente novamente.')
