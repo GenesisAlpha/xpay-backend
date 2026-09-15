@@ -16,7 +16,10 @@ import { FEE_FIELDS, FEE_TOGGLES, feeChanges, parseFeeSettings } from './fee-con
 import * as bcrypt from 'bcrypt'
 
 
-const VALID_PROVIDERS = ['stripe', 'viva', 'sibs', 'stripe_crypto', 'onramp', 'setinel_gate', 'approvebly', 'coinflow', 'rox_pay', 'whop', 'clip', 'simulator'] as const
+// Provedores que o CRM pode atribuir. Sellers antigos com outro provider seguem
+// funcionando, mas não recebem mais essas opções.
+const VALID_PROVIDERS = ['whop', 'stripe'] as const
+const DEFAULT_PROVIDER: ProviderDefault = 'whop'
 type ProviderDefault = typeof VALID_PROVIDERS[number] | null
 
 /** Hosts de WhatsApp aceitos no grupo da operação logística. */
@@ -420,6 +423,8 @@ export class CrmService {
   async approveSeller(sellerId: string, managerId: string, dto: {
     riskLevel: 'WHITE' | 'GRAY' | 'BLACK'
     enabledMethods: string[]
+    /** Provedor padrão do seller; sem valor, entra como Whop. */
+    provider?: ProviderDefault
     /** Taxas editadas na aprovação (camelCase ou nome da coluna); o resto fica no padrão. */
     fees?: Record<string, unknown>
     /** Nome antigo de `fees`. */
@@ -445,6 +450,14 @@ export class CrmService {
 
     const logisticsGroupUrl = normalizeWhatsappUrl(dto.logisticsGroupUrl)
 
+    const provider = dto.provider ?? DEFAULT_PROVIDER
+    if (!VALID_PROVIDERS.includes(provider as any)) {
+      throw new BadRequestException(`Provider inválido. Use um de: ${VALID_PROVIDERS.join(', ')}.`)
+    }
+    if (!dto.enabledMethods?.length) {
+      throw new BadRequestException('Selecione ao menos um método de pagamento.')
+    }
+
     // O risco não define mais a taxa: a aprovação parte do padrão (ou do que já
     // está gravado) com o que o gerente editou no formulário.
     const currentFees = await getSellerFees(sellerId)
@@ -458,6 +471,7 @@ export class CrmService {
         status: 'active',
         risk_level: dto.riskLevel,
         enabled_methods: dto.enabledMethods,
+        provider_default: provider,
         reviewed_at: new Date(),
         reviewed_by: managerId,
         rejection_reason: null,
@@ -505,6 +519,7 @@ export class CrmService {
 
     await this.log(sellerId, managerId, 'approved', {
       riskLevel: dto.riskLevel,
+      provider,
       enabledMethods: dto.enabledMethods,
       fees: sellerFeesRow(fees),
       notes: dto.notes,

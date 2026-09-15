@@ -107,6 +107,8 @@ export class CrmController {
     @Body() body: {
       riskLevel: 'WHITE' | 'GRAY' | 'BLACK'
       enabledMethods: string[]
+      /** Provedor padrão; sem valor, Whop. */
+      provider?: 'whop' | 'stripe'
       feeOverride?: any
       fees?: any
       notes?: string
@@ -378,7 +380,7 @@ export class CrmController {
     @Param('id') id: string,
     @Req() req: any,
     @Body() body: {
-      provider: 'stripe' | 'viva' | 'sibs' | 'stripe_crypto' | 'onramp' | 'setinel_gate' | 'approvebly' | 'coinflow' | 'rox_pay' | 'whop' | 'simulator' | null
+      provider: 'whop' | 'stripe' | null
       notes?: string
     },
   ) {
