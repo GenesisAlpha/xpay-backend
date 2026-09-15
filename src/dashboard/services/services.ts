@@ -9,7 +9,7 @@ import * as bcrypt from 'bcrypt';
 import { generateKey, hashKey } from '../../utils/apikeys.utils';
 import * as crypto from 'crypto';
 import { notifySellerPayout } from '../../utils/seller-mail';
-import { calculatePayoutFees, getEffectiveSellerFees, payoutCurrencyForMethod, saleFeePct } from '../../shared/fee.calculator';
+import { calculatePayoutFees, getEffectiveSellerFees, payoutCurrencyForMethod, publicFeeBreakdown, saleFeePct } from '../../shared/fee.calculator';
 import {
   BLOCKED_METHODS,
   IDEMPOTENCY_KEY_PATTERN,
@@ -158,6 +158,8 @@ export class TransactionsService {
       fee: fromCents(data.fee),
       netAmount: fromCents(data.net_amount),
       reserveAmount: fromCents(data.reserve_amount),
+      // Processamento, orquestração, checkout, fixa e câmbio separados (nulo em venda antiga).
+      feeBreakdown: publicFeeBreakdown(data.fee_breakdown),
       createdAt: data.created_at,
       approvedAt: data.approved_at,
       failedAt: data.failed_at,

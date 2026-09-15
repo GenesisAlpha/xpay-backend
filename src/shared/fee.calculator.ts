@@ -225,6 +225,35 @@ export function calculateSaleFees(
   }
 }
 
+/**
+ * `transactions.fee_breakdown` → taxas separadas em USD para as telas.
+ * Nulo quando a venda é anterior ao modelo de taxas (sem breakdown): a tela
+ * mostra só o total de `transactions.fee`.
+ */
+export function publicFeeBreakdown(breakdown: any) {
+  if (!breakdown || typeof breakdown !== 'object' || breakdown.processing_fee_cents == null) return null
+  const usd = (cents: unknown) => round2(Number(cents ?? 0) / 100)
+  const rate = (value: unknown) => {
+    const n = Number(value ?? 0)
+    return Number.isFinite(n) ? n : 0
+  }
+  const rates = breakdown.rates ?? {}
+  return {
+    processing: usd(breakdown.processing_fee_cents),
+    orchestration: usd(breakdown.orchestration_fee_cents),
+    checkout: usd(breakdown.checkout_fee_cents),
+    fixed: usd(breakdown.fixed_fee_cents),
+    fx: usd(breakdown.fx_fee_cents),
+    rates: {
+      processingPct: rate(rates.processing_fee_pct),
+      orchestrationPct: rate(rates.orchestration_fee_pct),
+      checkoutPct: rate(rates.checkout_fee_pct),
+      fixedUsd: rate(rates.fee_fixed_usd),
+      fxPct: rate(rates.fx_fee_pct),
+    },
+  }
+}
+
 // ─── Saque ────────────────────────────────────────────────────────────────────
 
 export interface PayoutFeeResult {

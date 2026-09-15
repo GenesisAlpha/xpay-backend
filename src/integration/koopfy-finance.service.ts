@@ -75,6 +75,7 @@ function publicTransaction(transaction: any) {
       transaction.reserveAmount == null
         ? undefined
         : Number(transaction.reserveAmount),
+    feeBreakdown: transaction.feeBreakdown ?? null,
     status: transaction.status,
     createdAt: transaction.createdAt,
     approvedAt: transaction.approvedAt ?? null,
