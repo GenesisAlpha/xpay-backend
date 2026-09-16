@@ -602,6 +602,15 @@ export class WhopLinkedAccountsService {
     if (!identifier) {
       throw new Error('KOOPFY_WHOP_AFFILIATE ausente: sem ele a Koopfy não vira afiliada e a comissão não é cobrada.');
     }
+    // Afiliado na Whop é sempre uma PESSOA (username, e-mail, user_… ou Discord).
+    // Com um biz_ a Whop recusa e a comissão passaria a não ser cobrada em
+    // silêncio — melhor falhar aqui, dizendo o que está errado.
+    if (identifier.startsWith('biz_')) {
+      throw new Error(
+        `KOOPFY_WHOP_AFFILIATE está com um id de empresa (${identifier}): use o usuário dono da conta `
+        + '(e-mail, username ou user_…), porque a comissão de afiliado é creditada a uma pessoa.',
+      );
+    }
 
     const affiliate = await this.whopPost(apiKey, apiUrl, '/api/v1/affiliates', {
       account_id: companyId,
