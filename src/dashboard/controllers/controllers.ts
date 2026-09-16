@@ -2,6 +2,7 @@
 
 import {
   Controller, Get, Post, Patch, Param, Query, Body, Req, UseGuards,
+  ForbiddenException,
   HttpCode,
   Delete,
   HttpStatus
@@ -109,6 +110,10 @@ export class WalletController {
 
   @Post('payout')
   async requestPayout(@Req() req: any, @Body() body: any) {
+    // Acesso da equipe ao painel é para VER. Sacar continua sendo do seller.
+    if (req.user?.act) {
+      throw new ForbiddenException('Saque não é permitido no acesso da equipe ao painel do seller.')
+    }
     const sellerId = await getSellerId(req.user.sub)
     body.sellerId = sellerId;
     return this.svc.requestPayout(body)

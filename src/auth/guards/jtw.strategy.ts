@@ -14,7 +14,9 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     });
   }
 
-  async validate(payload: { sub: string; email: string }) {
+  // `act` marca sessão aberta pela equipe no CRM (acesso ao painel do seller):
+  // quem lê decide o que fazer — o saque, por exemplo, é recusado.
+  async validate(payload: { sub: string; email: string; act?: { manager_id?: string; role?: string } }) {
     // Valida que o user ainda existe e está ativo
     const { data: user } = await supabase
       .from('users')
@@ -26,6 +28,6 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       throw new UnauthorizedException('Token inválido');
     }
 
-    return { sub: user.id, email: user.email };
+    return { sub: user.id, email: user.email, act: payload.act ?? null };
   }
 }
