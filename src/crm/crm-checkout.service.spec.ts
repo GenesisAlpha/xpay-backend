@@ -195,6 +195,67 @@ describe('listagens', () => {
   })
 })
 
+describe('trocar a conta de pagamento da loja', () => {
+  const ctx = { managerId: 'gerente-1' }
+
+  beforeEach(() => {
+    respostas['admin/workspaces/w-1'] = {
+      workspace: { id: 'w-1', name: 'Loja Brasil' },
+      owner: { id: 'user-checkout', name: 'Ana', email: 'ANA@loja.com' },
+      paymentAccount: { sellerId: 's-principal', gateways: [] },
+    }
+  })
+
+  it('aceita a conta a mais do mesmo dono', async () => {
+    respostas['admin/workspaces/w-1/payment-account'] = {
+      workspaceId: 'w-1', previousSellerId: 's-principal', sellerId: 's-extra', unlinked: false,
+    }
+
+    const result = await service.setStoreAccount('w-1', 's-extra', ctx)
+
+    expect(result).toMatchObject({ sellerId: 's-extra', previousSellerId: 's-principal', storeName: 'Loja Brasil' })
+    const [url, init] = fetchMock.mock.calls.at(-1) as any
+    expect(String(url)).toBe('http://checkout.test/internal/admin/workspaces/w-1/payment-account')
+    expect(JSON.parse(init.body)).toEqual({ sellerId: 's-extra', managerId: 'gerente-1' })
+  })
+
+  it('recusa conta de outro dono, que é para onde o dinheiro iria parar', async () => {
+    const erro: any = await service.setStoreAccount('w-1', 's-socio', ctx).catch(e => e)
+
+    expect(erro.status).toBe(400)
+    expect(erro.message).toContain('não é do dono da loja')
+    // Nada foi escrito no checkout: só a leitura da loja aconteceu.
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('desvincular não precisa de conta e avisa o checkout', async () => {
+    respostas['admin/workspaces/w-1/payment-account'] = {
+      workspaceId: 'w-1', previousSellerId: 's-principal', sellerId: null, unlinked: true,
+    }
+
+    const result = await service.setStoreAccount('w-1', null, ctx)
+
+    expect(result).toMatchObject({ unlinked: true, sellerId: null, accountName: null })
+  })
+})
+
+describe('reenviar pedido para a Shopify', () => {
+  it('repassa a loja do pedido para o checkout', async () => {
+    respostas['admin/orders/o-1/shopify'] = { shopifyOrderId: '123' }
+
+    await expect(service.resendOrderToShopify('o-1', 'w-1')).resolves.toMatchObject({ shopifyOrderId: '123' })
+    const [, init] = fetchMock.mock.calls.at(-1) as any
+    expect(JSON.parse(init.body)).toEqual({ workspaceId: 'w-1' })
+  })
+
+  it('sem a loja nem chama o checkout', async () => {
+    const erro: any = await service.resendOrderToShopify('o-1', '').catch(e => e)
+
+    expect(erro.status).toBe(400)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+})
+
 describe('checkout fora do ar', () => {
   it('vira 503 dizendo a ação e a causa', async () => {
     fetchMock.mockRejectedValueOnce(new Error('connect ECONNREFUSED 127.0.0.1:3006'))

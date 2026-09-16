@@ -9,7 +9,7 @@
 // gestor abre a ficha do seller e não descobre de qual conta sai o dinheiro das
 // lojas dele — que é justamente a pergunta que ele faz.
 
-import { Injectable, ServiceUnavailableException } from '@nestjs/common'
+import { BadRequestException, Injectable, ServiceUnavailableException } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
 import { normalizeEmail } from '../integration/seller-accounts'
 import { checkoutFailureMessage, checkoutInternal } from './checkout-internal'
@@ -35,6 +35,10 @@ export interface CheckoutSellerDetail {
 
 export interface CheckoutStoreDetail {
   paymentAccount?: { sellerId?: string | null; [extra: string]: unknown } | null
+  // Usados na troca de conta: o dono manda em quais contas podem receber as
+  // vendas da loja, e o nome entra no log de ações.
+  owner?: { id?: string; name?: string | null; email?: string | null } | null
+  workspace?: { id?: string; name?: string | null; [extra: string]: unknown } | null
   [extra: string]: unknown
 }
 
@@ -303,5 +307,63 @@ export class CrmCheckoutService {
     const res = await checkoutInternal<T>(path)
     if (res === null) throw new ServiceUnavailableException(checkoutFailureMessage(acao))
     return res
+  }
+
+  // ─── Ações (só admin; o controller cuida do papel) ─────────────────────────
+
+  /**
+   * Troca, ou desfaz, a conta Koopfy Payments que a loja usa.
+   *
+   * Isto redireciona dinheiro: as vendas da loja passam a cair na conta nova.
+   * Por isso a conta precisa ser do MESMO dono da loja — a conta principal do
+   * e-mail dele ou uma das contas a mais (`users.owner_user_id`). Apontar a loja
+   * de um seller para a conta de outro é sempre engano ou fraude.
+   */
+  async setStoreAccount(workspaceId: string, sellerId: string | null, ctx: { managerId: string }) {
+    const store = await this.fetchOrFail<CheckoutStoreDetail>(
+      `admin/workspaces/${encodeURIComponent(workspaceId)}`,
+      'carregar a loja no checkout',
+    )
+
+    const ownerEmail = normalizeEmail(store.owner?.email as string | undefined)
+    let account: (SellerProfileRow & { isOwnerAccount: boolean }) | undefined
+
+    if (sellerId) {
+      if (!ownerEmail) {
+        throw new BadRequestException('A loja não tem dono com e-mail no checkout: não dá para conferir a conta.')
+      }
+      const allowed = await this.accountsOfEmail(ownerEmail)
+      account = allowed.find((candidate) => candidate.id === sellerId)
+      if (!account) {
+        throw new BadRequestException(
+          'Esta conta de pagamento não é do dono da loja. Só a conta principal dele ou uma das contas a mais pode receber as vendas desta loja.',
+        )
+      }
+    }
+
+    const result = await checkoutInternal<{ workspaceId: string; previousSellerId: string | null; sellerId: string | null; unlinked: boolean }>(
+      `admin/workspaces/${encodeURIComponent(workspaceId)}/payment-account`,
+      { sellerId, managerId: ctx.managerId },
+    )
+    if (result === null) {
+      throw new ServiceUnavailableException(checkoutFailureMessage('mudar a conta de pagamento da loja'))
+    }
+
+    return { ...result, accountName: account?.name ?? null, storeName: store.workspace?.name ?? null }
+  }
+
+  /**
+   * Reenvia à Shopify um pedido pago que não chegou lá. O checkout recusa pedido
+   * já sincronizado, então clicar duas vezes não cria pedido duplicado na loja.
+   */
+  async resendOrderToShopify(orderId: string, workspaceId: string) {
+    if (!workspaceId) throw new BadRequestException('Informe a loja do pedido.')
+
+    const result = await checkoutInternal<Record<string, unknown>>(
+      `admin/orders/${encodeURIComponent(orderId)}/shopify`,
+      { workspaceId },
+    )
+    if (result === null) throw new ServiceUnavailableException(checkoutFailureMessage('reenviar o pedido para a Shopify'))
+    return result
   }
 }
