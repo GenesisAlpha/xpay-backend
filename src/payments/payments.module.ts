@@ -8,6 +8,7 @@ import { OrchestratorModule } from '../orchestrator/orchestrator.module';
 import { CryptoModule } from '../crypto/crypto.module';
 import { WebhookModule } from '../webhooks/webhook.module';
 import { StorageService } from '../lib/storage.service';
+import { AffiliatesModule } from '../affiliates/affiliates.module';
 
 @Module({
   imports: [
@@ -23,6 +24,7 @@ import { StorageService } from '../lib/storage.service';
     // conta derrubada no fluxo de pagamento continuava saudável no fluxo de
     // sessão, e o balanceamento por déficit lia caches divergentes.
     OrchestratorModule,
+    AffiliatesModule,
   ],
   providers: [
     PaymentService,

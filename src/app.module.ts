@@ -13,6 +13,7 @@ import { CurrencyModule } from './currency/currency.module';
 import { CryptoModule } from './crypto/crypto.module';
 import { OnboardingModule } from './onboarding/onboarding.module';
 import { CrmModule } from './crm/crm.module';
+import { AffiliatesModule } from './affiliates/affiliates.module';
 import { KoopfyIntegrationModule } from './integration/koopfy-integration.module';
 import { AppController } from './app.controller';
 
@@ -46,6 +47,7 @@ import { AppController } from './app.controller';
     CurrencyModule,
     CryptoModule,
     CrmModule,
+    AffiliatesModule,
 
     // Integração com o serviço checkout (Koopfy Pay como gateway)
     KoopfyIntegrationModule
