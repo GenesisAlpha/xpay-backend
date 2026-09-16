@@ -17,6 +17,7 @@ const row = (over: Partial<WhopLinkedAccountRow> = {}): WhopLinkedAccountRow => 
   webhook_id: null,
   webhook_secret: null,
   status: 'active',
+  wallet_ready: true,
   commission_pct: 3,
   affiliate_id: null,
   affiliate_code: null,
@@ -83,6 +84,7 @@ describe('sellerExternalProviderView', () => {
       companyTitle: 'Loja do Seller',
       commissionPct: 3,
       affiliateReady: true,
+      walletReady: true,
       blocker: null,
       lastError: 'comissão salva só na Koopfy',
     });
@@ -93,8 +95,23 @@ describe('sellerExternalProviderView', () => {
       accountName: 'Loja do Seller',
       commissionPct: 3,
       charging: true,
+      walletReady: true,
       attention: null,
     });
+  });
+
+  it('chave sem permissão de saldo avisa que o financeiro não abre', () => {
+    const view = sellerExternalProviderView({
+      allowed: true,
+      connected: true,
+      status: 'active',
+      commissionPct: 3,
+      walletReady: false,
+      blocker: null,
+    });
+    expect(view?.charging).toBe(true);
+    expect(view?.walletReady).toBe(false);
+    expect(view?.attention).toMatch(/saldo e saque/);
   });
 
   it('chave recusada vira recado para ele conectar de novo', () => {

@@ -76,6 +76,15 @@ export class KoopfyIntegrationService {
     );
   }
 
+  /**
+   * Sessão da carteira da Whop dele para o painel montar saldo, extrato e saque
+   * sem o dinheiro passar pela Koopfy.
+   */
+  externalProviderWallet(ctx: SellerCtx) {
+    if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
+    return this.whopLinked.walletSession(ctx.seller.id);
+  }
+
   async disconnectExternalProvider(ctx: SellerCtx) {
     if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
     return sellerExternalProviderView(
@@ -557,6 +566,14 @@ export class KoopfyIntegrationService {
 
     if (!seller) {
       return { state: 'not_found' as const, currency: WALLET_CURRENCY, balance: null };
+    }
+
+    // Conta externa: o dinheiro nunca entra na carteira da Koopfy, então o card
+    // da home mostraria zeros verdadeiros e enganosos. Diz de onde é o saldo e
+    // manda para a tela que lê a conta dele.
+    const external = await this.whopLinked.status(seller.id).catch(() => null);
+    if (external?.connected) {
+      return { state: 'external' as const, currency: WALLET_CURRENCY, balance: null };
     }
 
     const b = await this.wallet.getBalance(seller.id);

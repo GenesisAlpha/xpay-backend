@@ -41,6 +41,8 @@ export interface WhopLinkedAccountRow {
   webhook_id: string | null;
   webhook_secret: string | null;
   status: 'allowed' | 'active' | 'invalid' | 'disabled';
+  /** A chave dele libera saldo/extrato/saque no painel (Wallet Elements). */
+  wallet_ready: boolean;
   commission_pct: number;
   affiliate_id: string | null;
   affiliate_code: string | null;
@@ -72,6 +74,8 @@ export interface SellerExternalProviderView {
   commissionPct: number;
   /** Cobrando na conta dele (conectada e sem impedimento). */
   charging: boolean;
+  /** Saldo, extrato e saque da conta dele podem aparecer no painel. */
+  walletReady: boolean;
   /** Recado para ele agir — chave recusada, por exemplo. */
   attention: string | null;
 }
@@ -90,10 +94,13 @@ export function sellerExternalProviderView(view: any): SellerExternalProviderVie
     accountName: view.companyTitle ?? null,
     commissionPct: Number(view.commissionPct ?? DEFAULT_LINKED_COMMISSION_PCT),
     charging: connected && view.status === 'active' && !view.blocker,
+    walletReady: Boolean(view.walletReady),
     attention:
       connected && view.status === 'invalid'
         ? 'A Whop recusou a chave de API. Gere uma nova e conecte de novo.'
-        : null,
+        : connected && !view.walletReady
+          ? 'Sua chave não libera saldo e saque. Gere outra com essas permissões e conecte de novo para usar o Financeiro aqui.'
+          : null,
   };
 }
 

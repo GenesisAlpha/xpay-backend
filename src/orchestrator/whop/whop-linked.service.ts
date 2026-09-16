@@ -32,6 +32,19 @@ const WHOP_API_URL_DEFAULT = 'https://api.whop.com';
 // no caminho quente sem segurar uma revogação por muito tempo.
 const CACHE_TTL_MS = 15 * 1000;
 
+// O painel mostra saldo, extrato e saque da conta DELE com os Wallet Elements
+// da Whop. Eles pedem um token curto, emitido com a chave dele e limitado a
+// estas ações — nunca a chave inteira no browser.
+const WALLET_SCOPES = [
+  'company:balance:read',
+  'payout:withdraw_funds',
+  'payout:destination:read',
+  'payout:create_destination',
+];
+
+// Uma hora é o padrão da Whop (o teto é três). O painel pede outro quando expira.
+const WALLET_TOKEN_TTL_MS = 60 * 60 * 1000;
+
 @Injectable()
 export class WhopLinkedAccountsService {
   constructor(private readonly crypto: CryptoService) {}
@@ -97,6 +110,59 @@ export class WhopLinkedAccountsService {
     return this.publicView(await this.getRow(sellerId));
   }
 
+  /**
+   * Token curto para o painel montar a carteira da Whop dele (saldo, extrato e
+   * saque) dentro da Koopfy. O dinheiro nunca passa por nós: o saque sai da
+   * conta dele direto para o banco dele — a Koopfy só desenha a tela.
+   */
+  async walletSession(sellerId: string) {
+    const row = await this.getRow(sellerId);
+    if (!row?.whop_account_id) {
+      throw new NotFoundException('Nenhuma conta de provedor externo conectada.');
+    }
+
+    const apiKey = this.reveal(row);
+    if (!apiKey) {
+      throw new BadRequestException('A chave da sua conta externa não pôde ser lida. Conecte a conta novamente.');
+    }
+
+    const expiresAt = new Date(Date.now() + WALLET_TOKEN_TTL_MS).toISOString();
+    try {
+      const session = await this.whopPost(apiKey, row.api_url ?? WHOP_API_URL_DEFAULT, '/api/v1/access_tokens', {
+        account_id: row.whop_account_id,
+        scoped_actions: WALLET_SCOPES,
+        expires_at: expiresAt,
+      });
+
+      const token = String(session?.token ?? '').trim();
+      if (!token) throw new Error('a Whop não devolveu o token da carteira');
+
+      if (!row.wallet_ready) await this.markWallet(sellerId, true, null);
+      return {
+        accountId: row.whop_account_id,
+        accessToken: token,
+        expiresAt: session?.expires_at ?? expiresAt,
+      };
+    } catch (err: any) {
+      // Chave sem os escopos de saldo/saque: o seller precisa gerar outra, e a
+      // tela dele tem que dizer isso em vez de ficar vazia.
+      const reason = err?.message ?? String(err);
+      await this.markWallet(sellerId, false, reason.slice(0, 500));
+      throw new BadRequestException(
+        `A Whop não liberou o saldo desta conta (${reason}). Gere uma chave com permissão de saldo e saque e conecte de novo.`,
+      );
+    }
+  }
+
+  private async markWallet(sellerId: string, ready: boolean, error: string | null) {
+    const { error: dbError } = await supabase
+      .from(TABLE)
+      .update({ wallet_ready: ready, ...(error ? { last_error: error } : {}), updated_at: new Date().toISOString() })
+      .eq('seller_id', sellerId);
+    if (dbError) console.error('[WhopLinked] wallet_ready:', dbError.message);
+    this.cache.delete(sellerId);
+  }
+
   /** Conta pronta para cobrar? É o que decide o roteamento da venda. */
   async isChargeable(sellerId: string): Promise<boolean> {
     const row = await this.getRow(sellerId);
@@ -156,11 +222,26 @@ export class WhopLinkedAccountsService {
       return { id: null, code: null, overrideId: null, error: String(err?.message ?? err).slice(0, 300) };
     });
 
+    // A chave serve para o financeiro do painel (saldo, extrato e saque)? Vale
+    // saber agora, na tela em que ele ainda tem a chave na mão, e não depois,
+    // quando ele for sacar.
+    const walletReady = await this.whopPost(key, company.apiUrl, '/api/v1/access_tokens', {
+      account_id: company.id,
+      scoped_actions: WALLET_SCOPES,
+      expires_at: new Date(Date.now() + WALLET_TOKEN_TTL_MS).toISOString(),
+    })
+      .then(session => Boolean(String(session?.token ?? '').trim()))
+      .catch((err: any) => {
+        console.error(`[WhopLinked] carteira da conta ${company.id}:`, err?.message);
+        return false;
+      });
+
     const now = new Date().toISOString();
     const { error } = await supabase.from(TABLE).upsert(
       {
         seller_id: sellerId,
         whop_account_id: company.id,
+        wallet_ready: walletReady,
         company_title: company.title,
         api_key: this.crypto.encrypt(key),
         api_url: company.apiUrl,
@@ -269,6 +350,8 @@ export class WhopLinkedAccountsService {
       commissionPct: Number(row.commission_pct ?? 0),
       // Sem afiliado + rev-share na conta dele, a Koopfy não recebe nada.
       affiliateReady: Boolean(row.affiliate_id && row.affiliate_override_id),
+      // Saldo, extrato e saque da conta dele dentro do painel da Koopfy.
+      walletReady: Boolean(row.wallet_ready),
       blocker: linkedChargeBlocker(row),
       lastCheckedAt: row.last_checked_at,
       lastError: row.last_error,
