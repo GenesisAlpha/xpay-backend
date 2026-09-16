@@ -983,9 +983,14 @@ export class CrmService {
   // =========================================
 
   /**
-   * Link que abre o painel com a sessão DO SELLER, para a equipe ver o que ele
-   * vê. Vale 15 minutos e o token carrega `act` (quem abriu): o saque é
-   * recusado nesse acesso e a abertura fica no log do seller.
+   * Link que abre o PAINEL DO CHECKOUT com a sessão do seller, para a equipe ver
+   * o que ele vê. O painel do seller vive no checkout (app.koopfy.com), então
+   * quem gera a entrada é o checkout: aqui só dizemos de qual conta se trata e
+   * ele devolve um código de uso único (/internal/support-access/seller).
+   *
+   * A sessão de lá é de suporte: 15 minutos, não renova e o checkout recusa
+   * saque, antecipação e retentativa de transferência nela. A abertura fica no
+   * log do seller.
    *
    * Mesma regra das outras ações: admin e supervisor em qualquer seller,
    * gerente só nos que assumiu.
@@ -1007,23 +1012,22 @@ export class CrmService {
       .maybeSingle()
     if (!user) throw new NotFoundException('Conta do seller não encontrada.')
 
-    if (!process.env.JWT_SECRET) {
-      throw new ServiceUnavailableException('Acesso ao painel indisponível: JWT_SECRET ausente.')
-    }
-
-    const token = jwt.sign(
-      { sub: user.id, email: user.email, act: { manager_id: manager.sub, role: manager.role } },
-      process.env.JWT_SECRET,
-      { expiresIn: '15m' },
+    const access = await checkoutInternal<{ url: string; expiresInMinutes?: number }>(
+      'support-access/seller',
+      {
+        sellerId: seller.id,
+        email: user.email,
+        managerId: manager.sub,
+        managerRole: manager.role,
+      },
     )
+    if (!access?.url) {
+      throw new ServiceUnavailableException(checkoutFailureMessage('abrir o painel do seller'))
+    }
 
     await this.log(sellerId, manager.sub, 'seller.panel_access', { seller_name: seller.name ?? null })
 
-    const base = (process.env.FRONTEND_URL ?? 'https://merchant.koopfy.com').replace(/\/+$/, '')
-    return {
-      url: `${base}/sso?token=${encodeURIComponent(token)}&next=/dashboard`,
-      expiresInMinutes: 15,
-    }
+    return { url: access.url, expiresInMinutes: access.expiresInMinutes ?? 15 }
   }
 
   // =========================================
