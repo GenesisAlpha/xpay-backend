@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
+import { DEFAULT_PAYOUT_CYCLE, nextPayoutDate, normalizeCycle, type PayoutCycle } from './payout-cycle'
 
 /**
  * Comissão de afiliado sobre o platform_fee.
@@ -12,15 +13,12 @@ import { supabase } from '../lib/supabase.client'
  * o vínculo já resolvido, em `seller_referrals`.
  */
 
-/**
- * Carência antes da comissão virar sacável.
- *
- * Não é risco de reembolso: num refund a Koopfy mantém as taxas, então a
- * comissão sobre elas também se mantém. A carência existe pelo risco do
- * *indicado* — seller que entra, gera volume e some, deixando chargeback na
- * conta master. 30 dias é o tempo de esse sinal aparecer.
- */
-const COMMISSION_HOLD_DAYS = 30
+// A carência não é risco de reembolso: num refund a Koopfy mantém as taxas,
+// então a comissão sobre elas também se mantém. Ela existe pelo risco do
+// *indicado* — seller que entra, gera volume e some, deixando chargeback na
+// conta master. O prazo dá tempo desse sinal aparecer antes do dinheiro sair.
+//
+// O afiliado recebe em data fixa do mês, não a cada venda: ver payout-cycle.ts.
 
 export interface ReferralRow {
   seller_id: string
@@ -29,6 +27,12 @@ export interface ReferralRow {
   affiliate_code: string | null
   commission_rate_pct: number
   expires_at: string
+}
+
+interface CycleRow {
+  affiliate_seller_id: string
+  payout_day: number
+  hold_days: number
 }
 
 export interface AffiliateCommissionPlan {
@@ -62,10 +66,10 @@ export class AffiliateCommissionService {
       // não há o que creditar, e uma linha de 0 só suja o extrato.
       if (commissionCents <= 0) return null
 
-      // A comissão nunca fica disponível antes da própria venda liquidar: a
-      // Koopfy não pode pagar sobre receita que ainda não recebeu.
-      const holdUntil = new Date(Date.now() + COMMISSION_HOLD_DAYS * 24 * 60 * 60 * 1000)
-      const availableAt = saleAvailableAt > holdUntil ? saleAvailableAt : holdUntil
+      // Cai na carteira na data de ciclo do afiliado, nunca antes da própria
+      // venda liquidar — a Koopfy não paga sobre receita que não recebeu.
+      const cycle = await this.cycleFor(referral.affiliate_seller_id)
+      const availableAt = nextPayoutDate(new Date(), saleAvailableAt, cycle)
 
       return {
         affiliateSellerId: referral.affiliate_seller_id,
@@ -77,6 +81,20 @@ export class AffiliateCommissionService {
       this.logger.error(`planFor(${sellerId}): ${err?.message ?? err}`)
       return null
     }
+  }
+
+  /** Ciclo de pagamento do afiliado, ou o padrão da plataforma. */
+  private async cycleFor(affiliateSellerId: string): Promise<PayoutCycle> {
+    const { data } = await supabase
+      .from('affiliate_payout_cycles')
+      .select('payout_day, hold_days')
+      .eq('affiliate_seller_id', affiliateSellerId)
+      .maybeSingle()
+
+    if (!data) return DEFAULT_PAYOUT_CYCLE
+
+    const row = data as CycleRow
+    return normalizeCycle({ payoutDay: row.payout_day, holdDays: row.hold_days })
   }
 
   /** Vínculo do seller, se ainda dentro da janela de comissionamento. */

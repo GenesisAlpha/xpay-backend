@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
+import { DEFAULT_PAYOUT_CYCLE, normalizeCycle } from './payout-cycle'
 
 /**
  * Leitura das comissões de um afiliado.
@@ -11,8 +12,10 @@ import { supabase } from '../lib/supabase.client'
 @Injectable()
 export class AffiliateEarningsService {
 
-  /** Totais por estágio, em centavos de USD. */
+  /** Totais por estágio, em centavos de USD, mais o ciclo de pagamento. */
   async summary(affiliateSellerId: string) {
+    const cycle = await this.cycleOf(affiliateSellerId)
+
     const { data } = await supabase
       .from('affiliate_commissions')
       .select('commission_cents, status, source_seller_id, available_at')
@@ -44,7 +47,23 @@ export class AffiliateEarningsService {
       earningSellers: new Set(rows.map(r => r.source_seller_id)).size,
       commissionCount: rows.length,
       nextReleaseAt: nextRelease,
+      // O afiliado precisa saber a regra, não só a próxima data: sem isso
+      // "por que meu saldo não caiu ainda" vira ticket.
+      cycle,
     }
+  }
+
+  /** Ciclo do afiliado, ou o padrão da plataforma. */
+  private async cycleOf(affiliateSellerId: string) {
+    const { data } = await supabase
+      .from('affiliate_payout_cycles')
+      .select('payout_day, hold_days')
+      .eq('affiliate_seller_id', affiliateSellerId)
+      .maybeSingle()
+
+    if (!data) return DEFAULT_PAYOUT_CYCLE
+
+    return normalizeCycle({ payoutDay: data.payout_day, holdDays: data.hold_days })
   }
 
   /** Extrato, do mais recente para o mais antigo. */

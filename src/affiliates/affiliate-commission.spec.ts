@@ -1,17 +1,24 @@
 // A comissão sai de dentro do platform_fee, então o que importa provar é que o
 // seller indicado nunca paga a mais e que a soma fecha com o fee original.
+// A data de pagamento em si é do payout-cycle.spec.
 
-const maybeSingle = jest.fn()
+const referralResult = jest.fn()
+const cycleResult = jest.fn()
 
 jest.mock('../lib/supabase.client', () => ({
     supabase: {
-        from: () => ({
-            select: () => ({
-                eq: () => ({
-                    gt: () => ({ maybeSingle }),
-                }),
-            }),
-        }),
+        // Duas tabelas com formatos de query diferentes: o vínculo filtra por
+        // expires_at (.gt), o ciclo não. Um chain só não serve para as duas.
+        from: (table: string) => {
+            const terminal = table === 'seller_referrals' ? referralResult : cycleResult
+            const chain: any = {
+                select: () => chain,
+                eq: () => chain,
+                gt: () => chain,
+                maybeSingle: () => terminal(),
+            }
+            return chain
+        },
     },
 }))
 
@@ -39,14 +46,17 @@ describe('AffiliateCommissionService.planFor', () => {
 
     beforeEach(() => {
         jest.useFakeTimers().setSystemTime(NOW)
-        maybeSingle.mockReset()
+        referralResult.mockReset()
+        cycleResult.mockReset()
+        // Sem linha de ciclo vale o padrão da plataforma.
+        cycleResult.mockResolvedValue({ data: null })
         service = new AffiliateCommissionService()
     })
 
     afterEach(() => jest.useRealTimers())
 
     it('gives the affiliate its share of the platform fee', async () => {
-        maybeSingle.mockResolvedValue(referral())
+        referralResult.mockResolvedValue(referral())
 
         const plan = await service.planFor('sell_1', 1000, SALE_AVAILABLE_AT)
 
@@ -54,51 +64,59 @@ describe('AffiliateCommissionService.planFor', () => {
     })
 
     it('never takes more than the fee — platform keeps the remainder', async () => {
-        maybeSingle.mockResolvedValue(referral())
+        referralResult.mockResolvedValue(referral())
 
         const platformFeeCents = 999
         const plan = await service.planFor('sell_1', platformFeeCents, SALE_AVAILABLE_AT)
 
-        // O que sobra pra plataforma mais a comissão tem que fechar com o fee.
         expect(plan!.commissionCents + (platformFeeCents - plan!.commissionCents)).toBe(platformFeeCents)
         expect(plan!.commissionCents).toBeLessThan(platformFeeCents)
     })
 
-    it('holds the commission for 30 days, past the sale settlement', async () => {
-        maybeSingle.mockResolvedValue(referral())
+    it('pays on the affiliate cycle date, not a rolling date', async () => {
+        referralResult.mockResolvedValue(referral())
 
         const plan = await service.planFor('sell_1', 1000, SALE_AVAILABLE_AT)
 
-        // A venda libera em D+3, mas a comissão espera os 30 dias de carência.
-        expect(plan!.availableAt.toISOString()).toBe('2026-10-16T12:00:00.000Z')
+        // Venda em 16/set com carência de 15 passa do dia 30 → ciclo de outubro.
+        expect(plan!.availableAt.toISOString().slice(0, 10)).toBe('2026-10-30')
+    })
+
+    it('honours the cycle configured for the affiliate', async () => {
+        referralResult.mockResolvedValue(referral())
+        cycleResult.mockResolvedValue({ data: { payout_day: 10, hold_days: 5 } })
+
+        const plan = await service.planFor('sell_1', 1000, SALE_AVAILABLE_AT)
+
+        // 16/set + 5 = 21/set, já passou do dia 10 → 10/out.
+        expect(plan!.availableAt.toISOString().slice(0, 10)).toBe('2026-10-10')
     })
 
     it('never pays before the sale itself settles', async () => {
-        maybeSingle.mockResolvedValue(referral())
+        referralResult.mockResolvedValue(referral())
 
-        // Venda com liberação longa (produto físico sem rastreio, por exemplo).
-        const farOut = new Date('2026-12-01T00:00:00.000Z')
-        const plan = await service.planFor('sell_1', 1000, farOut)
+        // Venda com liberação longa (físico sem rastreio, por exemplo).
+        const plan = await service.planFor('sell_1', 1000, new Date('2026-12-01T00:00:00.000Z'))
 
-        expect(plan!.availableAt).toEqual(farOut)
+        expect(plan!.availableAt.toISOString().slice(0, 10)).toBe('2026-12-30')
     })
 
     it('skips a referral whose window has closed', async () => {
         // O filtro de expires_at é do banco; sem linha, não há comissão.
-        maybeSingle.mockResolvedValue({ data: null })
+        referralResult.mockResolvedValue({ data: null })
 
         expect(await service.planFor('sell_1', 1000, SALE_AVAILABLE_AT)).toBeNull()
     })
 
     it('skips when the fee is too small to leave a cent', async () => {
-        maybeSingle.mockResolvedValue(referral())
+        referralResult.mockResolvedValue(referral())
 
         // 20% de 4 centavos arredonda pra baixo: nada a creditar.
         expect(await service.planFor('sell_1', 4, SALE_AVAILABLE_AT)).toBeNull()
     })
 
     it('does not break the sale when the lookup fails', async () => {
-        maybeSingle.mockRejectedValue(new Error('supabase down'))
+        referralResult.mockRejectedValue(new Error('supabase down'))
 
         expect(await service.planFor('sell_1', 1000, SALE_AVAILABLE_AT)).toBeNull()
     })
