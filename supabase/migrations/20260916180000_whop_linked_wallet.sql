@@ -16,7 +16,8 @@ comment on column public.whop_linked_accounts.wallet_ready is
 -- (ou um duplo clique) vire dois saques na conta dele.
 create table if not exists public.whop_linked_withdrawals (
   id uuid primary key default gen_random_uuid(),
-  seller_id uuid not null,
+  -- text, igual a whop_linked_accounts.seller_id (não uuid).
+  seller_id text not null,
   whop_account_id text not null,
   whop_withdrawal_id text,
   idempotency_key text not null unique,
