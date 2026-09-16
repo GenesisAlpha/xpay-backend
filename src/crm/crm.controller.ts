@@ -69,11 +69,18 @@ export class CrmController {
 
   // Abre o painel com a sessão do seller (15 min). O saque fica bloqueado nesse
   // acesso e a abertura entra no log do seller.
+  //
+  // `workspaceId` vem da tela quando o gestor está olhando uma loja específica —
+  // a conta de pagamento pode servir várias.
   @Post('sellers/:id/panel-access')
   @UseGuards(CrmAuthGuard)
   @HttpCode(HttpStatus.OK)
-  sellerPanelAccess(@Param('id') id: string, @Req() req: any) {
-    return this.crm.sellerPanelAccess(id, req.manager)
+  sellerPanelAccess(
+    @Param('id') id: string,
+    @Req() req: any,
+    @Body() body: { workspaceId?: string },
+  ) {
+    return this.crm.sellerPanelAccess(id, req.manager, body?.workspaceId)
   }
 
   // ─── Assignment ───────────────────────────────────────────────────────────

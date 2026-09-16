@@ -46,6 +46,8 @@ import { CrmController } from './crm.controller'
 import { CrmService }    from './crm.service'
 import { CrmAdminController } from './crm-admin.controller'
 import { CrmAdminService } from './crm-admin.service'
+import { CrmCheckoutController } from './crm-checkout.controller'
+import { CrmCheckoutService } from './crm-checkout.service'
 import { StorageService } from '../lib/storage.service'
 import { CryptoModule } from '../crypto/crypto.module'
 import { OrchestratorModule } from '../orchestrator/orchestrator.module'
@@ -83,13 +85,15 @@ import { crmRequestContext } from './crm-request-context'
   ],
   // WhopConnectController: conta conectada da Whop por seller (serviço vem do
   // OrchestratorModule).
-  controllers: [CrmController, CrmAdminController, WhopConnectController, WhopLinkedController, ActivationRequestsController],
-  providers:   [CrmService, CrmAdminService, CrmAuthGuard, StorageService],
-  exports:     [CrmService, CrmAdminService],
+  // CrmCheckoutController: sellers e lojas do checkout (só leitura, via canal
+  // interno).
+  controllers: [CrmController, CrmAdminController, CrmCheckoutController, WhopConnectController, WhopLinkedController, ActivationRequestsController],
+  providers:   [CrmService, CrmAdminService, CrmCheckoutService, CrmAuthGuard, StorageService],
+  exports:     [CrmService, CrmAdminService, CrmCheckoutService],
 })
 export class CrmModule implements NestModule {
   // IP e navegador de cada requisição do CRM, para o log de ações.
   configure(consumer: MiddlewareConsumer) {
-    consumer.apply(crmRequestContext).forRoutes(CrmController, CrmAdminController)
+    consumer.apply(crmRequestContext).forRoutes(CrmController, CrmAdminController, CrmCheckoutController)
   }
 }

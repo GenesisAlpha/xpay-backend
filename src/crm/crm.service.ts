@@ -18,6 +18,9 @@ import { FEE_FIELDS, FEE_TOGGLES, feeChanges, parseFeeSettings } from './fee-con
 import * as bcrypt from 'bcrypt'
 import { LoginAttemptLimiter } from './crm-login-limiter'
 import { currentCrmRequest } from './crm-request-context'
+// Canal interno com o checkout: agora em módulo próprio, porque o CrmCheckoutService
+// usa o mesmo canal (e o mesmo motivo da última falha) para a visão do checkout.
+import { checkoutFailureMessage, checkoutInternal } from './checkout-internal'
 
 const loginLimiter = new LoginAttemptLimiter()
 
@@ -30,65 +33,6 @@ type ProviderDefault = typeof VALID_PROVIDERS[number] | null
 
 /** Hosts de WhatsApp aceitos no grupo da operação logística. */
 const WHATSAPP_HOSTS = ['chat.whatsapp.com', 'wa.me', 'api.whatsapp.com', 'web.whatsapp.com']
-
-// ─── Canal interno com o checkout ─────────────────────────────────────────────
-//
-// A esteira logística (produtos, fila, carteira do parceiro) vive no banco do
-// CHECKOUT. O CRM é a TELA onde o gestor decide, mas não é o dono do dado —
-// guardar aqui obrigaria o painel da DSB a uma chamada cross-service por linha.
-//
-// Por isso: o CRM grava lá, via segredo compartilhado.
-
-const CHECKOUT_API_BASE = process.env.CHECKOUT_API_BASE ?? 'http://127.0.0.1:3006'
-const CHECKOUT_INTERNAL_KEY = process.env.CHECKOUT_INTERNAL_KEY ?? ''
-
-// Último motivo REAL de falha, para a tela não culpar a chave quando o problema
-// é outro. O helper continua devolvendo null (as telas do CRM não podem cair
-// quando o checkout oscila), mas agora dá pra dizer o que aconteceu.
-let lastCheckoutFailure: string | null = null
-
-/** Mensagem de erro que aponta a causa provável, não um palpite fixo. */
-function checkoutFailureMessage(acao: string): string {
-  const causa = lastCheckoutFailure ?? 'motivo desconhecido'
-  return `Não foi possível ${acao}: ${causa} (checkout em ${CHECKOUT_API_BASE}).`
-}
-
-async function checkoutInternal<T>(path: string, body?: any): Promise<T | null> {
-  if (!CHECKOUT_INTERNAL_KEY) {
-    lastCheckoutFailure = 'CHECKOUT_INTERNAL_KEY não configurada no serviço de pagamentos'
-    console.error('[CrmService] CHECKOUT_INTERNAL_KEY não configurada')
-    return null
-  }
-  try {
-    const res = await fetch(`${CHECKOUT_API_BASE}/internal/${path}`, {
-      method: body === undefined ? 'GET' : 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-internal-key': CHECKOUT_INTERNAL_KEY,
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(8000),
-    })
-    if (!res.ok) {
-      const corpo = await res.text()
-      lastCheckoutFailure = res.status === 401 || res.status === 403
-        ? `o checkout recusou a chave interna (HTTP ${res.status}) — confira CHECKOUT_INTERNAL_KEY aqui e INTERNAL_API_KEY lá`
-        : `o checkout respondeu HTTP ${res.status}`
-      console.error(`[CrmService] checkout ${path}: ${res.status} ${corpo}`)
-      return null
-    }
-    lastCheckoutFailure = null
-    return (await res.json()) as T
-  } catch (e: any) {
-    // Falha de comunicação não pode derrubar a ficha do seller no CRM.
-    const msg = String(e?.message ?? e)
-    lastCheckoutFailure = /timeout|abort/i.test(msg)
-      ? 'o checkout não respondeu a tempo (8s)'
-      : `não foi possível conectar ao checkout (${msg})`
-    console.error(`[CrmService] checkout ${path}:`, msg)
-    return null
-  }
-}
 
 /**
  * Valida e normaliza a URL do grupo logístico.
@@ -994,8 +938,16 @@ export class CrmService {
    *
    * Mesma regra das outras ações: admin e supervisor em qualquer seller,
    * gerente só nos que assumiu.
+   *
+   * `workspaceId` é a loja escolhida na tela: uma conta de pagamento pode servir
+   * várias lojas, e quem sabe em qual delas o gestor está olhando é o CRM, não o
+   * checkout. Sem ele, o checkout continua escolhendo como sempre escolheu.
    */
-  async sellerPanelAccess(sellerId: string, manager: { sub: string; role: string }) {
+  async sellerPanelAccess(
+    sellerId: string,
+    manager: { sub: string; role: string },
+    workspaceId?: string,
+  ) {
     await this.assertCanManage(sellerId, manager)
 
     const { data: seller } = await supabase
@@ -1012,6 +964,8 @@ export class CrmService {
       .maybeSingle()
     if (!user) throw new NotFoundException('Conta do seller não encontrada.')
 
+    const loja = String(workspaceId ?? '').trim()
+
     const access = await checkoutInternal<{ url: string; expiresInMinutes?: number }>(
       'support-access/seller',
       {
@@ -1019,13 +973,19 @@ export class CrmService {
         email: user.email,
         managerId: manager.sub,
         managerRole: manager.role,
+        // O checkout dá prioridade à loja quando ela vem.
+        ...(loja ? { workspaceId: loja } : {}),
       },
     )
     if (!access?.url) {
       throw new ServiceUnavailableException(checkoutFailureMessage('abrir o painel do seller'))
     }
 
-    await this.log(sellerId, manager.sub, 'seller.panel_access', { seller_name: seller.name ?? null })
+    await this.log(sellerId, manager.sub, 'seller.panel_access', {
+      seller_name: seller.name ?? null,
+      // Em qual loja o gestor entrou: sem isto, o log não diz o que ele viu.
+      workspace_id: loja || null,
+    })
 
     return { url: access.url, expiresInMinutes: access.expiresInMinutes ?? 15 }
   }
