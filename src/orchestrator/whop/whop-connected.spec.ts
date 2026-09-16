@@ -13,7 +13,9 @@ import {
   isDefinitiveWhopFailure,
   negativeFiatBalances,
   RFI_NOT_COLLECTED,
+  mergeRequestedInformation,
   planBusinessVerification,
+  planIndividualVerification,
   planRfiAnswers,
   rfiRequirementsForKeys,
   sellerRequirementItems,
@@ -313,6 +315,42 @@ describe('decideConnectedMode', () => {
   });
 });
 
+describe('planIndividualVerification', () => {
+  it('monta a verificação da pessoa com os dados do cadastro', () => {
+    const plan = planIndividualVerification(kyc);
+    expect(plan.missing).toEqual([]);
+    expect(plan.verification).toMatchObject({
+      kind: 'individual',
+      country: 'BR',
+      first_name: 'Maria',
+      date_of_birth: '1990-05-17',
+      tax_identification_number: '52998224725',
+      address: { country: 'BR', state: 'SP' },
+    });
+    expect(plan.verification?.phone).toMatch(/^\+/);
+  });
+
+  it('sem telefone ou CPF não cria a verificação e diz o que falta', () => {
+    const plan = planIndividualVerification({ ...kyc, phone: null, cpf: null });
+    expect(plan.verification).toBeNull();
+    expect(plan.gaps.map(g => g.key).sort()).toEqual(['kyc', 'phone']);
+  });
+});
+
+describe('mergeRequestedInformation', () => {
+  it('junta os pedidos das duas verificações marcando a origem', () => {
+    expect(mergeRequestedInformation([
+      { id: 'idpf_business', requested_information: [{ id: 'inrqi_1', requirement: 'ein' }] },
+      { id: 'idpf_individual', requested_information: [{ id: 'inrqi_2', requirement: 'identity_document' }] },
+      null,
+      { id: null, requested_information: [{ id: 'inrqi_3' }] },
+    ])).toEqual([
+      { id: 'inrqi_1', requirement: 'ein', verification_id: 'idpf_business' },
+      { id: 'inrqi_2', requirement: 'identity_document', verification_id: 'idpf_individual' },
+    ]);
+  });
+});
+
 describe('deriveConnectedStatus', () => {
   it('mapeia conta e verificação da Whop', () => {
     expect(deriveConnectedStatus({ accountStatus: 'suspended', verificationStatus: 'approved' })).toBe('suspended');
@@ -322,6 +360,22 @@ describe('deriveConnectedStatus', () => {
     expect(deriveConnectedStatus({ verificationStatus: 'manual_review' })).toBe('pending_verification');
     expect(deriveConnectedStatus({ verificationStatus: 'rejected' })).toBe('rejected');
     expect(deriveConnectedStatus({})).toBe('provisioning');
+  });
+});
+
+describe('status com as duas verificações', () => {
+  it('vale a pior situação entre empresa e pessoa', () => {
+    const capabilities = { accept_card_payments: 'active' };
+    expect(deriveConnectedStatus({ verificationStatus: 'approved', individualStatus: 'approved', capabilities })).toBe('active');
+    expect(deriveConnectedStatus({ verificationStatus: 'approved', individualStatus: null })).toBe('provisioning');
+    expect(deriveConnectedStatus({ verificationStatus: 'approved', individualStatus: 'pending' })).toBe('pending_verification');
+    expect(deriveConnectedStatus({ verificationStatus: 'pending', individualStatus: 'action_required' })).toBe('action_required');
+    expect(deriveConnectedStatus({ verificationStatus: 'rejected', individualStatus: 'approved' })).toBe('rejected');
+    expect(deriveConnectedStatus({ accountStatus: 'suspended', verificationStatus: 'approved', individualStatus: 'approved' })).toBe('suspended');
+  });
+
+  it('sem a verificação da pessoa (conta antiga) segue só pela empresa', () => {
+    expect(deriveConnectedStatus({ verificationStatus: 'approved', capabilities: { accept_card_payments: 'active' } })).toBe('active');
   });
 });
 

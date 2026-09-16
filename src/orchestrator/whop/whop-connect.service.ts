@@ -19,8 +19,10 @@ import {
   deriveConnectedStatus,
   escalateRiskTier,
   isDefinitiveWhopFailure,
+  mergeRequestedInformation,
   negativeFiatBalances,
   planBusinessVerification,
+  planIndividualVerification,
   planRfiAnswers,
   sellerRequirementItems,
   toConnectedProviderAccountId,
@@ -180,7 +182,9 @@ export class WhopConnectService implements OnModuleInit {
         const account = await this.whop.createAccount(
           {
             email: source.seller.email,
-            title: String(plan.account.business_name).slice(0, 80),
+            // Título = nome que a Whop usa no extrato do comprador: a marca da
+            // loja reconhecida por ele, não a razão social da LLC.
+            title: String(source.seller.name || plan.account.business_name).slice(0, 80),
             country: 'US',
             ...(plan.verification.business_website ? { website: plan.verification.business_website } : {}),
             // Nenhum e-mail transacional da Whop para o comprador: quem fala
@@ -211,13 +215,36 @@ export class WhopConnectService implements OnModuleInit {
         `koopfy_connect_kyb_${sellerId}_${documentsVersion}`,
       );
 
+      // A conta só opera com as DUAS verificações: empresa e pessoa responsável.
+      // Os dados da pessoa são os mesmos exigidos na verificação da empresa, que
+      // já passou pelo plano acima — se faltar algo, a de empresa segue e o que
+      // falta vira pendência no painel do seller.
+      const individualPlan = planIndividualVerification(source.kyc);
+      let individual: any = null;
+      if (individualPlan.verification) {
+        individual = await this.whop.createVerification(
+          whopAccountId,
+          individualPlan.verification,
+          `koopfy_connect_kyc_${sellerId}_${documentsVersion}`,
+        );
+      } else {
+        console.warn(
+          `[WhopConnect] seller ${sellerId}: verificação da pessoa não criada — falta ${individualPlan.missing.join(', ')}`,
+        );
+      }
+
       await this.updateRow(sellerId, {
         verification_id: verification?.id ?? null,
         verification_status: verification?.status ?? null,
-        requested_information: verification?.requested_information ?? [],
+        individual_verification_id: individual?.id ?? null,
+        individual_verification_status: individual?.status ?? null,
+        requested_information: mergeRequestedInformation([verification, individual]),
         rfi_answered: [],
         rfi_unanswered: [],
-        status: deriveConnectedStatus({ verificationStatus: verification?.status }),
+        status: deriveConnectedStatus({
+          verificationStatus: verification?.status,
+          individualStatus: individual?.status ?? null,
+        }),
         last_error: null,
       });
 
@@ -225,6 +252,8 @@ export class WhopConnectService implements OnModuleInit {
         whop_account_id: whopAccountId,
         verification_id: verification?.id ?? null,
         verification_status: verification?.status ?? null,
+        individual_verification_id: individual?.id ?? null,
+        individual_verification_status: individual?.status ?? null,
       });
     } catch (err: any) {
       const message = this.errorMessage(err);
@@ -260,21 +289,25 @@ export class WhopConnectService implements OnModuleInit {
       return null;
     });
     const list: any[] = Array.isArray(verifications?.data) ? verifications.data : [];
-    // A da LLC é a de empresa; a individual só aparece se a Whop pedir à parte.
-    const verification = list.find(v => v?.kind === 'business') ?? list.find(v => v?.kind === 'individual') ?? list[0] ?? null;
+    const verification = list.find(v => v?.kind === 'business') ?? null;
+    const individual = list.find(v => v?.kind === 'individual') ?? null;
 
     const verificationStatus = verification?.status
       ?? account?.verification?.business?.status
-      ?? account?.verification?.individual?.status
       ?? row.verification_status;
+    const individualStatus = individual?.status
+      ?? account?.verification?.individual?.status
+      ?? row.individual_verification_status
+      ?? null;
 
     const status = deriveConnectedStatus({
       accountStatus: account?.status,
       verificationStatus,
+      individualStatus,
       capabilities: account?.capabilities,
     });
 
-    const requested = verification?.requested_information ?? [];
+    const requested = mergeRequestedInformation([verification, individual]);
 
     await this.updateRow(sellerId, {
       whop_status: account?.status ?? null,
@@ -284,6 +317,8 @@ export class WhopConnectService implements OnModuleInit {
       required_actions: account?.required_actions ?? [],
       verification_id: verification?.id ?? row.verification_id,
       verification_status: verificationStatus ?? null,
+      individual_verification_id: individual?.id ?? row.individual_verification_id,
+      individual_verification_status: individualStatus,
       requested_information: requested,
       status,
       // Conta de volta: a próxima queda ganha uma janela de 72h nova.
@@ -310,6 +345,14 @@ export class WhopConnectService implements OnModuleInit {
         console.error(`[WhopConnect] pedidos de informação do seller ${sellerId}:`, err?.message));
     }
 
+    // Verificações aprovadas e conta liberada na Whop: a venda passa a nascer na
+    // conta do seller sem ninguém apertar botão. WHOP_CONNECTED_AUTO_ENABLE=false
+    // devolve a decisão ao CRM.
+    if (status === 'active' && !row.charges_enabled && process.env.WHOP_CONNECTED_AUTO_ENABLE !== 'false') {
+      await this.setChargesEnabled(sellerId, 'auto', { enabled: true }).catch((err: any) =>
+        console.error(`[WhopConnect] modo conectado automático do seller ${sellerId}:`, err?.message));
+    }
+
     return this.getStatus(sellerId);
   }
 
@@ -327,7 +370,7 @@ export class WhopConnectService implements OnModuleInit {
 
     try {
       const row = await this.getRow(sellerId);
-      if (!row?.verification_id) return null;
+      if (!row?.verification_id && !row?.individual_verification_id) return null;
 
       const retry = new Set(opts.retryRequirements ?? []);
       const answered = new Set((row.rfi_answered ?? []).map(String));
@@ -345,9 +388,16 @@ export class WhopConnectService implements OnModuleInit {
       }, { retryRequirements: [...retry] });
 
       if (answers.length > 0) {
-        const payload: Record<string, any>[] = [];
-        for (const answer of answers) payload.push(await this.toRfiPayload(answer));
-        await this.whop.updateVerification(row.verification_id, { requested_information: payload });
+        // Cada pedido volta para a verificação de onde veio (empresa ou pessoa).
+        const byVerification = new Map<string, Record<string, any>[]>();
+        for (const answer of answers) {
+          const item = pending.find((p: any) => String(p.id) === String(answer.id));
+          const verificationId = String(item?.verification_id ?? row.verification_id ?? row.individual_verification_id);
+          byVerification.set(verificationId, [...(byVerification.get(verificationId) ?? []), await this.toRfiPayload(answer)]);
+        }
+        for (const [verificationId, payload] of byVerification) {
+          await this.whop.updateVerification(verificationId, { requested_information: payload });
+        }
       }
 
       await this.updateRow(sellerId, {

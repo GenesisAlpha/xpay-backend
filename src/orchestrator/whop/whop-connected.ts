@@ -57,8 +57,12 @@ export interface WhopConnectedAccountRow {
   whop_account_id: string | null;
   status: ConnectedStatus;
   charges_enabled: boolean;
+  /** Verificação da empresa (KYB). */
   verification_id: string | null;
   verification_status: string | null;
+  /** Verificação da pessoa responsável (KYC). */
+  individual_verification_id: string | null;
+  individual_verification_status: string | null;
   requested_information: any[];
   rfi_answered: string[];
   rfi_unanswered: RfiUnanswered[];
@@ -82,18 +86,33 @@ export interface WhopConnectedAccountRow {
 
 // ─── Status ──────────────────────────────────────────────────────────────────
 
+// Pior situação primeiro: a conta só opera com as DUAS verificações aprovadas
+// (empresa e pessoa), então uma parada em qualquer uma define o estado.
+const VERIFICATION_SEVERITY: ConnectedStatus[] = [
+  'rejected', 'action_required', 'pending_verification', 'provisioning',
+];
+
+function verificationStage(status: string | null | undefined): ConnectedStatus | 'approved' {
+  if (!status || status === 'not_started') return 'provisioning';
+  if (status === 'rejected') return 'rejected';
+  if (status === 'action_required') return 'action_required';
+  return status === 'approved' ? 'approved' : 'pending_verification';
+}
+
 export function deriveConnectedStatus(input: {
   accountStatus?: string | null;
+  /** Verificação de empresa (KYB). */
   verificationStatus?: string | null;
+  /** Verificação da pessoa responsável (KYC). Ausente = ainda não criada. */
+  individualStatus?: string | null;
   capabilities?: Record<string, string> | null;
 }): ConnectedStatus {
   if (input.accountStatus === 'suspended') return 'suspended';
 
-  const v = input.verificationStatus ?? null;
-  if (!v || v === 'not_started') return 'provisioning';
-  if (v === 'rejected') return 'rejected';
-  if (v === 'action_required') return 'action_required';
-  if (v !== 'approved') return 'pending_verification';
+  const stages = [verificationStage(input.verificationStatus)];
+  if (input.individualStatus !== undefined) stages.push(verificationStage(input.individualStatus));
+  const worst = VERIFICATION_SEVERITY.find(stage => stages.includes(stage));
+  if (worst) return worst;
 
   // `capabilities` só vem calculado com company:balance:read. Ausente não é
   // "bloqueado": é "não sabemos", e a própria Whop recusa a cobrança se for.
@@ -363,6 +382,64 @@ export function planBusinessVerification(kyc: any, docs: any, extra: { website?:
       tax_identification_number: rep.tax_identification_number,
     },
   };
+}
+
+// ─── Verificação da pessoa responsável (KYC) ────────────────────────────────
+//
+// A conta conectada precisa das duas verificações: a da empresa (LLC) e a da
+// pessoa que responde por ela. Os dados são os mesmos do onboarding; documento
+// e selfie seguem depois, como resposta aos pedidos da Whop.
+
+export function planIndividualVerification(kyc: any): {
+  missing: string[];
+  gaps: RequirementGap[];
+  verification: Record<string, any> | null;
+} {
+  const rep = representativeFrom(kyc);
+  const gaps: RequirementGap[] = [];
+  const gap = (key: string, label: string) => gaps.push({ key, label });
+
+  if (!rep.first_name) gap('kyc', 'nome completo do responsável (nome e sobrenome)');
+  if (!rep.date_of_birth) gap('kyc', 'data de nascimento do responsável');
+  if (!rep.phone) gap('phone', 'telefone do responsável com DDI (ex.: +5511999999999)');
+  if (!rep.tax_identification_number) gap('kyc', 'CPF do responsável');
+  if (!rep.personal_address) gap('kyc', 'endereço residencial do responsável');
+
+  const missing = gaps.map(g => g.label);
+  if (missing.length > 0) return { missing, gaps, verification: null };
+
+  return {
+    missing,
+    gaps,
+    verification: {
+      kind: 'individual',
+      // Pessoa brasileira: país do documento é o BR e o número fiscal é o CPF.
+      country: 'BR',
+      first_name: rep.first_name,
+      last_name: rep.last_name,
+      date_of_birth: rep.date_of_birth,
+      phone: rep.phone,
+      tax_identification_number: rep.tax_identification_number,
+      address: rep.personal_address,
+    },
+  };
+}
+
+/**
+ * Pedidos das duas verificações numa lista só, cada item sabendo de qual
+ * verificação veio — a resposta vai para o `idpf_` certo.
+ */
+export function mergeRequestedInformation(
+  verifications: Array<{ id?: string | null; requested_information?: any[] } | null | undefined>,
+): Array<Record<string, any>> {
+  const items: Array<Record<string, any>> = [];
+  for (const verification of verifications) {
+    if (!verification?.id) continue;
+    for (const item of verification.requested_information ?? []) {
+      if (item?.id) items.push({ ...item, verification_id: verification.id });
+    }
+  }
+  return items;
 }
 
 // ─── Respostas aos pedidos de informação (RFI) ──────────────────────────────
