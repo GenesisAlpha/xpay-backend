@@ -232,6 +232,11 @@ export class RequirementsDto {
     @IsOptional() @ValidateNested() @Type(() => DocumentFileDto)
     selfie?: DocumentFileDto;
 
+    // Conta criada com CNPJ passando para empresa americana: troca o tipo do
+    // cadastro e o que falta da LLC vira pendência no painel.
+    @IsOptional() @IsBoolean()
+    switchToLlc?: boolean;
+
     // Campos corrigidos por outra rota (ex.: dados pessoais pelo /kyc) que
     // devem reenviar à Whop os pedidos ligados a eles.
     @IsOptional() @IsArray() @IsIn(['kyc', 'phone'], { each: true })

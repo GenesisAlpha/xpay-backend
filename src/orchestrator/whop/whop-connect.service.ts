@@ -471,6 +471,8 @@ export class WhopConnectService implements OnModuleInit {
         companyType,
         connectedStatus,
         connected: { required: false, ready: false, status: connectedStatus },
+        // Quem está com CNPJ pode passar para LLC e aí ganha conta conectada.
+        switchToLlc: true,
         items: [] as SellerRequirementItem[],
       };
     }
@@ -480,6 +482,7 @@ export class WhopConnectService implements OnModuleInit {
       companyType,
       connectedStatus,
       connected: { required: true, ready: plan.missing.length === 0, status: connectedStatus },
+      switchToLlc: false,
       items: sellerRequirementItems(plan.gaps, row?.rfi_unanswered ?? []),
     };
   }
