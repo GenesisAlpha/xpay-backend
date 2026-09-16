@@ -1,6 +1,7 @@
 import { ChargeResponse } from './provider.types';
 import { supabase } from '../../lib/supabase.client';
 import { connectedApplicationFee } from '../whop/whop-connected';
+import { maskedPlanTitle } from './whop-plan-title';
 
 /** Membership da Whop reduzida ao que a área do cliente usa. */
 export interface WhopMembershipState {
@@ -235,14 +236,16 @@ export class WhopProvider {
       ? requested
       : `${checkoutBase}/payment-result?orderId=${encodeURIComponent(String(orderRef))}`;
 
-    // Título do plano = nome do produto REAL da Koopfy. É o que o comprador lê
-    // no checkout e no recibo — sem isso ele veria o nome do produto-container,
-    // igual pra toda a base, que é gerador direto de "não reconheço a cobrança".
-    const title =
-      metadata?.product_title
-      ?? metadata?.productTitle
-      ?? (Array.isArray(metadata?.items) ? metadata.items[0]?.title : null)
-      ?? `Pedido ${orderRef}`;
+    // Título do plano = LOJA + pedido, nunca o produto (ver whop-plan-title.ts).
+    // O provider não precisa saber o que a loja vende; o comprador reconhece a
+    // compra pela loja, e o produto real ele lê nas nossas telas e no e-mail.
+    const storeName =
+      metadata?.store_name
+      ?? metadata?.storeName
+      ?? config?.legal_name
+      ?? config?.label
+      ?? null;
+    const title = maskedPlanTitle(storeName, String(orderRef));
 
     // País do comprador — só usado pra decidir se o embed abre num método
     // específico. NÃO trocamos a moeda do plano por país: o `amount` está na
@@ -389,9 +392,9 @@ export class WhopProvider {
         transactionId,
         confirmationToken: ctx.confirmation_token,
         currency: cur,
-        title: String(metadata?.pricing_plan?.name
-          ? `${title} · ${metadata.pricing_plan.name}`
-          : title).slice(0, WHOP_PLAN_TITLE_MAX),
+        // Já vem mascarado e dentro do limite. O nome do plano de preço NÃO
+        // entra: "Plano anual do curso X" contaria o que o título esconde.
+        title,
         initialPrice,
         subscriptionTerms,
         metadata: koopfyMetadata,
@@ -413,10 +416,9 @@ export class WhopProvider {
       plan: {
         company_id: companyId,
         currency: cur,
-        // 30 chars é limite duro da API — acima disso a compra inteira falha.
-        title: String(metadata?.pricing_plan?.name
-          ? `${title} · ${metadata.pricing_plan.name}`
-          : title).slice(0, WHOP_PLAN_TITLE_MAX),
+        // Mascarado em maskedPlanTitle, que também respeita o limite de 30
+        // chars da API (acima disso a compra inteira falha com 400).
+        title,
         plan_type: isRecurring ? 'renewal' : 'one_time',
         // Em renewal, initial_price é uma taxa ADICIONAL à primeira cobrança.
         // O valor recorrente normal pertence a renewal_price.
