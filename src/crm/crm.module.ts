@@ -51,6 +51,7 @@ import { CryptoModule } from '../crypto/crypto.module'
 import { OrchestratorModule } from '../orchestrator/orchestrator.module'
 import { WebhookModule } from '../webhooks/webhook.module'
 import { WhopConnectController } from './whop-connect.controller'
+import { WhopLinkedController } from './whop-linked.controller'
 import { ActivationRequestsController } from './activation-requests.controller'
 import { ActivationModule } from '../activation/activation.module'
 import { crmRequestContext } from './crm-request-context'
@@ -82,7 +83,7 @@ import { crmRequestContext } from './crm-request-context'
   ],
   // WhopConnectController: conta conectada da Whop por seller (serviço vem do
   // OrchestratorModule).
-  controllers: [CrmController, CrmAdminController, WhopConnectController, ActivationRequestsController],
+  controllers: [CrmController, CrmAdminController, WhopConnectController, WhopLinkedController, ActivationRequestsController],
   providers:   [CrmService, CrmAdminService, CrmAuthGuard, StorageService],
   exports:     [CrmService, CrmAdminService],
 })

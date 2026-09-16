@@ -4,6 +4,8 @@ import { CryptoService } from '../../crypto/crypto.service';
 import { ProviderAccountConfig } from '../provider-accounts.config';
 import { ConnectedRouting, WhopConnectService } from './whop-connect.service';
 import { isConnectedProviderAccountId } from './whop-connected';
+import { isLinkedProviderAccountId } from './whop-linked';
+import { WhopLinkedAccountsService } from './whop-linked.service';
 
 // ============================================================================
 // WHOP ACCOUNTS — pool dinâmico (tabela `whop_accounts`)
@@ -67,6 +69,8 @@ export class WhopAccountsService {
   constructor(
     private readonly crypto: CryptoService,
     @Optional() private readonly connected?: WhopConnectService,
+    // Conta Whop própria do seller (modo conexão): resolve os ids 'whopl_…'.
+    @Optional() private readonly linked?: WhopLinkedAccountsService,
   ) { }
 
   private cache: ProviderAccountConfig[] | null = null;
@@ -134,6 +138,11 @@ export class WhopAccountsService {
       return this.connected ? this.connected.getProviderAccountById(id) : null;
     }
 
+    // Conta própria do seller ('whopl_<biz>'): a chave é dele, guardada cifrada.
+    if (isLinkedProviderAccountId(id)) {
+      return this.linked ? this.linked.getProviderAccountById(id) : null;
+    }
+
     const cached = this.cache?.find(a => a.id === id);
     if (cached && Date.now() - this.hydratedAt < this.CACHE_TTL_MS) return cached;
 
@@ -163,6 +172,14 @@ export class WhopAccountsService {
   // Sem o serviço de contas conectadas (testes), todo seller é master.
   async resolveSellerRouting(sellerId: string): Promise<ConnectedRouting> {
     return this.connected ? this.connected.getChargeRouting(sellerId) : { mode: 'master' };
+  }
+
+  /**
+   * Conta Whop PRÓPRIA do seller, quando ele conectou a dele. A venda nasce e
+   * fica lá: sem taxa de aplicação e sem passar pela carteira da Koopfy.
+   */
+  async getSellerLinkedAccount(sellerId: string): Promise<ProviderAccountConfig | null> {
+    return this.linked ? this.linked.getProviderAccountForSeller(sellerId) : null;
   }
 
   invalidate() {

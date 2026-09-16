@@ -5,7 +5,8 @@ import { supabase } from '../lib/supabase.client'
 import { CurrencyService } from '../currency/currency.service'
 import { WalletService } from '../wallets/wallet.service'
 import { AccountRouterService } from '../orchestrator/router/account-router.service'
-import { calculateSaleFees, getEffectiveSellerFees, saleFeePct } from '../shared/fee.calculator'
+import { DEFAULT_FEE_SETTINGS, calculateSaleFees, getEffectiveSellerFees, saleFeePct } from '../shared/fee.calculator'
+import { sellerChargesOnOwnWhopAccount } from '../orchestrator/whop/whop-linked.service'
 import { validateMbwayPhone } from '../utils/mbway.validator'
 import { RetrieveResponse } from '../orchestrator/providers/provider.types'
 import { CardCryptoService } from '../crypto/card-crypto.service'
@@ -196,7 +197,22 @@ export class PaymentService {
         __mark('convertToUSD')
         // Taxas do seller (seller_fees, padrão em fee.calculator): todas sobre o
         // bruto em USD; a de conversão só quando a venda não é em USD.
-        const sellerFees = await getEffectiveSellerFees(effectiveSellerId)
+        // Conta Whop própria do seller: o dinheiro nem passa pela Koopfy, então
+        // não há taxa de plataforma nem reserva a cobrar aqui — a remuneração
+        // é comissão de afiliado, cobrada na conta dele pela própria Whop.
+        const onOwnWhopAccount = this.normalizeProviderName(seller?.provider_default) === 'whop'
+            && await sellerChargesOnOwnWhopAccount(effectiveSellerId)
+        const sellerFees = onOwnWhopAccount
+            ? {
+                ...DEFAULT_FEE_SETTINGS,
+                fxFeePct: 0,
+                checkoutFeePct: 0,
+                processingFeePct: 0,
+                orchestrationFeePct: 0,
+                feeFixedUsd: 0,
+                reservePercentage: 0,
+            }
+            : await getEffectiveSellerFees(effectiveSellerId)
         const currencyConverted = String(currency).toUpperCase() !== 'USD'
         const saleFees = calculateSaleFees(Math.round(fx.grossUSD * 100), sellerFees, { currencyConverted })
         __mark('calculateSaleFees')

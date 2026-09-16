@@ -31,6 +31,8 @@ const CREATE_ACCOUNT_FAILED = 'Não foi possível criar a conta financeira agora
 import { WalletService } from '../dashboard/services/services';
 import { ActivationRequestsService } from '../activation/activation-requests.service';
 import { WhopConnectService } from '../orchestrator/whop/whop-connect.service';
+import { WhopLinkedAccountsService } from '../orchestrator/whop/whop-linked.service';
+import { sellerExternalProviderView } from '../orchestrator/whop/whop-linked';
 import {
   buildSubscriptionReport,
   filterTransactionsByWorkspace,
@@ -61,7 +63,25 @@ export class KoopfyIntegrationService {
     private readonly wallet: WalletService,
     private readonly activationRequests: ActivationRequestsService,
     private readonly whopConnect: WhopConnectService,
+    // Modo conta externa: o seller conecta a conta Whop dele pelo painel,
+    // depois que a equipe libera no CRM.
+    private readonly whopLinked: WhopLinkedAccountsService,
   ) {}
+
+  /** Conecta a conta Whop do próprio seller (só com o modo liberado pela equipe). */
+  async connectExternalProvider(ctx: SellerCtx, apiKey: string) {
+    if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
+    return sellerExternalProviderView(
+      await this.whopLinked.connect(ctx.seller.id, apiKey, `seller:${ctx.userId}`),
+    );
+  }
+
+  async disconnectExternalProvider(ctx: SellerCtx) {
+    if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
+    return sellerExternalProviderView(
+      await this.whopLinked.disconnect(ctx.seller.id, 'desconectado pelo seller', `seller:${ctx.userId}`),
+    );
+  }
 
   getActivationRequest(ctx: SellerCtx) {
     return this.activationRequests.getForUser(ctx.userId);
@@ -426,6 +446,11 @@ export class KoopfyIntegrationService {
         completed: !!user?.onboarding_completed,
       },
       requirements,
+      // Modo conta externa: o painel mostra "conecte seu provedor externo"
+      // quando a equipe liberou; com a conta conectada, mostra a situação dela.
+      externalProvider: seller
+        ? sellerExternalProviderView(await this.whopLinked.status(seller.id).catch(() => null))
+        : null,
     };
   }
 

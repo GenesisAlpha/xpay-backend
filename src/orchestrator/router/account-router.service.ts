@@ -843,6 +843,12 @@ export class AccountRouterService implements OnModuleInit {
     // de até 72h, segue para o pool abaixo) ou 'blocked' (reserva acionada,
     // fallback cortado no CRM ou janela vencida).
     if (args.provider.toLowerCase() === 'whop') {
+      // ── Conta Whop PRÓPRIA do seller (modo conexão) ──
+      // Ele autorizou a Koopfy a cobrar na conta dele: a venda nasce e fica lá.
+      // Não entra no pool nem no sticky — não há outra conta para onde ir.
+      const own = await this.whopAccounts.getSellerLinkedAccount(args.sellerId);
+      if (own) return own as unknown as ProviderAccount;
+
       const routing = await this.whopAccounts.resolveSellerRouting(args.sellerId);
       if (routing.mode === 'connected') return routing.account as unknown as ProviderAccount;
       if (routing.mode === 'blocked') {

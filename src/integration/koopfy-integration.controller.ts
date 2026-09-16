@@ -110,6 +110,21 @@ export class KoopfyIntegrationController {
     return this.onboarding.submitRequirements(req.sellerCtx.userId, body);
   }
 
+  // ─── Provedor externo (conta Whop do próprio seller) ───────────────────────
+  // Só funciona com o modo liberado no CRM, a pedido do seller.
+
+  @Post('external-provider/connect')
+  @UseGuards(CrossServiceJwtGuard)
+  connectExternalProvider(@Req() req: any, @Body() body: { apiKey?: string }) {
+    return this.svc.connectExternalProvider(req.sellerCtx, String(body?.apiKey ?? ''));
+  }
+
+  @Post('external-provider/disconnect')
+  @UseGuards(CrossServiceJwtGuard)
+  disconnectExternalProvider(@Req() req: any) {
+    return this.svc.disconnectExternalProvider(req.sellerCtx);
+  }
+
   // Emite um token curto p/ SSO no dash-pay (seller já deve existir — provision antes).
   @Post('sso')
   @UseGuards(CrossServiceJwtGuard)

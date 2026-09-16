@@ -7,6 +7,7 @@ import { AccountRouterService } from '../orchestrator/router/account-router.serv
 import { getProviderAccountById } from '../orchestrator/provider-accounts.config'
 import { RoxPayProvider } from '../orchestrator/providers/rox-pay.provider'
 import { WhopAccountsService } from '../orchestrator/whop/whop-accounts.service'
+import { isLinkedProviderAccountId } from '../orchestrator/whop/whop-linked'
 import { StripeAccountsService } from '../orchestrator/stripe/stripe-accounts.service'
 import { StripeRiskService } from '../orchestrator/stripe/stripe-risk.service'
 import { StripeEfwService } from '../orchestrator/stripe/stripe-efw.service'
@@ -198,6 +199,15 @@ export class WebhookService {
       // ── Side effects ─────────────────────────────────────────────────
 
       // 1) Crédito pendente na wallet (com external_fee se houver)
+      //
+      // Conta Whop própria do seller: o dinheiro entrou na conta DELE. Creditar
+      // aqui criaria saldo que a Koopfy não tem como pagar no saque.
+      if (isLinkedProviderAccountId(tx.provider_account_id)) {
+        console.log(
+          `[WebhookService] venda ${tx.id} na conta Whop do próprio seller `
+          + `(${tx.provider_account_id}) — sem crédito na carteira da Koopfy.`,
+        )
+      } else {
       await this.walletService.creditPending({
         sellerId: tx.seller_id,
         transactionId: tx.id,
@@ -220,6 +230,7 @@ export class WebhookService {
           }
           : null,
       })
+      }
 
       // 2) Contabiliza volume PAGO no router
       if (tx.provider_account_id) {
@@ -789,6 +800,12 @@ export class WebhookService {
         JSON.stringify({ accountId, eventType, data: body?.data ?? null }).slice(0, 1000),
       )
       return { ignored: true, reason: 'renewal refund without transaction' }
+    }
+    // Conta própria do seller: o webhook dela traz TODAS as vendas dele,
+    // inclusive as que não passaram pela Koopfy. Sem transação nossa, ignora —
+    // reentregar para sempre um evento que não é nosso só gera ruído.
+    if (!tx && isLinkedProviderAccountId(accountId)) {
+      return { ignored: true, reason: 'venda fora da Koopfy' }
     }
     if (!tx) {
       console.error(

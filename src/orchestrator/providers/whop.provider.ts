@@ -407,6 +407,9 @@ export class WhopProvider {
       // `account_id` do topo diz em qual conta conectada a venda nasce.
       // `plan.company_id` sozinho só define onde o plano é criado.
       ...(connected ? { account_id: companyId } : {}),
+      // Conta própria do seller: a venda é atribuída à Koopfy como afiliada, e
+      // é daí que sai a nossa comissão (não há application fee nessa conta).
+      ...(config?.affiliate_code ? { affiliate_code: config.affiliate_code } : {}),
       plan: {
         company_id: companyId,
         currency: cur,
