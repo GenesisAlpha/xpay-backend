@@ -4,6 +4,7 @@ import {
   HttpException, HttpStatus, ServiceUnavailableException,
 } from '@nestjs/common'
 import { JwtService } from '@nestjs/jwt'
+import * as jwt from 'jsonwebtoken'
 import { supabase } from '../lib/supabase.client'
 import { StorageService } from '../lib/storage.service'
 import { CryptoService } from '../crypto/crypto.service'
@@ -975,6 +976,54 @@ export class CrmService {
 
     if (error) throw new BadRequestException('Email já cadastrado ou erro ao criar gerente')
     return data
+  }
+
+  // =========================================
+  // ACESSO AO PAINEL DO SELLER (suporte)
+  // =========================================
+
+  /**
+   * Link que abre o painel com a sessão DO SELLER, para a equipe ver o que ele
+   * vê. Vale 15 minutos e o token carrega `act` (quem abriu): o saque é
+   * recusado nesse acesso e a abertura fica no log do seller.
+   *
+   * Mesma regra das outras ações: admin e supervisor em qualquer seller,
+   * gerente só nos que assumiu.
+   */
+  async sellerPanelAccess(sellerId: string, manager: { sub: string; role: string }) {
+    await this.assertCanManage(sellerId, manager)
+
+    const { data: seller } = await supabase
+      .from('seller_profiles')
+      .select('id, user_id, name')
+      .eq('id', sellerId)
+      .maybeSingle()
+    if (!seller?.user_id) throw new NotFoundException('Seller não encontrado.')
+
+    const { data: user } = await supabase
+      .from('users')
+      .select('id, email')
+      .eq('id', seller.user_id)
+      .maybeSingle()
+    if (!user) throw new NotFoundException('Conta do seller não encontrada.')
+
+    if (!process.env.JWT_SECRET) {
+      throw new ServiceUnavailableException('Acesso ao painel indisponível: JWT_SECRET ausente.')
+    }
+
+    const token = jwt.sign(
+      { sub: user.id, email: user.email, act: { manager_id: manager.sub, role: manager.role } },
+      process.env.JWT_SECRET,
+      { expiresIn: '15m' },
+    )
+
+    await this.log(sellerId, manager.sub, 'seller.panel_access', { seller_name: seller.name ?? null })
+
+    const base = (process.env.FRONTEND_URL ?? 'https://merchant.koopfy.com').replace(/\/+$/, '')
+    return {
+      url: `${base}/sso?token=${encodeURIComponent(token)}&next=/dashboard`,
+      expiresInMinutes: 15,
+    }
   }
 
   // =========================================

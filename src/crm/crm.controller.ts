@@ -67,6 +67,15 @@ export class CrmController {
     return this.crm.getSellerDetail(id)
   }
 
+  // Abre o painel com a sessão do seller (15 min). O saque fica bloqueado nesse
+  // acesso e a abertura entra no log do seller.
+  @Post('sellers/:id/panel-access')
+  @UseGuards(CrmAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  sellerPanelAccess(@Param('id') id: string, @Req() req: any) {
+    return this.crm.sellerPanelAccess(id, req.manager)
+  }
+
   // ─── Assignment ───────────────────────────────────────────────────────────
 
   @Post('sellers/:id/assign')
