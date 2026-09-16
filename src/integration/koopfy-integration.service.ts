@@ -77,12 +77,34 @@ export class KoopfyIntegrationService {
   }
 
   /**
-   * Sessão da carteira da Whop dele para o painel montar saldo, extrato e saque
-   * sem o dinheiro passar pela Koopfy.
+   * Financeiro da conta externa: saldo, contas bancárias e saques da conta Whop
+   * dele. O dinheiro não passa pela Koopfy — só lemos e disparamos o pedido.
    */
-  externalProviderWallet(ctx: SellerCtx) {
+  async externalProviderWallet(ctx: SellerCtx) {
     if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
-    return this.whopLinked.walletSession(ctx.seller.id);
+    const sellerId = ctx.seller.id;
+    const [balance, payoutMethods, withdrawals] = await Promise.all([
+      this.whopLinked.balance(sellerId),
+      this.whopLinked.payoutMethods(sellerId).catch(() => []),
+      this.whopLinked.withdrawals(sellerId).catch(() => []),
+    ]);
+    return { balance, payoutMethods, withdrawals };
+  }
+
+  externalProviderWithdraw(
+    ctx: SellerCtx,
+    body: { amountCents?: number; currency?: string; payoutMethodId?: string },
+  ) {
+    if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
+    return this.whopLinked.withdraw(
+      ctx.seller.id,
+      {
+        amountCents: Number(body?.amountCents),
+        currency: String(body?.currency ?? ''),
+        payoutMethodId: String(body?.payoutMethodId ?? ''),
+      },
+      `seller:${ctx.userId}`,
+    );
   }
 
   async disconnectExternalProvider(ctx: SellerCtx) {

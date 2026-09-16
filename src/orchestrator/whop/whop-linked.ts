@@ -104,6 +104,100 @@ export function sellerExternalProviderView(view: any): SellerExternalProviderVie
   };
 }
 
+// ─── Saldo e saque da conta dele ───────────────────────────────────────────
+//
+// A Whop trabalha com valores decimais ("12.34"); o painel da Koopfy, com
+// centavos inteiros. A conversão mora aqui para não se espalhar pelo código.
+
+export interface LinkedBalanceCurrency {
+  currency: string;
+  /** Liquidado e pronto para sacar. */
+  availableCents: number;
+  /** Vendas ainda dentro do prazo de liquidação da Whop. */
+  pendingCents: number;
+  /** Retido pela Whop como proteção. */
+  reservedCents: number;
+}
+
+export interface LinkedBalance {
+  /** Moeda principal da conta (a `treasury_balance` da Whop). */
+  currency: string;
+  availableCents: number;
+  pendingCents: number;
+  reservedCents: number;
+  /** Teto do saque na moeda principal, segundo a Whop. */
+  withdrawableCents: number;
+  currencies: LinkedBalanceCurrency[];
+  /** Situação do cadastro de payout dele (sem isso a Whop não paga). */
+  payoutStatus: string | null;
+  settlementAt: string | null;
+}
+
+export function toCents(value: unknown): number {
+  const amount = Number(value);
+  return Number.isFinite(amount) ? Math.round(amount * 100) : 0;
+}
+
+/** `GET /ledger_accounts/{biz}` da Whop no formato que o painel entende. */
+export function mapLedgerBalance(ledger: any): LinkedBalance {
+  const treasury = ledger?.treasury_balance ?? {};
+  const rows: LinkedBalanceCurrency[] = (Array.isArray(ledger?.balances) ? ledger.balances : [])
+    .map((row: any) => ({
+      currency: String(row?.currency ?? '').toLowerCase(),
+      availableCents: toCents(row?.balance),
+      pendingCents: toCents(row?.pending_balance),
+      reservedCents: toCents(row?.reserve_balance),
+    }))
+    .filter((row: LinkedBalanceCurrency) => row.currency.length === 3);
+
+  const currency = String(treasury?.currency ?? rows[0]?.currency ?? 'usd').toLowerCase();
+  const main = rows.find(row => row.currency === currency);
+
+  return {
+    currency,
+    availableCents: treasury?.balance != null ? toCents(treasury.balance) : main?.availableCents ?? 0,
+    pendingCents: treasury?.pending_balance != null ? toCents(treasury.pending_balance) : main?.pendingCents ?? 0,
+    reservedCents: treasury?.reserve_balance != null ? toCents(treasury.reserve_balance) : main?.reservedCents ?? 0,
+    // Sem o teto da Whop, o disponível é o melhor palpite honesto.
+    withdrawableCents: treasury?.total_withdrawable_balance != null
+      ? toCents(treasury.total_withdrawable_balance)
+      : treasury?.balance != null ? toCents(treasury.balance) : main?.availableCents ?? 0,
+    currencies: rows,
+    payoutStatus: ledger?.payout_account_details?.status
+      ?? ledger?.payout_account_details?.kyc_status
+      ?? ledger?.payments_approval_status
+      ?? null,
+    settlementAt: ledger?.settlement_time_at ?? null,
+  };
+}
+
+export interface LinkedPayoutMethod {
+  id: string;
+  nickname: string | null;
+  currency: string;
+  isDefault: boolean;
+  /** Mascarado pela Whop (`****1234`) — nunca temos o número inteiro. */
+  accountReference: string | null;
+  institution: string | null;
+  country: string | null;
+}
+
+/** `GET /payout_methods?account_id=` no formato do painel. */
+export function mapPayoutMethods(payload: any): LinkedPayoutMethod[] {
+  const rows = Array.isArray(payload?.data) ? payload.data : Array.isArray(payload) ? payload : [];
+  return rows
+    .map((row: any) => ({
+      id: String(row?.id ?? ''),
+      nickname: row?.nickname ?? null,
+      currency: String(row?.currency ?? '').toLowerCase(),
+      isDefault: Boolean(row?.is_default),
+      accountReference: row?.account_reference ?? null,
+      institution: row?.institution_name ?? row?.destination?.name ?? null,
+      country: row?.destination?.country_code ?? null,
+    }))
+    .filter((row: LinkedPayoutMethod) => row.id.length > 0);
+}
+
 /**
  * Comissão da Koopfy na venda, em centavos de USD. É só o registro do que a
  * Whop vai creditar como afiliado — não sai da carteira de ninguém aqui.

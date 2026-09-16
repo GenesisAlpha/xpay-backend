@@ -3,6 +3,8 @@ import {
   isLinkedProviderAccountId,
   linkedChargeBlocker,
   linkedCommissionCents,
+  mapLedgerBalance,
+  mapPayoutMethods,
   sellerExternalProviderView,
   toLinkedProviderAccountId,
   whopAccountIdFromLinkedProviderAccountId,
@@ -124,6 +126,82 @@ describe('sellerExternalProviderView', () => {
     });
     expect(view?.charging).toBe(false);
     expect(view?.attention).toMatch(/nova/);
+  });
+});
+
+describe('mapLedgerBalance', () => {
+  const ledger = {
+    treasury_balance: {
+      currency: 'usd',
+      balance: 1250.5,
+      pending_balance: 300,
+      reserve_balance: 125.05,
+      total_withdrawable_balance: 1200,
+    },
+    balances: [
+      { currency: 'usd', balance: 1250.5, pending_balance: 300, reserve_balance: 125.05 },
+      { currency: 'eur', balance: 40, pending_balance: 0, reserve_balance: 0 },
+      { currency: 'bitcoin', balance: 1, pending_balance: 0, reserve_balance: 0 },
+    ],
+    payout_account_details: { status: 'approved' },
+    settlement_time_at: '2026-09-15T00:00:00Z',
+  };
+
+  it('traz o saldo da moeda principal em centavos', () => {
+    const balance = mapLedgerBalance(ledger);
+    expect(balance.currency).toBe('usd');
+    expect(balance.availableCents).toBe(125050);
+    expect(balance.pendingCents).toBe(30000);
+    expect(balance.reservedCents).toBe(12505);
+    // O teto do saque é o da Whop, não o disponível.
+    expect(balance.withdrawableCents).toBe(120000);
+    expect(balance.payoutStatus).toBe('approved');
+  });
+
+  it('lista as outras moedas e ignora o que não é moeda', () => {
+    expect(mapLedgerBalance(ledger).currencies.map(row => row.currency)).toEqual(['usd', 'eur']);
+  });
+
+  it('conta sem treasury cai no primeiro saldo, sem quebrar', () => {
+    const balance = mapLedgerBalance({ balances: [{ currency: 'brl', balance: 10 }] });
+    expect(balance).toMatchObject({ currency: 'brl', availableCents: 1000, withdrawableCents: 1000 });
+    expect(mapLedgerBalance(null)).toMatchObject({ currency: 'usd', availableCents: 0, currencies: [] });
+  });
+});
+
+describe('mapPayoutMethods', () => {
+  it('só o que a tela precisa da conta bancária dele', () => {
+    const methods = mapPayoutMethods({
+      data: [
+        {
+          id: 'potk_1',
+          nickname: 'Conta principal',
+          currency: 'USD',
+          is_default: true,
+          account_reference: '****1234',
+          institution_name: 'Mercury',
+          destination: { country_code: 'US', name: 'Mercury' },
+        },
+        { id: '', nickname: 'sem id' },
+      ],
+    });
+
+    expect(methods).toEqual([
+      {
+        id: 'potk_1',
+        nickname: 'Conta principal',
+        currency: 'usd',
+        isDefault: true,
+        accountReference: '****1234',
+        institution: 'Mercury',
+        country: 'US',
+      },
+    ]);
+  });
+
+  it('resposta vazia ou estranha não quebra a tela', () => {
+    expect(mapPayoutMethods(null)).toEqual([]);
+    expect(mapPayoutMethods({ data: [] })).toEqual([]);
   });
 });
 

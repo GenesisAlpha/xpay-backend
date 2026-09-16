@@ -1,12 +1,18 @@
+import { randomUUID } from 'crypto';
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { supabase } from '../../lib/supabase.client';
 import { CryptoService } from '../../crypto/crypto.service';
 import { ProviderAccountConfig } from '../provider-accounts.config';
 import {
   DEFAULT_LINKED_COMMISSION_PCT,
+  LinkedBalance,
+  LinkedPayoutMethod,
   WhopLinkedAccountRow,
   isLinkedProviderAccountId,
   linkedChargeBlocker,
+  mapLedgerBalance,
+  mapPayoutMethods,
+  toCents,
   toLinkedProviderAccountId,
   whopAccountIdFromLinkedProviderAccountId,
 } from './whop-linked';
@@ -23,6 +29,13 @@ import {
 
 const TABLE = 'whop_linked_accounts';
 
+// Os saques que o painel dispara na conta dele. A Whop não documenta listagem
+// de saques, então o histórico da tela é o nosso registro.
+const WITHDRAWALS_TABLE = 'whop_linked_withdrawals';
+
+// Status em que a Whop não mexe mais: não vale reconsultar.
+const FINAL_WITHDRAWAL_STATUS = new Set(['completed', 'failed', 'canceled', 'cancelled', 'denied']);
+
 // Duplicado de whop-accounts.service de propósito: importar de lá fecharia um
 // ciclo (whop-accounts → whop-linked → whop-accounts) e a injeção do Nest
 // receberia `undefined` no meio do ciclo.
@@ -32,18 +45,15 @@ const WHOP_API_URL_DEFAULT = 'https://api.whop.com';
 // no caminho quente sem segurar uma revogação por muito tempo.
 const CACHE_TTL_MS = 15 * 1000;
 
-// O painel mostra saldo, extrato e saque da conta DELE com os Wallet Elements
-// da Whop. Eles pedem um token curto, emitido com a chave dele e limitado a
-// estas ações — nunca a chave inteira no browser.
-const WALLET_SCOPES = [
+// Permissões que a chave dele precisa ter para o Financeiro do painel
+// funcionar (saldo, contas bancárias e saque). Sem elas a cobrança ainda sai,
+// mas a tela de saldo fica cega — por isso conferimos na conexão.
+export const WALLET_SCOPES = [
   'company:balance:read',
-  'payout:withdraw_funds',
+  'payout:account:read',
   'payout:destination:read',
-  'payout:create_destination',
+  'payout:withdraw_funds',
 ];
-
-// Uma hora é o padrão da Whop (o teto é três). O painel pede outro quando expira.
-const WALLET_TOKEN_TTL_MS = 60 * 60 * 1000;
 
 @Injectable()
 export class WhopLinkedAccountsService {
@@ -110,51 +120,217 @@ export class WhopLinkedAccountsService {
     return this.publicView(await this.getRow(sellerId));
   }
 
+  // ─── Financeiro da conta dele, dentro do painel da Koopfy ────────────────
+  //
+  // O dinheiro nunca passa pela Koopfy: lemos o saldo da conta dele e mandamos
+  // o saque para o banco dele. Tudo com a chave que ele conectou.
+
+  /** Saldo da conta externa (por moeda), como a Whop devolve agora. */
+  async balance(sellerId: string): Promise<LinkedBalance> {
+    const { row, apiKey } = await this.connected(sellerId);
+    const ledger = await this.walletCall(sellerId, () =>
+      this.whopGet(apiKey, row.api_url ?? WHOP_API_URL_DEFAULT, `/api/v1/ledger_accounts/${encodeURIComponent(row.whop_account_id!)}`),
+    );
+    return mapLedgerBalance(ledger);
+  }
+
+  /** Contas bancárias que ele já cadastrou na Whop — o destino do saque. */
+  async payoutMethods(sellerId: string): Promise<LinkedPayoutMethod[]> {
+    const { row, apiKey } = await this.connected(sellerId);
+    const payload = await this.walletCall(sellerId, () =>
+      this.whopGet(apiKey, row.api_url ?? WHOP_API_URL_DEFAULT, `/api/v1/payout_methods?account_id=${encodeURIComponent(row.whop_account_id!)}`),
+    );
+    return mapPayoutMethods(payload);
+  }
+
   /**
-   * Token curto para o painel montar a carteira da Whop dele (saldo, extrato e
-   * saque) dentro da Koopfy. O dinheiro nunca passa por nós: o saque sai da
-   * conta dele direto para o banco dele — a Koopfy só desenha a tela.
+   * Saque da conta dele para o banco dele. A Koopfy só dispara o pedido: o
+   * dinheiro sai da Whop dele e nunca encosta na nossa carteira.
    */
-  async walletSession(sellerId: string) {
-    const row = await this.getRow(sellerId);
-    if (!row?.whop_account_id) {
-      throw new NotFoundException('Nenhuma conta de provedor externo conectada.');
+  async withdraw(
+    sellerId: string,
+    input: { amountCents: number; currency: string; payoutMethodId: string },
+    actor: string | null = null,
+  ) {
+    const { row, apiKey } = await this.connected(sellerId);
+
+    const amountCents = Math.floor(Number(input?.amountCents));
+    if (!Number.isFinite(amountCents) || amountCents <= 0) {
+      throw new BadRequestException('Informe um valor de saque maior que zero.');
+    }
+    const payoutMethodId = String(input?.payoutMethodId ?? '').trim();
+    if (!payoutMethodId) throw new BadRequestException('Escolha para qual conta bancária enviar.');
+    const currency = String(input?.currency ?? '').trim().toLowerCase();
+    if (!/^[a-z]{3}$/.test(currency)) throw new BadRequestException('Moeda do saque inválida.');
+
+    // Não deixa pedir mais do que a Whop libera: o erro dela viria genérico e
+    // o seller ficaria sem saber por quê.
+    const balance = await this.balance(sellerId);
+    const ceiling = currency === balance.currency
+      ? balance.withdrawableCents
+      : balance.currencies.find(item => item.currency === currency)?.availableCents ?? 0;
+    if (amountCents > ceiling) {
+      throw new BadRequestException(
+        `Valor acima do disponível para saque (${(ceiling / 100).toFixed(2)} ${currency.toUpperCase()}).`,
+      );
     }
 
+    // A chave de idempotência é nossa e fica gravada: um retry do painel (ou um
+    // duplo clique) não vira dois saques.
+    const idempotencyKey = randomUUID();
+    const { data: saved, error: saveError } = await supabase
+      .from(WITHDRAWALS_TABLE)
+      .insert({
+        seller_id: sellerId,
+        whop_account_id: row.whop_account_id,
+        idempotency_key: idempotencyKey,
+        amount_cents: amountCents,
+        currency,
+        payout_method_id: payoutMethodId,
+        status: 'requested',
+        requested_by: actor,
+      })
+      .select('id')
+      .single();
+    if (saveError) {
+      console.error('[WhopLinked] registro do saque:', saveError.message);
+      throw new BadRequestException('Não foi possível registrar o saque agora. Tente novamente.');
+    }
+
+    try {
+      const withdrawal = await this.whopPost(apiKey, row.api_url ?? WHOP_API_URL_DEFAULT, '/api/v1/withdrawals', {
+        company_id: row.whop_account_id,
+        payout_method_id: payoutMethodId,
+        // A Whop trabalha em decimal; nós guardamos centavos.
+        amount: amountCents / 100,
+        currency,
+        idempotency_key: idempotencyKey,
+      });
+
+      await supabase
+        .from(WITHDRAWALS_TABLE)
+        .update({
+          whop_withdrawal_id: withdrawal?.id ?? null,
+          status: withdrawal?.status ?? 'requested',
+          fee_cents: toCents(withdrawal?.fees?.fee_amount ?? 0) + toCents(withdrawal?.fees?.markup_fee ?? 0),
+          estimated_at: withdrawal?.estimated_availability ?? null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', saved.id);
+
+      await this.log(sellerId, actor, 'whop_linked.withdrawal', {
+        amount_cents: amountCents,
+        currency,
+        whop_withdrawal_id: withdrawal?.id ?? null,
+      });
+
+      return this.withdrawals(sellerId);
+    } catch (err: any) {
+      const reason = String(err?.message ?? err).slice(0, 500);
+      await supabase
+        .from(WITHDRAWALS_TABLE)
+        .update({ status: 'failed', failure_reason: reason, updated_at: new Date().toISOString() })
+        .eq('id', saved.id);
+      throw new BadRequestException(`A Whop recusou o saque: ${reason}`);
+    }
+  }
+
+  /**
+   * Saques pedidos por aqui. A Whop não documenta uma listagem, então a fonte é
+   * o nosso registro — e cada abertura da tela tenta atualizar o que ainda está
+   * em andamento.
+   */
+  async withdrawals(sellerId: string) {
+    const { data, error } = await supabase
+      .from(WITHDRAWALS_TABLE)
+      .select('*')
+      .eq('seller_id', sellerId)
+      .order('created_at', { ascending: false })
+      .limit(50);
+    if (error) {
+      console.error('[WhopLinked] leitura dos saques:', error.message);
+      return [];
+    }
+
+    const rows = data ?? [];
+    await this.refreshPendingWithdrawals(sellerId, rows);
+
+    return rows.map(row => ({
+      id: row.id,
+      whopWithdrawalId: row.whop_withdrawal_id,
+      amountCents: Number(row.amount_cents ?? 0),
+      feeCents: Number(row.fee_cents ?? 0),
+      currency: row.currency,
+      status: row.status,
+      estimatedAt: row.estimated_at,
+      failureReason: row.failure_reason,
+      createdAt: row.created_at,
+    }));
+  }
+
+  /** Enquanto o saque não termina, a Whop é a dona da verdade sobre o status. */
+  private async refreshPendingWithdrawals(sellerId: string, rows: any[]) {
+    const open = rows.filter(row => row.whop_withdrawal_id && !FINAL_WITHDRAWAL_STATUS.has(String(row.status)));
+    if (open.length === 0) return;
+
+    const { row: account, apiKey } = await this.connected(sellerId).catch(() => ({ row: null, apiKey: null } as any));
+    if (!account || !apiKey) return;
+
+    for (const row of open) {
+      try {
+        const fresh = await this.whopGet(
+          apiKey,
+          account.api_url ?? WHOP_API_URL_DEFAULT,
+          `/api/v1/withdrawals/${encodeURIComponent(row.whop_withdrawal_id)}`,
+        );
+        const status = String(fresh?.status ?? '').trim();
+        if (!status || status === row.status) continue;
+        row.status = status;
+        row.estimated_at = fresh?.estimated_availability ?? row.estimated_at;
+        await supabase
+          .from(WITHDRAWALS_TABLE)
+          .update({ status, estimated_at: row.estimated_at, updated_at: new Date().toISOString() })
+          .eq('id', row.id);
+      } catch (err: any) {
+        // Listagem não é lugar de falhar: o status antigo ainda é verdade.
+        console.error(`[WhopLinked] status do saque ${row.whop_withdrawal_id}:`, err?.message);
+      }
+    }
+  }
+
+  /** Conta conectada + chave decifrada, ou o erro certo para o painel. */
+  private async connected(sellerId: string): Promise<{ row: WhopLinkedAccountRow; apiKey: string }> {
+    const row = await this.getRow(sellerId);
+    if (!row?.whop_account_id) throw new NotFoundException('Nenhuma conta de provedor externo conectada.');
     const apiKey = this.reveal(row);
     if (!apiKey) {
       throw new BadRequestException('A chave da sua conta externa não pôde ser lida. Conecte a conta novamente.');
     }
+    return { row, apiKey };
+  }
 
-    const expiresAt = new Date(Date.now() + WALLET_TOKEN_TTL_MS).toISOString();
+  /**
+   * Chamada de saldo/saque: o que falha aqui quase sempre é a chave sem os
+   * escopos certos, e o painel precisa dizer isso em vez de mostrar tela vazia.
+   */
+  private async walletCall<T>(sellerId: string, call: () => Promise<T>): Promise<T> {
     try {
-      const session = await this.whopPost(apiKey, row.api_url ?? WHOP_API_URL_DEFAULT, '/api/v1/access_tokens', {
-        account_id: row.whop_account_id,
-        scoped_actions: WALLET_SCOPES,
-        expires_at: expiresAt,
-      });
-
-      const token = String(session?.token ?? '').trim();
-      if (!token) throw new Error('a Whop não devolveu o token da carteira');
-
-      if (!row.wallet_ready) await this.markWallet(sellerId, true, null);
-      return {
-        accountId: row.whop_account_id,
-        accessToken: token,
-        expiresAt: session?.expires_at ?? expiresAt,
-      };
+      const result = await call();
+      await this.markWallet(sellerId, true, null);
+      return result;
     } catch (err: any) {
-      // Chave sem os escopos de saldo/saque: o seller precisa gerar outra, e a
-      // tela dele tem que dizer isso em vez de ficar vazia.
-      const reason = err?.message ?? String(err);
+      const reason = String(err?.message ?? err);
       await this.markWallet(sellerId, false, reason.slice(0, 500));
       throw new BadRequestException(
-        `A Whop não liberou o saldo desta conta (${reason}). Gere uma chave com permissão de saldo e saque e conecte de novo.`,
+        `A Whop não liberou esta consulta (${reason}). A chave precisa das permissões de saldo e saque — gere outra e conecte de novo.`,
       );
     }
   }
 
   private async markWallet(sellerId: string, ready: boolean, error: string | null) {
+    const row = await this.getRow(sellerId);
+    if (!row || row.wallet_ready === ready) return;
+
     const { error: dbError } = await supabase
       .from(TABLE)
       .update({ wallet_ready: ready, ...(error ? { last_error: error } : {}), updated_at: new Date().toISOString() })
@@ -222,17 +398,13 @@ export class WhopLinkedAccountsService {
       return { id: null, code: null, overrideId: null, error: String(err?.message ?? err).slice(0, 300) };
     });
 
-    // A chave serve para o financeiro do painel (saldo, extrato e saque)? Vale
-    // saber agora, na tela em que ele ainda tem a chave na mão, e não depois,
-    // quando ele for sacar.
-    const walletReady = await this.whopPost(key, company.apiUrl, '/api/v1/access_tokens', {
-      account_id: company.id,
-      scoped_actions: WALLET_SCOPES,
-      expires_at: new Date(Date.now() + WALLET_TOKEN_TTL_MS).toISOString(),
-    })
-      .then(session => Boolean(String(session?.token ?? '').trim()))
+    // A chave serve para o financeiro do painel (saldo e saque)? Vale saber
+    // agora, na tela em que ele ainda tem a chave na mão, e não depois, quando
+    // ele for sacar. Ler o ledger é o teste mais barato e real.
+    const walletReady = await this.whopGet(key, company.apiUrl, `/api/v1/ledger_accounts/${encodeURIComponent(company.id)}`)
+      .then(() => true)
       .catch((err: any) => {
-        console.error(`[WhopLinked] carteira da conta ${company.id}:`, err?.message);
+        console.error(`[WhopLinked] saldo da conta ${company.id}:`, err?.message);
         return false;
       });
 
@@ -455,6 +627,17 @@ export class WhopLinkedAccountsService {
       // Sobre o líquido, depois das taxas da Whop — o que sobra de verdade.
       revenue_basis: 'post_fees',
     });
+  }
+
+  private async whopGet(apiKey: string, apiUrl: string, path: string) {
+    const response = await fetch(`${apiUrl}${path}`, {
+      headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' },
+    });
+    const json: any = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(json?.error?.message ?? `Whop HTTP ${response.status} em ${path}`);
+    }
+    return json;
   }
 
   private async whopPost(apiKey: string, apiUrl: string, path: string, body: Record<string, any>) {

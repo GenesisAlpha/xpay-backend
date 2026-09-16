@@ -119,12 +119,18 @@ export class KoopfyIntegrationController {
     return this.svc.connectExternalProvider(req.sellerCtx, String(body?.apiKey ?? ''));
   }
 
-  // Token curto (1h) da carteira dele: o painel monta saldo, extrato e saque da
-  // conta Whop do seller sem que a chave chegue ao browser.
-  @Get('external-provider/wallet-session')
+  // Financeiro da conta externa: saldo, contas bancárias e saques, lidos da
+  // conta Whop do seller com a chave que ele conectou.
+  @Get('external-provider/wallet')
   @UseGuards(CrossServiceJwtGuard)
   externalProviderWallet(@Req() req: any) {
     return this.svc.externalProviderWallet(req.sellerCtx);
+  }
+
+  @Post('external-provider/withdrawals')
+  @UseGuards(CrossServiceJwtGuard)
+  externalProviderWithdraw(@Req() req: any, @Body() body: any) {
+    return this.svc.externalProviderWithdraw(req.sellerCtx, body ?? {});
   }
 
   @Post('external-provider/disconnect')
