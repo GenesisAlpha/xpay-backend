@@ -101,11 +101,12 @@ export class KoopfyIntegrationService {
         companyType: requirements?.companyType ?? null,
         connectedStatus: requirements?.connectedStatus ?? null,
         connected: requirements?.connected ?? null,
+        switchToLlc: requirements?.switchToLlc ?? false,
         items: requirements?.items ?? [],
       };
     } catch (err: any) {
       console.error('[integration] requirements:', err?.message);
-      return { cnpjAllowed: false, activationRequest: null, rejectionReason, companyType: null, connectedStatus: null, connected: null, items: [] };
+      return { cnpjAllowed: false, activationRequest: null, rejectionReason, companyType: null, connectedStatus: null, connected: null, switchToLlc: false, items: [] };
     }
   }
 

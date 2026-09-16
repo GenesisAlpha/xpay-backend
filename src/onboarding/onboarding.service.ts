@@ -310,7 +310,10 @@ export class OnboardingService {
       .select('company_address, company_type')
       .eq('user_id', userId)
       .maybeSingle()
-    if (current?.company_type === 'BR') {
+    // Conta com CNPJ vende pela master e não tem conta conectada. Ela só entra
+    // aqui quando o seller pede para passar o cadastro para LLC.
+    const switchingToLlc = current?.company_type === 'BR' && dto.switchToLlc === true
+    if (current?.company_type === 'BR' && !switchingToLlc) {
       throw new BadRequestException('Contas com CNPJ vendem pela Koopfy e não precisam de conta conectada.')
     }
 
@@ -368,12 +371,16 @@ export class OnboardingService {
 
     const now = new Date().toISOString()
 
-    if (Object.keys(patch).length > 0) {
-      // Sem linha ou sem tipo de empresa: o que chega aqui é da LLC.
+    if (Object.keys(patch).length > 0 || switchingToLlc) {
+      // Sem linha, sem tipo de empresa ou trocando de CNPJ: o cadastro vira LLC.
       const { error } = current
         ? await supabase
             .from('seller_documents')
-            .update({ ...patch, ...(current.company_type ? {} : { company_type: 'US' }), updated_at: now })
+            .update({
+              ...patch,
+              ...(current.company_type && !switchingToLlc ? {} : { company_type: 'US' }),
+              updated_at: now,
+            })
             .eq('user_id', userId)
         : await supabase
             .from('seller_documents')
@@ -394,7 +401,7 @@ export class OnboardingService {
     }
     touched.push(...(dto.refresh ?? []))
 
-    if (touched.length === 0 && !dto.rfi?.length) {
+    if (touched.length === 0 && !dto.rfi?.length && !switchingToLlc) {
       throw new BadRequestException('Preencha ao menos uma pendência antes de enviar.')
     }
 
@@ -412,7 +419,11 @@ export class OnboardingService {
       }
     }
 
-    return { message: 'Pendências enviadas. Avisaremos se faltar mais alguma coisa.' }
+    return {
+      message: switchingToLlc
+        ? 'Cadastro alterado para empresa americana (LLC). Envie os dados e documentos que faltam.'
+        : 'Pendências enviadas. Avisaremos se faltar mais alguma coisa.',
+    }
   }
 
   // =========================================
