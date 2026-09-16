@@ -178,6 +178,17 @@ export class CrmAdminService {
 
     const { count: failedCount } = await failedQ
 
+    // ── Disputas abertas (fila de trabalho do painel)
+    const { data: openDisputes } = await supabase
+      .from('chargebacks')
+      .select('amount_cents, deadline_at')
+      .in('status', ['open', 'evidence_required'])
+
+    const disputeDeadlines = (openDisputes ?? [])
+      .map(d => d.deadline_at)
+      .filter(Boolean)
+      .sort()
+
     // ── Saldos consolidados (Float da plataforma)
     const [totals, revenueCurr, revenuePrev, timeseries, topSellers] = await Promise.all([
       this.balanceTotals(),
@@ -242,6 +253,11 @@ export class CrmAdminService {
         pending_usd: c2u(pendingCents),
         processed_today_usd: c2u(processedTodayCents),
         failed_count: failedCount ?? 0,
+      },
+      disputes: {
+        open_count: openDisputes?.length ?? 0,
+        open_usd: c2u((openDisputes ?? []).reduce((sum, d) => sum + Number(d.amount_cents ?? 0), 0)),
+        next_deadline_at: disputeDeadlines[0] ?? null,
       },
       balances: {
         total_available_usd: c2u(totals.available),
