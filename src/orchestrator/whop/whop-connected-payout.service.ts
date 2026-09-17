@@ -8,12 +8,16 @@ import {
   PAYOUT_EXECUTION_MODE,
   PayoutExecution,
   classifyWhopPayout,
+  eventMatchesExecution,
+  isQuoteRequiredError,
   isWhopConnectedPayout,
   newPayoutExecution,
   payoutNetCents,
   payoutTransferKey,
   payoutWithdrawalKey,
+  payoutIdFromEvent,
   pickPayoutMethod,
+  quoteUsable,
   toSavedDestination,
   whopPayoutFailureReason,
 } from './whop-connected-payout';
@@ -43,6 +47,11 @@ import { WhopApiError, WhopPlatformClient } from './whop-platform.client';
 const LEDGER_TYPE = 'debit_payout';
 const CYCLE_INTERVAL_MS = 5 * 60 * 1000;
 const CYCLE_BATCH = 50;
+// Estorno depois de pago chega por webhook (payout.reversed). A varredura é a
+// rede de segurança para evento perdido ou webhook sem a assinatura do evento.
+const REVERSAL_SWEEP_EVERY_MS = 6 * 60 * 60 * 1000;
+const REVERSAL_WINDOW_DAYS = 30;
+const REVERSAL_BATCH = 200;
 
 interface PayoutEntry {
   id: string;
@@ -58,6 +67,7 @@ interface PayoutEntry {
 @Injectable()
 export class WhopConnectedPayoutService implements OnModuleInit {
   private cycleRunning = false;
+  private lastReversalSweep = 0;
   private readonly inFlight = new Set<string>();
 
   constructor(
@@ -116,6 +126,12 @@ export class WhopConnectedPayoutService implements OnModuleInit {
       for (const row of data ?? []) {
         await this.advance(row.id).catch(err =>
           console.error(`[WhopPayout] saque ${row.id}:`, err?.message ?? err));
+      }
+
+      if (Date.now() - this.lastReversalSweep >= REVERSAL_SWEEP_EVERY_MS) {
+        this.lastReversalSweep = Date.now();
+        await this.checkReversals().catch(err =>
+          console.error('[WhopPayout] varredura de estornos:', err?.message ?? err));
       }
     } finally {
       this.cycleRunning = false;
@@ -297,8 +313,8 @@ export class WhopConnectedPayoutService implements OnModuleInit {
     return (await this.update(entry, { execution: next })) ?? entry;
   }
 
-  private async settlePayout(entry: PayoutEntry): Promise<PayoutEntry> {
-    const exec = this.execution(entry);
+  private async settlePayout(entry: PayoutEntry, quoteRetried = false): Promise<PayoutEntry> {
+    let exec = this.execution(entry);
     const net = payoutNetCents(entry);
     const current = exec.payout?.attempt === exec.attempt ? exec.payout : null;
 
@@ -312,6 +328,14 @@ export class WhopConnectedPayoutService implements OnModuleInit {
         if (connectedUsd < net) {
           return this.note(entry, `aguardando saldo na conta conectada (US$ ${(connectedUsd / 100).toFixed(2)} de US$ ${(net / 100).toFixed(2)})`);
         }
+        ({ entry, exec } = await this.ensureQuote(entry, exec, net));
+        const round = exec.quote_required ? exec.quote_round ?? 1 : 0;
+        if (exec.quote_required && !exec.quote_sent) {
+          // Gravado ANTES de enviar: se o POST cair no meio, o próximo ciclo
+          // sabe que esta cotação já foi usada e repete o mesmo corpo.
+          exec = { ...exec, quote_sent: true };
+          entry = (await this.update(entry, { execution: exec })) ?? entry;
+        }
         payout = await this.whop.createPayout({
           account_id: exec.whop_account_id,
           payout_method_id: exec.payout_method_id,
@@ -322,9 +346,24 @@ export class WhopConnectedPayoutService implements OnModuleInit {
           platform_covers_fees: false,
           notes: 'Saque Koopfy',
           metadata: { koopfy_payout_id: entry.id, koopfy_seller_id: entry.seller_id },
-        }, payoutWithdrawalKey(entry.id, exec.attempt));
+          ...(exec.quote_required && exec.quote?.token ? { quote_token: exec.quote.token } : {}),
+        }, payoutWithdrawalKey(entry.id, exec.attempt, round));
       }
     } catch (err) {
+      if (!current?.id && err instanceof WhopApiError && isQuoteRequiredError(err)) {
+        // A conta exige cotação (ou a cotação expirou): rodada nova, com chave
+        // nova. Tenta de novo já; se falhar outra vez, o ciclo repete.
+        const next: PayoutExecution = {
+          ...exec,
+          quote_required: true,
+          quote: null,
+          quote_sent: false,
+          quote_round: (exec.quote_round ?? 0) + 1,
+          last_error: 'a conta exige cotação — cotando o saque',
+        };
+        const saved = (await this.update(entry, { execution: next })) ?? entry;
+        return quoteRetried ? saved : this.settlePayout(saved, true);
+      }
       if (!current?.id && err instanceof WhopApiError && isDefinitiveWhopFailure(err.status)) {
         return this.failPayout(entry, this.message(err), null);
       }
@@ -357,6 +396,125 @@ export class WhopConnectedPayoutService implements OnModuleInit {
     return (await this.update(entry, {
       execution: { ...exec, payout: payoutState, last_error: null },
     })) ?? entry;
+  }
+
+  /**
+   * Cotação do saque, quando a conta exige. Reaproveita a cotação já enviada
+   * (o POST pode ter criado o saque e só a resposta se perdeu); cota de novo
+   * quando a atual expirou antes de ser usada.
+   */
+  private async ensureQuote(entry: PayoutEntry, exec: PayoutExecution, net: number) {
+    if (!exec.quote_required) return { entry, exec };
+    if (exec.quote?.token && (exec.quote_sent || quoteUsable(exec.quote))) return { entry, exec };
+
+    const round = exec.quote_round ?? 1;
+    const quote = await this.whop.createPayoutQuote({
+      account_id: exec.whop_account_id,
+      payout_method_id: exec.payout_method_id,
+      amount: net / 100,
+      currency: 'usd',
+      platform_covers_fees: false,
+    }, `${payoutWithdrawalKey(entry.id, exec.attempt, round)}_quote_${Date.now()}`);
+    if (!quote?.quote_token) throw new Error('A Whop não devolveu a cotação do saque.');
+
+    const next: PayoutExecution = {
+      ...exec,
+      quote_round: round,
+      quote: { token: String(quote.quote_token), expires_at: quote.expires_at ?? null },
+      quote_sent: false,
+    };
+    const saved = (await this.update(entry, { execution: next })) ?? entry;
+    return { entry: saved, exec: next };
+  }
+
+  // ─────────────────────────────────────────────
+  // Estorno depois de pago
+  // ─────────────────────────────────────────────
+
+  /**
+   * Evento de payout da Whop (webhook). Adianta o saque em andamento e trata o
+   * estorno de um saque já concluído.
+   */
+  async handlePayoutEvent(eventType: string, data: any, whopAccountId: string) {
+    const payoutId = payoutIdFromEvent(data);
+    if (!payoutId) return { ignored: true, reason: 'payout sem koopfy_payout_id' };
+
+    let entry: PayoutEntry;
+    try {
+      entry = await this.load(payoutId);
+    } catch {
+      return { ignored: true, reason: 'saque não encontrado' };
+    }
+    if (!isWhopConnectedPayout(entry.metadata)) return { ignored: true, reason: 'saque manual' };
+
+    const exec = this.execution(entry);
+    if (exec.whop_account_id !== whopAccountId) {
+      console.error(`[WhopPayout] 🚨 evento ${eventType} da conta ${whopAccountId} aponta para o saque ${payoutId}, que é da conta ${exec.whop_account_id} — ignorado`);
+      return { ignored: true, reason: 'ownership mismatch' };
+    }
+    if (!eventMatchesExecution(data, exec)) return { ignored: true, reason: 'payout de outra tentativa' };
+
+    if (entry.status === 'completed') {
+      if (classifyWhopPayout(data) === 'failed') {
+        await this.markReversed(entry, whopPayoutFailureReason(data));
+        return { reversed: true };
+      }
+      return { received: true };
+    }
+
+    await this.advance(payoutId);
+    return { received: true };
+  }
+
+  /** Confere os saques pagos nos últimos dias atrás de estorno perdido. */
+  async checkReversals() {
+    const since = new Date(Date.now() - REVERSAL_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    const { data, error } = await supabase
+      .from('wallet_ledger')
+      .select('id, seller_id, amount, fee, currency, status, metadata, created_at')
+      .eq('type', LEDGER_TYPE)
+      .eq('status', 'completed')
+      .filter('metadata->execution->>mode', 'eq', PAYOUT_EXECUTION_MODE)
+      .gte('completed_at', since)
+      .limit(REVERSAL_BATCH);
+    if (error) throw new Error(error.message);
+
+    let reversed = 0;
+    for (const entry of (data ?? []) as PayoutEntry[]) {
+      const payoutRef = entry.metadata?.execution?.payout?.id;
+      if (!payoutRef) continue;
+      try {
+        const payout = await this.whop.getPayout(payoutRef);
+        if (classifyWhopPayout(payout) === 'failed') {
+          await this.markReversed(entry, whopPayoutFailureReason(payout));
+          reversed += 1;
+        }
+      } catch (err) {
+        console.error(`[WhopPayout] estorno do saque ${entry.id}:`, this.message(err));
+      }
+    }
+    return { checked: data?.length ?? 0, reversed };
+  }
+
+  // O dinheiro voltou para a conta conectada. O saldo na Koopfy NÃO volta:
+  // ele é do seller, na conta dele. O saque reabre em payout_failed para o
+  // CRM reenviar.
+  private async markReversed(entry: PayoutEntry, reason: string) {
+    const exec = this.execution(entry);
+    const message = `o banco devolveu o saque depois de pago: ${reason}`.slice(0, 500);
+    const reopened = await this.update(entry, {
+      status: 'processing',
+      completed_at: null,
+      execution: { ...exec, stage: 'payout_failed', reversed_at: new Date().toISOString(), last_error: message },
+    }, 'completed');
+    if (!reopened) return;
+
+    console.error(`[WhopPayout] 🚨 saque ${entry.id}: ${message}. Dinheiro na conta conectada ${exec.whop_account_id}; reenviar pelo CRM.`);
+    await this.log(entry.seller_id, 'whop_payout.reversed', { payout_id: entry.id, reason, payout_ref: exec.payout?.id ?? null });
+    void notifySellerPayout(entry.seller_id, 'failed', {
+      ...this.emailInfo(entry),
+      reason: 'O banco devolveu o saque. O valor voltou para a sua conta Whop e será reenviado.',
+    });
   }
 
   // ─────────────────────────────────────────────

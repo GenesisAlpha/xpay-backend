@@ -140,6 +140,15 @@ export class WhopPlatformClient {
     return this.payouts('POST', '/payouts/methods', { body, idempotencyKey });
   }
 
+  /**
+   * Cotação do saque. Conta com `payout_quote_required` recusa payout sem o
+   * `quote_token` devolvido aqui (erro `invalid_payout_quote`). A cotação
+   * expira em pouco tempo; nada se move até o POST /payouts.
+   */
+  createPayoutQuote(body: Record<string, any>, idempotencyKey: string) {
+    return this.payouts('POST', '/payouts/quotes', { body, idempotencyKey });
+  }
+
   /** Saque da conta conectada para uma conta salva. Devolve o pedido (`cofr_`). */
   createPayout(body: Record<string, any>, idempotencyKey: string) {
     return this.payouts('POST', '/payouts', { body, idempotencyKey });

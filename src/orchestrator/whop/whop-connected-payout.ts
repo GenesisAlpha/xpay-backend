@@ -33,6 +33,15 @@ export interface PayoutExecution {
   attempt: number;
   last_error?: string | null;
   updated_at?: string;
+  // A conta conectada exige cotação antes do saque (payout_quote_required).
+  quote_required?: boolean;
+  quote?: { token: string; expires_at: string | null } | null;
+  // A cotação atual já foi mandada num POST /payouts.
+  quote_sent?: boolean;
+  // Rodada de cotação: cada cotação nova vai com uma chave de saque nova.
+  quote_round?: number;
+  // O banco devolveu um saque já dado como pago.
+  reversed_at?: string | null;
 }
 
 /** Estágios em que o ciclo ainda tem trabalho a fazer. */
@@ -48,8 +57,11 @@ export function payoutTransferKey(payoutId: string): string {
 
 // O saque tem tentativa: depois de um saque recusado (conta bancária errada), o
 // CRM manda de novo — e esse precisa ser um saque NOVO na Whop.
-export function payoutWithdrawalKey(payoutId: string, attempt: number): string {
-  return `koopfy_payout_${payoutId}_withdraw_${attempt}`;
+export function payoutWithdrawalKey(payoutId: string, attempt: number, quoteRound = 0): string {
+  const base = `koopfy_payout_${payoutId}_withdraw_${attempt}`;
+  // Com cotação, o corpo do saque muda (quote_token): mesma chave com corpo
+  // diferente a Whop recusaria. Cada cotação ganha a sua.
+  return quoteRound > 0 ? `${base}_q${quoteRound}` : base;
 }
 
 /** Líquido do saque: o que sai da master e chega ao banco do seller. */
@@ -199,4 +211,37 @@ export function checkPayoutFields(
     fields[field.id] = value;
   }
   return { ok: Object.keys(errors).length === 0, fields, errors };
+}
+
+// ─── Cotação ────────────────────────────────────────────────────────────────
+
+/** A Whop recusou o saque porque a conta exige cotação. */
+export function isQuoteRequiredError(err: any): boolean {
+  const text = [err?.type, err?.code, err?.message].filter(Boolean).join(' ');
+  return /invalid_payout_quote|quote_token|payout_quote_required/i.test(text);
+}
+
+/**
+ * Cotação ainda utilizável: com folga de 60s para o POST chegar antes de
+ * expirar. Sem data de expiração, não arrisca.
+ */
+export function quoteUsable(quote: PayoutExecution['quote'], now = Date.now()): boolean {
+  if (!quote?.token || !quote.expires_at) return false;
+  const expires = Date.parse(quote.expires_at);
+  return Number.isFinite(expires) && expires - now > 60_000;
+}
+
+// ─── Eventos de payout (webhook) ────────────────────────────────────────────
+
+/** Saque da Koopfy a que um evento de payout se refere. */
+export function payoutIdFromEvent(data: any): string | null {
+  const id = data?.metadata?.koopfy_payout_id;
+  return typeof id === 'string' && id.trim() ? id.trim() : null;
+}
+
+/** O evento é do payout que este saque criou? (`cofr_` ou `wdrl_`). */
+export function eventMatchesExecution(data: any, exec: PayoutExecution): boolean {
+  const known = exec.payout?.id;
+  if (!known) return false;
+  return [data?.id, data?.payout_request_id].filter(Boolean).includes(known);
 }

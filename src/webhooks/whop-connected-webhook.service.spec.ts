@@ -2,6 +2,7 @@ jest.mock('../lib/supabase.client', () => ({ supabase: { from: jest.fn() } }));
 // Os dois serviços reais puxam o router, os providers e o Supabase inteiro.
 jest.mock('./webhook.service', () => ({ WebhookService: class WebhookService { } }));
 jest.mock('../orchestrator/whop/whop-connect.service', () => ({ WhopConnectService: class WhopConnectService { } }));
+jest.mock('../orchestrator/whop/whop-connected-payout.service', () => ({ WhopConnectedPayoutService: class WhopConnectedPayoutService { } }));
 
 import * as crypto from 'crypto';
 import { supabase } from '../lib/supabase.client';
@@ -42,6 +43,34 @@ const paymentBody = (metadata: Record<string, any>) => ({
   type: 'payment.succeeded',
   account_id: 'biz_seller',
   data: { id: 'pay_1', metadata },
+});
+
+describe('WhopConnectedWebhookService — eventos de saque', () => {
+  beforeEach(() => { process.env.WHOP_CONNECTED_WEBHOOK_SECRET = SECRET; });
+  afterAll(() => { delete process.env.WHOP_CONNECTED_WEBHOOK_SECRET; });
+
+  it('payout.* vai para o executor de saque com a conta do envelope', async () => {
+    const { connect, webhooks } = setup();
+    const payouts = { handlePayoutEvent: jest.fn().mockResolvedValue({ reversed: true }) };
+    const service = new WhopConnectedWebhookService(webhooks as any, connect as any, payouts as any);
+    const body = { type: 'payout.reversed', account_id: 'biz_seller', data: { id: 'wdrl_1', metadata: { koopfy_payout_id: 'p1' } } };
+    const { raw, headers } = signed(body);
+
+    await expect(service.handle(body, raw, headers)).resolves.toEqual({ reversed: true });
+    expect(payouts.handlePayoutEvent).toHaveBeenCalledWith('payout.reversed', body.data, 'biz_seller');
+    expect(webhooks.handleWhopWebhook).not.toHaveBeenCalled();
+  });
+
+  it('payout.* com assinatura inválida não chega ao executor', async () => {
+    const { connect, webhooks } = setup();
+    const payouts = { handlePayoutEvent: jest.fn() };
+    const service = new WhopConnectedWebhookService(webhooks as any, connect as any, payouts as any);
+    const body = { type: 'payout.reversed', account_id: 'biz_seller', data: {} };
+    const { raw, headers } = signed(body);
+
+    await expect(service.handle(body, raw, { ...headers, 'webhook-signature': 'v1,forjada' })).rejects.toThrow('assinatura inválida');
+    expect(payouts.handlePayoutEvent).not.toHaveBeenCalled();
+  });
 });
 
 describe('WhopConnectedWebhookService', () => {

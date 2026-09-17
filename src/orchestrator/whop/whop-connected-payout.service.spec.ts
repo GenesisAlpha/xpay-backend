@@ -23,6 +23,13 @@ function query(table: string) {
     update: (value: Row) => { patch = value; return builder; },
     insert: async () => ({ error: null }),
     eq: (col: string, val: any) => { filters.push([col, val]); return builder; },
+    // Filtros que o teste não precisa aplicar (jsonb, datas, ordem).
+    in: () => builder,
+    filter: () => builder,
+    gte: () => builder,
+    order: () => builder,
+    limit: () => builder,
+    then: (resolve: any, reject: any) => Promise.resolve({ data: apply().map(r => structuredClone(r)), error: null }).then(resolve, reject),
     single: async () => {
       const hit = apply();
       return hit.length === 1 ? { data: structuredClone(hit[0]), error: null } : { data: null, error: { message: 'not found' } };
@@ -76,6 +83,9 @@ function makeService() {
     getTransfer: jest.fn<Promise<any>, any[]>(async () => ({ id: 'xfer_1', status: 'succeeded' })),
     createPayout: jest.fn<Promise<any>, any[]>(async () => ({ id: 'cofr_1', status: 'requested' })),
     getPayout: jest.fn<Promise<any>, any[]>(async () => ({ id: 'cofr_1', status: 'completed' })),
+    createPayoutQuote: jest.fn<Promise<any>, any[]>(async () => ({
+      quote_token: 'qt_1', expires_at: new Date(Date.now() + 10 * 60_000).toISOString(),
+    })),
   };
   const balances: Record<string, number> = { [MASTER]: 1_000_000, [BIZ]: 9700 };
   const connect = {
@@ -385,5 +395,174 @@ describe('elegibilidade', () => {
   it('conta conectada ativa: envio automático', async () => {
     const { service } = makeService();
     await expect(service.eligibleAccount(SELLER)).resolves.toBe(BIZ);
+  });
+});
+
+describe('conta que exige cotação', () => {
+  const quoteError = () => new WhopApiError('A quote is required for this payout', 422, 'invalid_payout_quote', null);
+
+  it('cota e reenvia com o quote_token e uma chave nova', async () => {
+    seedPayout();
+    const { service, whop } = makeService();
+    whop.createPayout.mockRejectedValueOnce(quoteError());
+
+    await service.advance('pay_1');
+
+    expect(whop.createPayoutQuote).toHaveBeenCalledWith(
+      expect.objectContaining({ account_id: BIZ, payout_method_id: 'potk_1', amount: 97, currency: 'usd', platform_covers_fees: false }),
+      expect.stringMatching(/^koopfy_payout_pay_1_withdraw_1_q1_quote_/),
+    );
+    expect(whop.createPayout).toHaveBeenCalledTimes(2);
+    expect(whop.createPayout.mock.calls[0][0]).not.toHaveProperty('quote_token');
+    expect(whop.createPayout.mock.calls[1]).toEqual([
+      expect.objectContaining({ quote_token: 'qt_1' }),
+      payoutWithdrawalKey('pay_1', 1, 1),
+    ]);
+    expect(row().metadata.execution).toMatchObject({ quote_required: true, quote_round: 1, quote_sent: true });
+    expect(credits()).toHaveLength(0);
+  });
+
+  it('timeout depois de usar a cotação: repete o MESMO corpo e a MESMA chave', async () => {
+    seedPayout();
+    const { service, whop } = makeService();
+    whop.createPayout
+      .mockRejectedValueOnce(quoteError())
+      .mockRejectedValueOnce(new WhopApiError('timeout', 504, null, null));
+
+    await service.advance('pay_1');
+    expect(stage()).toBe('paying_out');
+
+    await service.advance('pay_1');
+
+    expect(whop.createPayoutQuote).toHaveBeenCalledTimes(1);
+    expect(whop.createPayout.mock.calls[2]).toEqual(whop.createPayout.mock.calls[1]);
+  });
+
+  it('cotação vencida que nunca foi enviada é renovada', async () => {
+    seedPayout({
+      status: 'processing',
+      metadata: {
+        net_cents: 9700,
+        execution: {
+          ...newPayoutExecution(BIZ), stage: 'paying_out', payout_method_id: 'potk_1', transfer: { id: 'xfer_1', status: 'succeeded' },
+          quote_required: true, quote_round: 1, quote_sent: false,
+          quote: { token: 'qt_velho', expires_at: new Date(Date.now() - 1000).toISOString() },
+        },
+      },
+    });
+    const { service, whop } = makeService();
+
+    await service.advance('pay_1');
+
+    expect(whop.createPayoutQuote).toHaveBeenCalledTimes(1);
+    expect(whop.createPayout).toHaveBeenCalledWith(expect.objectContaining({ quote_token: 'qt_1' }), payoutWithdrawalKey('pay_1', 1, 1));
+  });
+
+  it('cotação recusada de novo: não entra em laço, espera o próximo ciclo', async () => {
+    seedPayout();
+    const { service, whop } = makeService();
+    whop.createPayout.mockRejectedValue(quoteError());
+
+    await service.advance('pay_1');
+
+    expect(whop.createPayout).toHaveBeenCalledTimes(2);
+    expect(stage()).toBe('paying_out');
+    expect(row().metadata.execution.quote_round).toBe(2);
+    expect(credits()).toHaveLength(0);
+  });
+});
+
+describe('estorno depois de pago', () => {
+  const completedSeed = () => seedPayout({
+    status: 'completed',
+    completed_at: '2026-09-16T12:00:00Z',
+    provider_payout_id: 'cofr_1',
+    metadata: {
+      net_cents: 9700,
+      execution: {
+        ...newPayoutExecution(BIZ), stage: 'completed', payout_method_id: 'potk_1',
+        transfer: { id: 'xfer_1', status: 'succeeded' }, payout: { id: 'cofr_1', status: 'completed', attempt: 1 },
+      },
+    },
+  });
+
+  it('webhook payout.reversed reabre o saque para reenvio, sem devolver saldo', async () => {
+    completedSeed();
+    const { service } = makeService();
+
+    const result = await service.handlePayoutEvent('payout.reversed', {
+      id: 'wdrl_9', payout_request_id: 'cofr_1', status: 'reversed',
+      failure: { message: 'Account closed' }, metadata: { koopfy_payout_id: 'pay_1' },
+    }, BIZ);
+
+    expect(result).toEqual({ reversed: true });
+    expect(row().status).toBe('processing');
+    expect(row().completed_at).toBeNull();
+    expect(stage()).toBe('payout_failed');
+    expect(row().metadata.execution.reversed_at).toEqual(expect.any(String));
+    expect(row().metadata.execution.last_error).toMatch(/devolveu o saque depois de pago: Account closed/);
+    expect(credits()).toHaveLength(0);
+  });
+
+  it('depois do estorno, o reenvio cria um saque novo sem transferir de novo', async () => {
+    completedSeed();
+    const { service, whop } = makeService();
+    await service.handlePayoutEvent('payout.reversed', { id: 'wdrl_9', payout_request_id: 'cofr_1', status: 'reversed', metadata: { koopfy_payout_id: 'pay_1' } }, BIZ);
+    whop.createPayout.mockResolvedValueOnce({ id: 'cofr_2', status: 'completed' });
+
+    await service.retryWithdrawal('pay_1');
+
+    expect(whop.createTransfer).not.toHaveBeenCalled();
+    expect(whop.createPayout).toHaveBeenCalledWith(expect.anything(), payoutWithdrawalKey('pay_1', 2));
+    expect(row().status).toBe('completed');
+  });
+
+  it('evento de outra conta é ignorado', async () => {
+    completedSeed();
+    const { service } = makeService();
+    const result = await service.handlePayoutEvent('payout.reversed', { id: 'wdrl_9', payout_request_id: 'cofr_1', status: 'reversed', metadata: { koopfy_payout_id: 'pay_1' } }, 'biz_intruso');
+    expect(result).toMatchObject({ ignored: true, reason: 'ownership mismatch' });
+    expect(row().status).toBe('completed');
+  });
+
+  it('evento de uma tentativa antiga não mexe no saque atual', async () => {
+    completedSeed();
+    const { service } = makeService();
+    const result = await service.handlePayoutEvent('payout.reversed', { id: 'wdrl_x', payout_request_id: 'cofr_antigo', status: 'reversed', metadata: { koopfy_payout_id: 'pay_1' } }, BIZ);
+    expect(result).toMatchObject({ ignored: true });
+    expect(row().status).toBe('completed');
+  });
+
+  it('payout.updated de saque em andamento adianta a execução', async () => {
+    seedPayout();
+    const { service, whop } = makeService();
+    await service.advance('pay_1'); // transfere e cria cofr_1
+    whop.getPayout.mockResolvedValueOnce({ id: 'cofr_1', status: 'completed' });
+
+    await service.handlePayoutEvent('payout.updated', { id: 'wdrl_9', payout_request_id: 'cofr_1', status: 'completed', metadata: { koopfy_payout_id: 'pay_1' } }, BIZ);
+
+    expect(row().status).toBe('completed');
+  });
+
+  it('evento sem koopfy_payout_id é ignorado', async () => {
+    const { service } = makeService();
+    await expect(service.handlePayoutEvent('payout.updated', { id: 'wdrl_1' }, BIZ)).resolves.toMatchObject({ ignored: true });
+  });
+
+  it('a varredura pega estorno cujo webhook se perdeu', async () => {
+    completedSeed();
+    const { service, whop } = makeService();
+    whop.getPayout.mockResolvedValueOnce({ id: 'cofr_1', status: 'reversed', failure: { code: 'account_closed' } });
+
+    await expect(service.checkReversals()).resolves.toEqual({ checked: 1, reversed: 1 });
+    expect(stage()).toBe('payout_failed');
+    expect(credits()).toHaveLength(0);
+  });
+
+  it('a varredura não mexe em saque pago de verdade', async () => {
+    completedSeed();
+    const { service } = makeService();
+    await expect(service.checkReversals()).resolves.toEqual({ checked: 1, reversed: 0 });
+    expect(row().status).toBe('completed');
   });
 });

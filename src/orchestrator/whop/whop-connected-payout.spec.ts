@@ -2,6 +2,10 @@ import {
   availableCents,
   classifyWhopPayout,
   checkPayoutFields,
+  eventMatchesExecution,
+  isQuoteRequiredError,
+  payoutIdFromEvent,
+  quoteUsable,
   toRequiredField,
   whopPayoutFailureReason,
   isWhopConnectedPayout,
@@ -144,4 +148,41 @@ it('isWhopConnectedPayout reconhece só a execução automática', () => {
   expect(isWhopConnectedPayout({ execution: newPayoutExecution('biz_1') })).toBe(true);
   expect(isWhopConnectedPayout({ method: 'pix' })).toBe(false);
   expect(isWhopConnectedPayout(null)).toBe(false);
+});
+
+describe('cotação', () => {
+  it('reconhece a recusa por falta de cotação', () => {
+    expect(isQuoteRequiredError({ type: 'invalid_payout_quote', message: 'x' })).toBe(true);
+    expect(isQuoteRequiredError({ message: 'quote_token is required' })).toBe(true);
+    expect(isQuoteRequiredError({ type: 'invalid_request', message: 'amount too low' })).toBe(false);
+  });
+
+  it('cotação só vale com folga antes de expirar', () => {
+    const now = Date.parse('2026-09-17T12:00:00Z');
+    expect(quoteUsable({ token: 't', expires_at: '2026-09-17T12:05:00Z' }, now)).toBe(true);
+    expect(quoteUsable({ token: 't', expires_at: '2026-09-17T12:00:30Z' }, now)).toBe(false);
+    expect(quoteUsable({ token: 't', expires_at: null }, now)).toBe(false);
+    expect(quoteUsable(null, now)).toBe(false);
+  });
+
+  it('cada rodada de cotação tem chave própria', () => {
+    expect(payoutWithdrawalKey('p1', 1, 0)).toBe(payoutWithdrawalKey('p1', 1));
+    expect(payoutWithdrawalKey('p1', 1, 1)).not.toBe(payoutWithdrawalKey('p1', 1, 2));
+  });
+});
+
+describe('eventos de payout', () => {
+  const exec = { ...newPayoutExecution('biz_1'), payout: { id: 'cofr_1', status: 'completed', attempt: 1 } };
+
+  it('lê o saque da Koopfy pelo metadata', () => {
+    expect(payoutIdFromEvent({ metadata: { koopfy_payout_id: ' p1 ' } })).toBe('p1');
+    expect(payoutIdFromEvent({ metadata: {} })).toBeNull();
+  });
+
+  it('casa pelo pedido (cofr_) ou pelo payout (wdrl_)', () => {
+    expect(eventMatchesExecution({ id: 'wdrl_9', payout_request_id: 'cofr_1' }, exec)).toBe(true);
+    expect(eventMatchesExecution({ id: 'cofr_1' }, exec)).toBe(true);
+    expect(eventMatchesExecution({ id: 'wdrl_9', payout_request_id: 'cofr_2' }, exec)).toBe(false);
+    expect(eventMatchesExecution({ id: 'cofr_1' }, { ...exec, payout: null })).toBe(false);
+  });
 });

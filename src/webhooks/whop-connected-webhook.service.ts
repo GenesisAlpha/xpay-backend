@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
 import { WebhookService } from './webhook.service'
 import { WhopConnectService } from '../orchestrator/whop/whop-connect.service'
+import { WhopConnectedPayoutService } from '../orchestrator/whop/whop-connected-payout.service'
 import {
   checkConnectedEventOwnership,
   connectedWebhookSecret,
@@ -41,6 +42,8 @@ export class WhopConnectedWebhookService {
   constructor(
     private readonly webhooks: WebhookService,
     private readonly connect: WhopConnectService,
+    // Opcional só para os testes antigos; em produção o módulo sempre injeta.
+    private readonly payouts?: WhopConnectedPayoutService,
   ) { }
 
   /**
@@ -88,6 +91,14 @@ export class WhopConnectedWebhookService {
     if (ACCOUNT_SYNC_EVENTS.has(eventType) || eventType.startsWith('identity_profile.')) {
       await this.connect.sync(row.seller_id)
       return { synced: true }
+    }
+
+    // Saque da conta conectada: adianta o que está em andamento e pega o
+    // estorno de um saque já pago (payout.reversed). Precisa da família
+    // `payout.*` assinada no webhook da Whop.
+    if (eventType.startsWith('payout.')) {
+      if (!this.payouts) return { ignored: true, reason: 'saque automático indisponível' }
+      return this.payouts.handlePayoutEvent(eventType, body?.data ?? {}, whopAccountId)
     }
 
     if (eventType === 'dispute_alert.created') {
