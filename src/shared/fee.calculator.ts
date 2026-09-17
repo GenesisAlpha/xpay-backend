@@ -11,6 +11,7 @@
 // Tudo tem padrão aqui e pode ser alterado por seller no CRM.
 
 import { supabase } from '../lib/supabase.client'
+import { releaseDateAfter } from './business-time'
 
 export interface FeeSettings {
   fxFeePct: number
@@ -236,7 +237,7 @@ export function calculateSaleFees(
   const netCents = afterFees - reserveCents
 
   const now = options.now ?? new Date()
-  const availableAt = nextReleaseDay(addCalendarDays(now, fees.settlementDays))
+  const availableAt = releaseDateAfter(now, fees.settlementDays)
   const reserveUntil = fees.reserveHoldDays > 0 ? addCalendarDays(now, fees.reserveHoldDays) : now
   const providerCost = calculateProviderCost(gross, { currencyConverted: options.currencyConverted })
 
@@ -357,18 +358,5 @@ function round2(v: number): number {
 function addCalendarDays(date: Date, days: number): Date {
   const d = new Date(date)
   d.setDate(d.getDate() + days)
-  return d
-}
-
-// Próximo dia de liberação (SEGUNDA=1 ou QUINTA=4) na data dada ou depois dela.
-// O horário é zerado (00:00) para liberar no início do dia.
-function nextReleaseDay(date: Date): Date {
-  const RELEASE_DOWS = [1, 4] // segunda, quinta
-  const d = new Date(date)
-  d.setHours(0, 0, 0, 0)
-  for (let i = 0; i < 7; i++) {
-    if (RELEASE_DOWS.includes(d.getDay())) return d
-    d.setDate(d.getDate() + 1)
-  }
   return d
 }
