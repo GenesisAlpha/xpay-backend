@@ -30,8 +30,10 @@ interface AffiliateAccountRow {
 
 /** O que o checkout devolve de cada afiliado. */
 interface CheckoutAffiliate {
-  sellerId: string
+  sellerId: string | null
   id: string
+  email?: string | null
+  name?: string | null
   code: string
   status: string
   commissionRatePct: number
@@ -71,7 +73,23 @@ export class AffiliateCrmService {
 
     const accounts = (data ?? []) as AffiliateAccountRow[]
     const ids = accounts.map(a => a.seller_id)
-    if (ids.length === 0) return { affiliates: [] }
+
+    // Ativados pelo CRM que ainda não têm Koopfy Payments: só existem no
+    // checkout até ativarem. Aparecem na lista para o time acompanhar.
+    const pendingRes = await checkoutInternal<{ affiliates: CheckoutAffiliate[] }>('affiliates/pending', {})
+    const pending = (pendingRes?.affiliates ?? []).map(a => ({
+      affiliateId: a.id,
+      email: a.email ?? null,
+      name: a.name ?? null,
+      status: a.status,
+      code: a.code,
+      link: a.link,
+      commissionRatePct: Number(a.commissionRatePct),
+      clicks: a.clicks ?? null,
+      signups: a.signups ?? null,
+    }))
+
+    if (ids.length === 0) return { funnelAvailable: pendingRes !== null, affiliates: [], pending }
 
     const [statsRes, sellersRes, cycles, funnel] = await Promise.all([
       supabase.from('v_crm_affiliates').select('*').in('affiliate_seller_id', ids),
@@ -88,6 +106,7 @@ export class AffiliateCrmService {
 
     return {
       funnelAvailable: funnel !== null,
+      pending,
       affiliates: accounts.map(acc => {
         const st = stats.get(acc.seller_id)
         const fn = clicks.get(acc.seller_id)
@@ -154,6 +173,115 @@ export class AffiliateCrmService {
     await this.audit(ctx, 'affiliate.activated', sellerId, { code: res.affiliate.code, ratePct: res.affiliate.commissionRatePct })
 
     return { sellerId, code: res.affiliate.code, link: res.affiliate.link, commissionRatePct: res.affiliate.commissionRatePct }
+  }
+
+  /**
+   * Ativa pelo e-mail do cadastro no checkout — para quem ainda não tem
+   * Koopfy Payments. O link já sai; a comissão começa quando a pessoa ativar
+   * o Koopfy Payments (o checkout liga a conta nesse momento).
+   *
+   * Se o e-mail já tem conta aqui, cai no fluxo normal por conta.
+   */
+  async activateByEmail(ctx: AffiliateCrmContext, rawEmail: string, input: { ratePct?: number } = {}) {
+    const email = String(rawEmail ?? '').trim().toLowerCase()
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      throw new BadRequestException('Informe um e-mail válido.')
+    }
+    const rate = this.optionalRate(input.ratePct)
+
+    const existing = await this.sellerByEmail(email)
+    if (existing) return this.activate(ctx, existing, { ratePct: rate })
+
+    const res = await checkoutInternal<{ affiliate: CheckoutAffiliate }>('affiliates/activate', {
+      email,
+      commissionRatePct: rate,
+    })
+    if (!res?.affiliate) {
+      throw new ServiceUnavailableException(checkoutFailureMessage('ativar o programa no checkout'))
+    }
+
+    await this.audit(ctx, 'affiliate.activated', email, {
+      code: res.affiliate.code,
+      ratePct: res.affiliate.commissionRatePct,
+      withoutPayments: true,
+    })
+
+    return {
+      sellerId: null,
+      affiliateId: res.affiliate.id,
+      code: res.affiliate.code,
+      link: res.affiliate.link,
+      commissionRatePct: res.affiliate.commissionRatePct,
+      awaitingPayments: true,
+    }
+  }
+
+  /** Desativa ou reativa quem ainda não tem Koopfy Payments (só existe no checkout). */
+  async updatePending(ctx: AffiliateCrmContext, affiliateId: string, status: 'active' | 'inactive') {
+    const res = await checkoutInternal<{ affiliate: CheckoutAffiliate }>('affiliates/update', { affiliateId, status })
+    if (!res?.affiliate) {
+      throw new ServiceUnavailableException(checkoutFailureMessage('atualizar o afiliado no checkout'))
+    }
+    await this.audit(ctx, status === 'active' ? 'affiliate.activated' : 'affiliate.deactivated', affiliateId, {
+      withoutPayments: true,
+    })
+    return { affiliateId, status }
+  }
+
+  /**
+   * Conta que acabou de ativar o Koopfy Payments sendo afiliada: o checkout
+   * avisa, e ela entra na lista. Não sobrescreve quem ativou nem quando.
+   */
+  async upsertFromCheckout(input: {
+    sellerId: string
+    affiliateId: string | null
+    code: string | null
+    link: string | null
+    status: 'active' | 'inactive'
+    commissionRatePct: number
+  }) {
+    const rate = Number.isFinite(input.commissionRatePct) && input.commissionRatePct > 0 && input.commissionRatePct < 100
+      ? input.commissionRatePct
+      : 20
+    const now = new Date().toISOString()
+
+    const { data: current } = await supabase
+      .from('affiliate_accounts').select('seller_id').eq('seller_id', input.sellerId).maybeSingle()
+
+    const row = {
+      seller_id: input.sellerId,
+      affiliate_id: input.affiliateId,
+      code: input.code,
+      link: input.link,
+      status: input.status,
+      commission_rate_pct: rate,
+      updated_at: now,
+    }
+
+    const { error } = current
+      ? await supabase.from('affiliate_accounts').update(row).eq('seller_id', input.sellerId)
+      : await supabase.from('affiliate_accounts').insert({ ...row, activated_by: 'checkout', activated_at: now })
+
+    if (error) throw new BadRequestException('Falha ao registrar a conta do afiliado: ' + error.message)
+    return { ok: true }
+  }
+
+  private optionalRate(value: unknown): number | undefined {
+    if (value === undefined || value === null || value === '') return undefined
+    const rate = Number(value)
+    if (!Number.isFinite(rate) || rate <= 0 || rate >= 100) {
+      throw new BadRequestException('A alíquota deve estar entre 0 e 100.')
+    }
+    return rate
+  }
+
+  /** Conta do Koopfy Payments do e-mail, se existir. */
+  private async sellerByEmail(email: string): Promise<string | null> {
+    const { data: user } = await supabase.from('users').select('id').ilike('email', email).maybeSingle()
+    if (!user?.id) return null
+    const { data: seller } = await supabase
+      .from('seller_profiles').select('id').eq('user_id', user.id).maybeSingle()
+    return seller?.id ? String(seller.id) : null
   }
 
   /**

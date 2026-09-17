@@ -48,6 +48,20 @@ export class AffiliateCrmController {
     return this.affiliates.setRate(ctxFromReq(req), sellerId, Number(body?.ratePct))
   }
 
+  /** Ativa pelo e-mail do checkout, para quem ainda não tem Koopfy Payments. */
+  @Post('activate-by-email')
+  @Roles('admin')
+  activateByEmail(@Req() req: any, @Body() body: { email?: string; ratePct?: number }) {
+    return this.affiliates.activateByEmail(ctxFromReq(req), String(body?.email ?? ''), body ?? {})
+  }
+
+  /** Desativa/reativa um afiliado que ainda não tem Koopfy Payments. */
+  @Post('pending/:affiliateId/status')
+  @Roles('admin')
+  pendingStatus(@Req() req: any, @Param('affiliateId') affiliateId: string, @Body() body: { status?: string }) {
+    return this.affiliates.updatePending(ctxFromReq(req), affiliateId, body?.status === 'active' ? 'active' : 'inactive')
+  }
+
   /** Ativa o programa para a conta e devolve o link de indicação. */
   @Post(':sellerId/activate')
   @Roles('admin')

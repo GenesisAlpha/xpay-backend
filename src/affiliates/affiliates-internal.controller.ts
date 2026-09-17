@@ -9,6 +9,18 @@ import {
   BadRequestException,
 } from '@nestjs/common'
 import { AffiliateCommissionService } from './affiliate-commission.service'
+import { AffiliateCrmService } from './affiliate-crm.service'
+
+/**
+ * Mesmo segredo do canal pay → checkout (CHECKOUT_INTERNAL_KEY aqui,
+ * INTERNAL_API_KEY lá), já configurado nos dois lados. INTERNAL_API_KEY
+ * continua aceito para quem preferir um segredo só deste sentido.
+ */
+function assertInternalKey(key: string) {
+  const expected = process.env.INTERNAL_API_KEY || process.env.CHECKOUT_INTERNAL_KEY
+  if (!expected) throw new UnauthorizedException('CHECKOUT_INTERNAL_KEY não configurada no pay.')
+  if (!key || key !== expected) throw new UnauthorizedException('Chave interna inválida.')
+}
 
 interface ReferralInput {
   sellerId?: string
@@ -28,17 +40,15 @@ interface ReferralInput {
  */
 @Controller('internal/affiliates')
 export class AffiliatesInternalController {
-  constructor(private readonly commissions: AffiliateCommissionService) {}
+  constructor(
+    private readonly commissions: AffiliateCommissionService,
+    private readonly accounts: AffiliateCrmService,
+  ) {}
 
   @Post('referral')
   @HttpCode(HttpStatus.OK)
   async referral(@Headers('x-internal-key') key: string, @Body() body: ReferralInput) {
-    // Mesmo segredo do canal pay → checkout (CHECKOUT_INTERNAL_KEY aqui,
-    // INTERNAL_API_KEY lá), já configurado nos dois lados. INTERNAL_API_KEY
-    // continua aceito para quem preferir um segredo só deste sentido.
-    const expected = process.env.INTERNAL_API_KEY || process.env.CHECKOUT_INTERNAL_KEY
-    if (!expected) throw new UnauthorizedException('CHECKOUT_INTERNAL_KEY não configurada no pay.')
-    if (!key || key !== expected) throw new UnauthorizedException('Chave interna inválida.')
+    assertInternalKey(key)
 
     const sellerId = body?.sellerId?.trim()
     const affiliateSellerId = body?.affiliateSellerId?.trim()
@@ -60,6 +70,29 @@ export class AffiliatesInternalController {
       affiliateCode: body?.affiliateCode ?? null,
       commissionRatePct: rate,
       expiresAt,
+    })
+  }
+
+  /**
+   * O afiliado ativado pelo CRM antes de ter Koopfy Payments acabou de ativar.
+   * O checkout avisa para a conta entrar na lista do CRM — a partir daqui ela é
+   * administrada como qualquer outra.
+   */
+  @Post('account')
+  @HttpCode(HttpStatus.OK)
+  async account(@Headers('x-internal-key') key: string, @Body() body: any) {
+    assertInternalKey(key)
+
+    const sellerId = String(body?.sellerId ?? '').trim()
+    if (!sellerId) throw new BadRequestException('sellerId é obrigatório.')
+
+    return this.accounts.upsertFromCheckout({
+      sellerId,
+      affiliateId: body?.affiliateId ?? null,
+      code: body?.code ?? null,
+      link: body?.link ?? null,
+      status: body?.status === 'inactive' ? 'inactive' : 'active',
+      commissionRatePct: Number(body?.commissionRatePct ?? 20),
     })
   }
 }

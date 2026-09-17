@@ -17,6 +17,7 @@ jest.mock('../lib/supabase.client', () => ({
             const chain: any = {
                 select: () => chain,
                 eq: () => chain,
+                ilike: () => chain,
                 in: () => chain,
                 gt: () => chain,
                 order: () => chain,
@@ -99,5 +100,48 @@ describe('AffiliateCrmService', () => {
 
         const closed = writes.find(w => w.table === 'seller_referrals' && w.op === 'update')
         expect(closed?.payload).toHaveProperty('expires_at')
+    })
+
+    describe('activateByEmail', () => {
+        it('activates in the checkout without a Koopfy Payments account', async () => {
+            tableData.users = null
+            checkoutInternal.mockResolvedValue({
+                affiliate: { sellerId: null, id: 'a9', code: 'Q2W3E4R5', status: 'active', commissionRatePct: 20, link: 'https://koopfy.com/?ref=Q2W3E4R5' },
+            })
+
+            const result = await service.activateByEmail(ctx, ' Gui@Outlook.com ')
+
+            expect(checkoutInternal).toHaveBeenCalledWith('affiliates/activate', { email: 'gui@outlook.com', commissionRatePct: undefined })
+            expect(result).toMatchObject({ sellerId: null, awaitingPayments: true, link: 'https://koopfy.com/?ref=Q2W3E4R5' })
+            // Sem conta aqui não há espelho: ele entra quando ativar o Koopfy Payments.
+            expect(writes.filter(w => w.table === 'affiliate_accounts')).toHaveLength(0)
+        })
+
+        it('uses the normal flow when the e-mail already has an account', async () => {
+            tableData.users = { id: 'u_1', email: 'marcos@loja.com' }
+            checkoutInternal.mockResolvedValue({
+                affiliate: { sellerId: 'sell_1', id: 'a1', code: 'K7M2PQ4A', status: 'active', commissionRatePct: 20, link: 'https://koopfy.com/?ref=K7M2PQ4A' },
+            })
+
+            const result = await service.activateByEmail(ctx, 'marcos@loja.com')
+
+            expect(checkoutInternal).toHaveBeenCalledWith('affiliates/activate', expect.objectContaining({ sellerId: 'sell_1' }))
+            expect(result).toMatchObject({ sellerId: 'sell_1' })
+        })
+
+        it('refuses something that is not an e-mail', async () => {
+            await expect(service.activateByEmail(ctx, 'guilapiccirella')).rejects.toThrow(/e-mail/)
+            expect(checkoutInternal).not.toHaveBeenCalled()
+        })
+    })
+
+    it('registers the account the checkout reports after payments are activated', async () => {
+        tableData.affiliate_accounts = null
+        await service.upsertFromCheckout({
+            sellerId: 'sell_7', affiliateId: 'a9', code: 'Q2W3E4R5', link: 'https://koopfy.com/?ref=Q2W3E4R5',
+            status: 'active', commissionRatePct: 25,
+        })
+        const inserted = writes.find(w => w.table === 'affiliate_accounts' && w.op === 'insert')
+        expect(inserted?.payload).toMatchObject({ seller_id: 'sell_7', commission_rate_pct: 25, activated_by: 'checkout' })
     })
 })
