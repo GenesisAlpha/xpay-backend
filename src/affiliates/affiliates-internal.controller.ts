@@ -33,8 +33,11 @@ export class AffiliatesInternalController {
   @Post('referral')
   @HttpCode(HttpStatus.OK)
   async referral(@Headers('x-internal-key') key: string, @Body() body: ReferralInput) {
-    const expected = process.env.INTERNAL_API_KEY
-    if (!expected) throw new UnauthorizedException('INTERNAL_API_KEY não configurada no pay.')
+    // Mesmo segredo do canal pay → checkout (CHECKOUT_INTERNAL_KEY aqui,
+    // INTERNAL_API_KEY lá), já configurado nos dois lados. INTERNAL_API_KEY
+    // continua aceito para quem preferir um segredo só deste sentido.
+    const expected = process.env.INTERNAL_API_KEY || process.env.CHECKOUT_INTERNAL_KEY
+    if (!expected) throw new UnauthorizedException('CHECKOUT_INTERNAL_KEY não configurada no pay.')
     if (!key || key !== expected) throw new UnauthorizedException('Chave interna inválida.')
 
     const sellerId = body?.sellerId?.trim()

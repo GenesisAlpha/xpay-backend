@@ -1,5 +1,6 @@
-import { BadRequestException, Injectable, Logger } from '@nestjs/common'
+import { BadRequestException, Injectable, Logger, NotFoundException, ServiceUnavailableException } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
+import { checkoutFailureMessage, checkoutInternal } from '../crm/checkout-internal'
 import { DEFAULT_PAYOUT_CYCLE, normalizeCycle } from './payout-cycle'
 
 /**
@@ -13,6 +14,30 @@ export interface AffiliateCrmContext {
   managerId: string
   ip?: string
   userAgent?: string
+}
+
+interface AffiliateAccountRow {
+  seller_id: string
+  affiliate_id: string | null
+  code: string | null
+  link: string | null
+  status: 'active' | 'inactive'
+  commission_rate_pct: number
+  activated_by: string | null
+  activated_at: string
+  deactivated_at: string | null
+}
+
+/** O que o checkout devolve de cada afiliado. */
+interface CheckoutAffiliate {
+  sellerId: string
+  id: string
+  code: string
+  status: string
+  commissionRatePct: number
+  link: string
+  clicks?: number
+  signups?: number
 }
 
 interface CrmAffiliateRow {
@@ -31,33 +56,147 @@ interface CrmAffiliateRow {
 export class AffiliateCrmService {
   private readonly logger = new Logger(AffiliateCrmService.name)
 
-  /** Afiliados que já geraram comissão, do maior volume para o menor. */
-  async list(limit = 100) {
+  /**
+   * Contas com o programa ativado, com funil (do checkout) e comissão (daqui).
+   * Inativas também aparecem: ainda podem ter comissão a receber.
+   */
+  async list(limit = 200) {
     const { data, error } = await supabase
-      .from('v_crm_affiliates')
+      .from('affiliate_accounts')
       .select('*')
-      .order('total_cents', { ascending: false })
+      .order('activated_at', { ascending: false })
       .limit(Math.min(Math.max(limit, 1), 500))
 
     if (error) throw new BadRequestException('Falha ao listar afiliados: ' + error.message)
 
-    const rows = (data ?? []) as CrmAffiliateRow[]
-    const cycles = await this.cyclesFor(rows.map(r => r.affiliate_seller_id))
+    const accounts = (data ?? []) as AffiliateAccountRow[]
+    const ids = accounts.map(a => a.seller_id)
+    if (ids.length === 0) return { affiliates: [] }
+
+    const [statsRes, sellersRes, cycles, funnel] = await Promise.all([
+      supabase.from('v_crm_affiliates').select('*').in('affiliate_seller_id', ids),
+      supabase.from('seller_profiles').select('id, name, user_id').in('id', ids),
+      this.cyclesFor(ids),
+      // Uma chamada para a lista inteira. Se o checkout oscilar, a lista sai
+      // sem o funil em vez de não sair.
+      checkoutInternal<{ affiliates: CheckoutAffiliate[] }>('affiliates/summary', { sellerIds: ids }),
+    ])
+
+    const stats = new Map(((statsRes.data ?? []) as CrmAffiliateRow[]).map(r => [r.affiliate_seller_id, r]))
+    const names = new Map((sellersRes.data ?? []).map((r: any) => [String(r.id), r.name as string | null]))
+    const clicks = new Map((funnel?.affiliates ?? []).map(a => [a.sellerId, a]))
 
     return {
-      affiliates: rows.map(row => ({
-        affiliateSellerId: row.affiliate_seller_id,
-        commissionCount: row.commission_count,
-        earningSellers: row.earning_sellers,
-        totalCents: row.total_cents,
-        pendingCents: row.pending_cents,
-        availableCents: row.available_cents,
-        paidCents: row.paid_cents,
-        firstCommissionAt: row.first_commission_at,
-        lastCommissionAt: row.last_commission_at,
-        cycle: cycles.get(row.affiliate_seller_id) ?? DEFAULT_PAYOUT_CYCLE,
-      })),
+      funnelAvailable: funnel !== null,
+      affiliates: accounts.map(acc => {
+        const st = stats.get(acc.seller_id)
+        const fn = clicks.get(acc.seller_id)
+        return {
+          sellerId: acc.seller_id,
+          sellerName: names.get(acc.seller_id) ?? null,
+          status: acc.status,
+          code: acc.code,
+          link: fn?.link ?? acc.link,
+          commissionRatePct: Number(acc.commission_rate_pct),
+          activatedAt: acc.activated_at,
+          deactivatedAt: acc.deactivated_at,
+          clicks: fn?.clicks ?? null,
+          signups: fn?.signups ?? null,
+          earningSellers: st?.earning_sellers ?? 0,
+          totalCents: Number(st?.total_cents ?? 0),
+          pendingCents: Number(st?.pending_cents ?? 0),
+          availableCents: Number(st?.available_cents ?? 0),
+          paidCents: Number(st?.paid_cents ?? 0),
+          cycle: cycles.get(acc.seller_id) ?? DEFAULT_PAYOUT_CYCLE,
+        }
+      }),
     }
+  }
+
+  /**
+   * Ativa o programa para uma conta e devolve o link.
+   *
+   * O código nasce no checkout, que é quem resolve o link no cadastro; aqui
+   * fica o espelho que a lista usa.
+   */
+  async activate(ctx: AffiliateCrmContext, sellerId: string, input: { ratePct?: number } = {}) {
+    const seller = await this.sellerOrThrow(sellerId)
+    const rate = input.ratePct === undefined || input.ratePct === null ? undefined : Number(input.ratePct)
+    if (rate !== undefined && (!Number.isFinite(rate) || rate <= 0 || rate >= 100)) {
+      throw new BadRequestException('A alíquota deve estar entre 0 e 100.')
+    }
+
+    const res = await checkoutInternal<{ affiliate: CheckoutAffiliate }>('affiliates/activate', {
+      sellerId,
+      email: seller.email,
+      commissionRatePct: rate,
+    })
+    if (!res?.affiliate) {
+      throw new ServiceUnavailableException(checkoutFailureMessage('ativar o programa no checkout'))
+    }
+
+    const now = new Date().toISOString()
+    const { error } = await supabase.from('affiliate_accounts').upsert({
+      seller_id: sellerId,
+      affiliate_id: res.affiliate.id,
+      code: res.affiliate.code,
+      link: res.affiliate.link,
+      status: 'active',
+      commission_rate_pct: res.affiliate.commissionRatePct,
+      activated_by: ctx.managerId,
+      activated_at: now,
+      deactivated_by: null,
+      deactivated_at: null,
+      updated_at: now,
+    }, { onConflict: 'seller_id' })
+    if (error) throw new BadRequestException('Afiliado ativado no checkout, mas não registrado aqui: ' + error.message)
+
+    await this.audit(ctx, 'affiliate.activated', sellerId, { code: res.affiliate.code, ratePct: res.affiliate.commissionRatePct })
+
+    return { sellerId, code: res.affiliate.code, link: res.affiliate.link, commissionRatePct: res.affiliate.commissionRatePct }
+  }
+
+  /**
+   * Tira o link do ar: cliques e cadastros novos deixam de ser atribuídos.
+   *
+   * Com `closeReferrals`, também encerra a comissão dos indicados que ele já
+   * trouxe. Sem isso, os indicados atuais seguem gerando até a janela fechar —
+   * desativar o convite não é o mesmo que cortar o que já foi combinado.
+   */
+  async deactivate(ctx: AffiliateCrmContext, sellerId: string, input: { closeReferrals?: boolean; reason?: string } = {}) {
+    const res = await checkoutInternal<{ affiliate: CheckoutAffiliate }>('affiliates/update', { sellerId, status: 'inactive' })
+    if (!res?.affiliate) {
+      throw new ServiceUnavailableException(checkoutFailureMessage('desativar o link no checkout'))
+    }
+
+    const now = new Date().toISOString()
+    await supabase.from('affiliate_accounts')
+      .update({ status: 'inactive', deactivated_by: ctx.managerId, deactivated_at: now, updated_at: now })
+      .eq('seller_id', sellerId)
+
+    if (input.closeReferrals) {
+      await this.suspend(ctx, sellerId, input.reason)
+    }
+
+    await this.audit(ctx, 'affiliate.deactivated', sellerId, {
+      closeReferrals: !!input.closeReferrals,
+      reason: input.reason ?? null,
+    })
+
+    return { sellerId, status: 'inactive', referralsClosed: !!input.closeReferrals }
+  }
+
+  /** Conta do pay com o e-mail do dono — é o elo com o checkout. */
+  private async sellerOrThrow(sellerId: string) {
+    const { data: seller } = await supabase
+      .from('seller_profiles').select('id, user_id, name').eq('id', sellerId).maybeSingle()
+    if (!seller) throw new NotFoundException('Seller não encontrado.')
+
+    const { data: user } = seller.user_id
+      ? await supabase.from('users').select('email').eq('id', seller.user_id).maybeSingle()
+      : { data: null as any }
+
+    return { id: String(seller.id), name: seller.name as string | null, email: (user?.email as string | undefined) ?? undefined }
   }
 
   /**
@@ -129,12 +268,23 @@ export class AffiliateCrmService {
       throw new BadRequestException('A alíquota deve estar entre 0 e 100.')
     }
 
+    // Checkout primeiro: é de lá que saem os vínculos novos. Se falhar, nada
+    // muda aqui e a tela mostra o motivo — sem alíquota pela metade.
+    const synced = await checkoutInternal('affiliates/update', { sellerId: affiliateSellerId, commissionRatePct: ratePct })
+    if (!synced) {
+      throw new ServiceUnavailableException(checkoutFailureMessage('atualizar a alíquota no checkout'))
+    }
+
+    const now = new Date().toISOString()
     const { error } = await supabase
       .from('seller_referrals')
-      .update({ commission_rate_pct: ratePct, updated_at: new Date().toISOString() })
+      .update({ commission_rate_pct: ratePct, updated_at: now })
       .eq('affiliate_seller_id', affiliateSellerId)
-
     if (error) throw new BadRequestException('Falha ao gravar a alíquota: ' + error.message)
+
+    await supabase.from('affiliate_accounts')
+      .update({ commission_rate_pct: ratePct, updated_at: now })
+      .eq('seller_id', affiliateSellerId)
 
     await this.audit(ctx, 'affiliate.rate_updated', affiliateSellerId, { ratePct })
 
