@@ -164,11 +164,11 @@ describe('WhopProvider confirmation token charge (Whop Elements)', () => {
       expect(result).toMatchObject({ success: false, failureMessage: expect.stringContaining('renovação') });
     });
 
-    it('refuses a first charge below the renewal when there is no trial', async () => {
-      const fetchMock = mockFetch(200, {});
+    it('valor inicial menor que a mensalidade, sem teste: cobra o inicial hoje e renova depois de um ciclo', async () => {
+      const fetchMock = mockFetch(200, { id: 'pay_s3', status: 'open', client_secret: 'pay_s3_secret' });
 
-      const result = await new WhopProvider().charge(ctx({
-        amount: 2000,
+      await new WhopProvider().charge(ctx({
+        amount: 990,
         currency: 'USD',
         metadata: subscriptionMetadata({
           subscription_config: { billing_period_days: 30, trial_period_days: 0 },
@@ -176,8 +176,76 @@ describe('WhopProvider confirmation token charge (Whop Elements)', () => {
         }),
       }));
 
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.plan).toMatchObject({ initial_price: 9.9, renewal_price: 29, billing_period: 30, trial_period_days: 30 });
+    });
+
+    it('valor inicial maior que a mensalidade, sem teste: a Whop cobra só o inicial hoje', async () => {
+      const fetchMock = mockFetch(200, { id: 'pay_s4', status: 'open', client_secret: 'pay_s4_secret' });
+
+      await new WhopProvider().charge(ctx({
+        amount: 9700,
+        currency: 'USD',
+        metadata: subscriptionMetadata({
+          subscription_config: { billing_period_days: 30, trial_period_days: 0 },
+          pricing_plan: { id: 'monthly', currency: 'USD', initial_price: 97, renewal_price: 47 },
+          subscription_charge: undefined,
+        }),
+      }));
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      // A Whop soma: 50 + 47 = 97 na compra; 47 a cada 30 dias.
+      expect(body.plan).toMatchObject({ initial_price: 50, renewal_price: 47, billing_period: 30, trial_period_days: null });
+    });
+
+    it('sem valor inicial, cobrança abaixo da mensalidade continua recusada', async () => {
+      const fetchMock = mockFetch(200, {});
+
+      const result = await new WhopProvider().charge(ctx({
+        amount: 2000,
+        currency: 'USD',
+        metadata: subscriptionMetadata({
+          subscription_config: { billing_period_days: 30, trial_period_days: 0 },
+          pricing_plan: { id: 'monthly', currency: 'USD', initial_price: 0, renewal_price: 29 },
+          subscription_charge: undefined,
+        }),
+      }));
+
       expect(fetchMock).not.toHaveBeenCalled();
       expect(result).toMatchObject({ success: false });
+    });
+  });
+
+  describe('assinatura no checkout embutido', () => {
+    const meta = (plan: Record<string, any>) => ({
+      ...ctx().metadata,
+      payment_type: 'subscription',
+      subscription_config: { billing_period_days: 30, trial_period_days: 0 },
+      pricing_plan: { id: 'monthly', currency: 'USD', ...plan },
+    });
+
+    it('ciclo de teste do valor inicial pede plano novo na Whop', async () => {
+      const fetchMock = mockFetch(200, { id: 'ch_1', purchase_url: '/checkout/plan_1?session=ch_1' });
+
+      await new WhopProvider().charge(ctx({
+        confirmation_token: 'not-a-token', amount: 990, currency: 'USD',
+        metadata: meta({ initial_price: 9.9, renewal_price: 29 }),
+      }));
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.plan).toMatchObject({ initial_price: 9.9, trial_period_days: 30, force_create_new_plan: true });
+    });
+
+    it('sem ciclo de teste, o plano com os mesmos termos é reaproveitado', async () => {
+      const fetchMock = mockFetch(200, { id: 'ch_2', purchase_url: '/checkout/plan_2?session=ch_2' });
+
+      await new WhopProvider().charge(ctx({
+        confirmation_token: 'not-a-token', amount: 9700, currency: 'USD',
+        metadata: meta({ initial_price: 97, renewal_price: 47 }),
+      }));
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.plan).toMatchObject({ initial_price: 50, trial_period_days: null, force_create_new_plan: false });
     });
   });
 
