@@ -92,6 +92,23 @@ export class CrmAdminController {
     return this.admin.markWithdrawalCompleted(ctxFromReq(req), id, body)
   }
 
+  @Get('withdrawals/:id/payout-methods')
+  listConnectedPayoutMethods(@Req() req: any, @Param('id') id: string) {
+    return this.admin.listConnectedPayoutMethods(ctxFromReq(req), id)
+  }
+
+  // Seller com conta conectada: o banco recusou o saque e o dinheiro está na
+  // conta dele. Reenvia, opcionalmente para outra conta bancária cadastrada.
+  @Post('withdrawals/:id/retry-payout')
+  @Roles('admin')
+  retryConnectedPayout(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Body() body: { payout_method_id?: string },
+  ) {
+    return this.admin.retryConnectedPayout(ctxFromReq(req), id, body ?? {})
+  }
+
   @Post('withdrawals/:id/mark-failed')
   @Roles('admin')
   markWithdrawalFailed(

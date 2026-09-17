@@ -28,6 +28,7 @@ import {
   toConnectedProviderAccountId,
   whopAccountIdFromProviderAccountId,
 } from './whop-connected';
+import { availableCents } from './whop-connected-payout';
 
 // ============================================================================
 // CONTAS CONECTADAS DA WHOP — ciclo de vida, roteamento, risco e dinheiro
@@ -95,7 +96,9 @@ export class WhopConnectService implements OnModuleInit {
   //    saindo da master, e o primeiro ciclo precisa ser acompanhado.
   onModuleInit() {
     const autoCover = process.env.WHOP_CONNECTED_AUTO_COVER !== 'false';
-    const autoRelease = process.env.WHOP_CONNECTED_AUTO_RELEASE === 'true';
+    // Saque por aprovação ligado: a liberação avulsa não roda.
+    const autoRelease = process.env.WHOP_CONNECTED_AUTO_RELEASE === 'true'
+      && process.env.WHOP_CONNECTED_PAYOUTS !== 'true';
     if (autoCover || autoRelease) {
       setInterval(() => void this.runCycle({ cover: autoCover, release: autoRelease }), CYCLE_INTERVAL_MS);
     }
@@ -938,6 +941,12 @@ export class WhopConnectService implements OnModuleInit {
   }
 
   async releaseToSeller(sellerId: string, managerId: string | null = null) {
+    // Com o saque por aprovação ligado, o dinheiro só vai para a conta
+    // conectada quando um saque é aprovado. Mandar o saldo inteiro por fora
+    // esvaziaria o disponível e o seller não conseguiria mais pedir saque.
+    if (process.env.WHOP_CONNECTED_PAYOUTS === 'true') {
+      throw new BadRequestException('Liberação avulsa desligada: o saldo vai para a conta conectada quando um saque é aprovado.');
+    }
     const row = await this.getRow(sellerId);
     if (!row?.whop_account_id) throw new BadRequestException('Seller sem conta conectada na Whop.');
     if (!row.charges_enabled || row.status !== 'active') {
@@ -1083,6 +1092,12 @@ export class WhopConnectService implements OnModuleInit {
     if (error) console.error(`[WhopConnect] ledger da liberação ${releaseId} (${status}):`, error.message);
   }
 
+  /** Saldo disponível (centavos) de uma conta Whop — master ou conectada. */
+  async accountAvailableCents(accountId: string, currency: string): Promise<number> {
+    const account = await this.whop.getAccount(accountId);
+    return availableCents(account?.balances, currency);
+  }
+
   private async masterBalance(currency: string): Promise<{ available: number; others: string[] }> {
     const account = await this.whop.getAccount(await this.masterAccountId());
     const balances: any[] = Array.isArray(account?.balances) ? account.balances : [];
@@ -1094,7 +1109,7 @@ export class WhopConnectService implements OnModuleInit {
     return { available: Number.isFinite(available) ? available : 0, others };
   }
 
-  private masterAccountId(): Promise<string> {
+  masterAccountId(): Promise<string> {
     const fromEnv = process.env.WHOP_COMPANY_ID?.trim();
     if (fromEnv) return Promise.resolve(fromEnv);
 

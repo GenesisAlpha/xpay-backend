@@ -55,6 +55,13 @@ const PAYOUT_FIELDS = [
   // Faltavam: sem eles todo saque Pix pelo fluxo unificado falhava no buildDestination.
   'pixKey',
   'pixKeyType',
+  // Seller com conta conectada: conta salva na Whop ou uma nova.
+  'whopPayoutMethodId',
+  'whopSupportedPayoutMethodId',
+  'whopFields',
+  'whopDestinationCurrency',
+  'whopNickname',
+  'whopCountry',
 ] as const;
 
 function publicTransaction(transaction: any) {
@@ -211,8 +218,20 @@ export class KoopfyFinanceService {
     return this.wallet.quotePayout(
       this.seller(ctx).id,
       Number.isFinite(amount) ? amount : 0,
-      ['ach', 'iban', 'pix', 'crypto'].includes(method) ? method : 'ach',
+      ['ach', 'iban', 'pix', 'crypto', 'whop'].includes(method) ? method : 'ach',
     );
+  }
+
+  async getPayoutDestinations(ctx: SellerCtx, country?: unknown) {
+    return this.wallet.getPayoutDestinations(this.seller(ctx).id, country);
+  }
+
+  async getPayoutDestinationFields(ctx: SellerCtx, query: Record<string, unknown>) {
+    return this.wallet.getPayoutDestinationFields(this.seller(ctx).id, {
+      supportedPayoutMethodId: query?.supportedPayoutMethodId,
+      country: query?.country,
+      destinationCurrency: query?.destinationCurrency,
+    });
   }
 
   async getAnticipationQuote(ctx: SellerCtx) {
