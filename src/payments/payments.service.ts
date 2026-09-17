@@ -13,6 +13,7 @@ import { CardCryptoService } from '../crypto/card-crypto.service'
 import { WebhookService } from '../webhooks/webhook.service'
 import { ClipAccountsService } from '../orchestrator/clip/clip-accounts.service'
 import { SpeiReceiptService } from '../orchestrator/clip/spei-receipt.service'
+import { AffiliateCommissionService } from '../affiliates/affiliate-commission.service'
 import { StorageService } from '../lib/storage.service'
 import { WhopProvider, type WhopMembershipState } from '../orchestrator/providers/whop.provider'
 import { customerSubscriptionView, isSubscriptionTransaction } from './customer-subscription'
@@ -77,6 +78,7 @@ export class PaymentService {
         private readonly clipAccounts: ClipAccountsService,
         private readonly storage: StorageService,
         private readonly speiReceipts: SpeiReceiptService,
+        private readonly affiliateCommissions: AffiliateCommissionService,
     ) { }
 
     private static readonly REDIRECT_PROVIDERS = new Set(['viva'])
@@ -1009,6 +1011,17 @@ export class PaymentService {
         }
 
         if (updated.net_amount && updated.fee != null) {
+            // Se o seller foi indicado, parte do fee é do afiliado. Sai de
+            // DENTRO da fatia da plataforma: o net do seller não muda.
+            const affiliatePlan = await this.affiliateCommissions.planFor(
+                updated.seller_id,
+                updated.fee,
+                new Date(updated.available_at),
+            )
+
+            const affiliateCents = affiliatePlan?.commissionCents ?? 0
+            const platformFeeCents = updated.fee - affiliateCents
+
             await this.walletService.creditPending({
                 sellerId: updated.seller_id,
                 transactionId: updated.id,
@@ -1021,14 +1034,31 @@ export class PaymentService {
                     ? { amount: updated.external_fee_cents, recipientId: updated.external_fee_recipient_id }
                     : null,
                 // 🔥 NOVO
-                platformFee: updated.fee > 0
+                platformFee: platformFeeCents > 0
                     ? {
-                        amount: updated.fee,
+                        amount: platformFeeCents,
                         walletRef: this.resolvePlatformWalletRef(updated.platform_partner),
                         partner: updated.platform_partner,
                     }
                     : null,
+                affiliateCommission: affiliatePlan
+                    ? {
+                        amount: affiliatePlan.commissionCents,
+                        affiliateSellerId: affiliatePlan.affiliateSellerId,
+                        availableAt: affiliatePlan.availableAt,
+                    }
+                    : null,
             })
+
+            if (affiliatePlan) {
+                await this.affiliateCommissions.record({
+                    transactionId: updated.id,
+                    affiliateSellerId: affiliatePlan.affiliateSellerId,
+                    sourceSellerId: updated.seller_id,
+                    platformFeeCents: updated.fee,
+                    plan: affiliatePlan,
+                })
+            }
         }
 
         await this.registerKpi({

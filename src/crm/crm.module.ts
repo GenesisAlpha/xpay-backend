@@ -56,6 +56,8 @@ import { WhopConnectController } from './whop-connect.controller'
 import { WhopLinkedController } from './whop-linked.controller'
 import { ActivationRequestsController } from './activation-requests.controller'
 import { ActivationModule } from '../activation/activation.module'
+import { AffiliatesModule } from '../affiliates/affiliates.module'
+import { AffiliateCrmController } from '../affiliates/affiliate-crm.controller'
 import { crmRequestContext } from './crm-request-context'
 
 @Module({
@@ -82,12 +84,15 @@ import { crmRequestContext } from './crm-request-context'
     WebhookModule,
     // ActivationModule: fila de solicitações de ativação (CNPJ / LLC).
     ActivationModule,
+    // AffiliatesModule: o AffiliateCrmService vem de lá; o controller fica aqui
+    // porque o CrmAuthGuard precisa do JwtModule registrado neste módulo.
+    AffiliatesModule,
   ],
   // WhopConnectController: conta conectada da Whop por seller (serviço vem do
   // OrchestratorModule).
   // CrmCheckoutController: sellers e lojas do checkout (só leitura, via canal
   // interno).
-  controllers: [CrmController, CrmAdminController, CrmCheckoutController, WhopConnectController, WhopLinkedController, ActivationRequestsController],
+  controllers: [CrmController, CrmAdminController, CrmCheckoutController, WhopConnectController, WhopLinkedController, ActivationRequestsController, AffiliateCrmController],
   providers:   [CrmService, CrmAdminService, CrmCheckoutService, CrmAuthGuard, StorageService],
   exports:     [CrmService, CrmAdminService, CrmCheckoutService],
 })

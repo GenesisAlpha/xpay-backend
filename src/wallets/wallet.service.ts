@@ -14,6 +14,17 @@ interface PlatformFeeArgs {
   partner: string
 }
 
+/**
+ * Comissão de afiliado. Sai de DENTRO do platform_fee — o `amount` do
+ * PlatformFeeArgs já chega líquido dela —, então o net do seller não muda: ele
+ * paga o mesmo que pagaria sem ter sido indicado.
+ */
+interface AffiliateCommissionArgs {
+  amount: number
+  affiliateSellerId: string
+  availableAt: Date | string
+}
+
 @Injectable()
 export class WalletService {
 
@@ -29,6 +40,7 @@ export class WalletService {
     reserveUntil,
     externalFee = null,
     platformFee = null,
+    affiliateCommission = null,
   }: {
     sellerId: string
     transactionId: string
@@ -39,6 +51,7 @@ export class WalletService {
     reserveUntil: Date | string | null
     externalFee?: ExternalFeeArgs | null
     platformFee?: PlatformFeeArgs | null
+    affiliateCommission?: AffiliateCommissionArgs | null
   }) {
     const toISO = (d: Date | string | null): string => {
       if (!d) return new Date().toISOString()
@@ -101,6 +114,35 @@ export class WalletService {
         status: 'completed',
         created_at: now,
         metadata: { source_seller_id: sellerId, partner: platformFee.partner },
+      })
+    }
+
+    // Comissão de afiliado — sai da fatia da plataforma, que já veio líquida.
+    if (affiliateCommission && affiliateCommission.amount > 0 && platformFee) {
+      // Saída contábil da plataforma (registro de quanto do fee virou comissão).
+      ledgerRows.push({
+        seller_id: platformFee.walletRef,
+        transaction_id: transactionId,
+        type: 'debit_affiliate_commission',
+        amount: affiliateCommission.amount,
+        currency: 'USD',
+        status: 'completed',
+        created_at: now,
+        metadata: { affiliate_seller_id: affiliateCommission.affiliateSellerId, source_seller_id: sellerId },
+      })
+
+      // Entrada do afiliado — pending até vencer a carência. O
+      // run_affiliate_settlement_batch move pra available.
+      ledgerRows.push({
+        seller_id: affiliateCommission.affiliateSellerId,
+        transaction_id: transactionId,
+        type: 'credit_affiliate_commission',
+        amount: affiliateCommission.amount,
+        currency: 'USD',
+        available_at: toISO(affiliateCommission.availableAt),
+        status: 'pending',
+        created_at: now,
+        metadata: { source_seller_id: sellerId },
       })
     }
 
@@ -178,6 +220,22 @@ export class WalletService {
       }
     }
 
+
+    if (affiliateCommission && affiliateCommission.amount > 0) {
+      const { error: affBalanceError } = await supabase.rpc('add_pending_balance', {
+        p_seller_id: affiliateCommission.affiliateSellerId,
+        p_amount: affiliateCommission.amount,
+      })
+
+      if (affBalanceError) {
+        // Não trava a venda — marca para reconciliação.
+        console.error(
+          '[WalletService] affiliate_commission balance error (reconciliation needed):',
+          affBalanceError,
+          { transactionId, affiliate: affiliateCommission.affiliateSellerId },
+        )
+      }
+    }
 
     // 🔥 3. Atualiza available balance do recipient (external_fee)
     if (externalFee && externalFee.amount > 0) {
