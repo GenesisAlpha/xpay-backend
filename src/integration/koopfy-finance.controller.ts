@@ -66,6 +66,17 @@ export class KoopfyFinanceController {
     return this.finance.getPayoutQuote(req.sellerCtx, query);
   }
 
+  // Conta de recebimento: contas salvas na Whop (conta conectada) ou manual.
+  @Get('payouts/destinations')
+  payoutDestinations(@Req() req: any, @Query('country') country?: string) {
+    return this.finance.getPayoutDestinations(req.sellerCtx, country);
+  }
+
+  @Get('payouts/destinations/fields')
+  payoutDestinationFields(@Req() req: any, @Query() query: Record<string, unknown>) {
+    return this.finance.getPayoutDestinationFields(req.sellerCtx, query);
+  }
+
   // O seller vem do token verificado; um sellerId no corpo é descartado.
   @Post('payouts')
   requestPayout(

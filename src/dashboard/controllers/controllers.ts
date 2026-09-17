@@ -108,6 +108,24 @@ export class WalletController {
     })
   }
 
+  // Como o seller recebe: contas salvas na Whop (conta conectada) ou manual.
+  @Get('payout-destinations')
+  async payoutDestinations(@Req() req: any, @Query('country') country?: string) {
+    const sellerId = await getSellerId(req.user.sub)
+    return this.svc.getPayoutDestinations(sellerId, country)
+  }
+
+  // Campos que o trilho da Whop pede para cadastrar uma conta nova.
+  @Get('payout-destinations/fields')
+  async payoutDestinationFields(@Req() req: any, @Query() q: any) {
+    const sellerId = await getSellerId(req.user.sub)
+    return this.svc.getPayoutDestinationFields(sellerId, {
+      supportedPayoutMethodId: q.supportedPayoutMethodId,
+      country: q.country,
+      destinationCurrency: q.destinationCurrency,
+    })
+  }
+
   @Post('payout')
   async requestPayout(@Req() req: any, @Body() body: any) {
     // Acesso da equipe ao painel é para VER. Sacar continua sendo do seller.

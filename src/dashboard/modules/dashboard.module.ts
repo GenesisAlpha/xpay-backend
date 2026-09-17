@@ -68,6 +68,9 @@ export class TransactionsModule {}
 // ============================================================
 
 @Module({
+  // OrchestratorModule: seller com conta conectada saca para a conta bancária
+  // salva na Whop (WhopPayoutDestinationsService).
+  imports:     [OrchestratorModule],
   controllers: [WalletController],
   providers:   [WalletService],
   exports:     [WalletService],   // exportado para PaymentModule usar creditPending()

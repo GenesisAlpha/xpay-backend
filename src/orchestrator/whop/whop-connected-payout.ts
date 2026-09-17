@@ -29,7 +29,7 @@ export interface PayoutExecution {
   whop_account_id: string;
   payout_method_id?: string | null;
   transfer?: { id?: string | null; status?: string | null } | null;
-  withdrawal?: { id?: string | null; status?: string | null; attempt: number } | null;
+  payout?: { id?: string | null; status?: string | null; attempt: number } | null;
   attempt: number;
   last_error?: string | null;
   updated_at?: string;
@@ -61,11 +61,22 @@ export function payoutNetCents(entry: { amount: number | string; fee?: number | 
   return Math.max(amount - fee, 0);
 }
 
-export function classifyWhopWithdrawal(withdrawal: any): 'succeeded' | 'failed' | 'processing' {
-  const status = String(withdrawal?.status ?? '').toLowerCase();
+/**
+ * Status do payout (API versionada): requested, in_review, processing,
+ * completed, reversed, canceled, failed, denied. `reversed` é um pagamento que
+ * voltou depois de liquidado — o dinheiro está de novo na conta conectada.
+ */
+export function classifyWhopPayout(payout: any): 'succeeded' | 'failed' | 'processing' {
+  const status = String(payout?.status ?? '').toLowerCase();
   if (status === 'completed') return 'succeeded';
-  if (status === 'failed' || status === 'canceled' || status === 'denied') return 'failed';
+  if (['failed', 'canceled', 'denied', 'reversed'].includes(status)) return 'failed';
   return 'processing';
+}
+
+/** Motivo legível de um payout que não pagou. */
+export function whopPayoutFailureReason(payout: any): string {
+  const failure = payout?.failure ?? {};
+  return String(failure.message ?? failure.code ?? `saque ${payout?.status ?? 'recusado'}`);
 }
 
 // Plano de propósito: o tsconfig não tem strictNullChecks, e sem ele uma união
@@ -82,7 +93,9 @@ export interface PayoutMethodChoice {
  * nenhuma padrão, não chuta — dinheiro no banco errado não volta.
  */
 export function pickPayoutMethod(methods: any[] | null | undefined, preferredId?: string | null): PayoutMethodChoice {
-  const list = (Array.isArray(methods) ? methods : []).filter(m => typeof m?.id === 'string' && m.id);
+  // `broken`: a Whop já viu pagamentos falharem nessa conta de forma permanente.
+  const list = (Array.isArray(methods) ? methods : [])
+    .filter(m => typeof m?.id === 'string' && m.id && m.status !== 'broken');
   const preferred = String(preferredId ?? '').trim();
 
   if (preferred) {
@@ -108,4 +121,82 @@ export function availableCents(balances: any[] | null | undefined, currency: str
 
 export function isWhopConnectedPayout(metadata: any): boolean {
   return metadata?.execution?.mode === PAYOUT_EXECUTION_MODE;
+}
+
+// ─── Conta bancária informada pelo seller no saque ──────────────────────────
+
+/** O que a tela mostra de uma conta salva. Nunca o número inteiro. */
+export function toSavedDestination(method: any) {
+  return {
+    id: String(method?.id ?? ''),
+    name: method?.nickname ?? method?.supported_payout_method?.name ?? method?.payer_name ?? null,
+    method: method?.supported_payout_method?.name ?? null,
+    institution: method?.institution_name ?? null,
+    reference: method?.account_reference ?? null,
+    currency: method?.destination_currency ?? method?.currency ?? null,
+    country: method?.supported_payout_method?.country_code ?? method?.destination?.country_code ?? null,
+    isDefault: method?.is_default === true,
+    status: method?.status ?? null,
+    iconUrl: method?.supported_payout_method?.icon_url ?? null,
+  };
+}
+
+export function toSupportedMethod(method: any) {
+  return {
+    id: String(method?.id ?? ''),
+    name: method?.name ?? null,
+    deliveryType: method?.delivery_type ?? null,
+    iconUrl: method?.icon_url ?? null,
+    fields: Array.isArray(method?.required_fields) ? method.required_fields.map(toRequiredField) : null,
+  };
+}
+
+export function toRequiredField(field: any) {
+  return {
+    id: String(field?.id ?? ''),
+    label: field?.label ?? field?.id ?? '',
+    type: field?.type ?? null,
+    inputType: field?.input_type === 'options' || field?.input_type === 'date' ? field.input_type : 'text',
+    required: field?.required !== false,
+    options: Array.isArray(field?.options) ? field.options.map(String) : null,
+    placeholder: field?.placeholder ?? null,
+    validation: typeof field?.validation === 'string' ? field.validation : null,
+    sensitive: field?.sensitive === true,
+  };
+}
+
+/**
+ * Confere os valores digitados contra o schema da Whop antes de mandar — o
+ * seller vê o erro no campo, e só os campos do schema seguem adiante.
+ */
+export function checkPayoutFields(
+  schema: Array<ReturnType<typeof toRequiredField>>,
+  values: Record<string, unknown> | null | undefined,
+): { ok: boolean; fields: Record<string, string>; errors: Record<string, string> } {
+  const fields: Record<string, string> = {};
+  const errors: Record<string, string> = {};
+  const input = values && typeof values === 'object' ? values : {};
+
+  for (const field of schema) {
+    const raw = input[field.id];
+    const value = typeof raw === 'string' ? raw.trim() : raw == null ? '' : String(raw).trim();
+    if (!value) {
+      if (field.required) errors[field.id] = `Informe ${field.label}.`;
+      continue;
+    }
+    if (field.options && field.options.length && !field.options.includes(value)) {
+      errors[field.id] = `${field.label}: opção inválida.`;
+      continue;
+    }
+    if (field.validation) {
+      let pattern: RegExp | null = null;
+      try { pattern = new RegExp(field.validation); } catch { pattern = null; }
+      if (pattern && !pattern.test(value)) {
+        errors[field.id] = `${field.label} em formato inválido.`;
+        continue;
+      }
+    }
+    fields[field.id] = value;
+  }
+  return { ok: Object.keys(errors).length === 0, fields, errors };
 }

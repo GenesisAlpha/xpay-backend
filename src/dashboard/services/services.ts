@@ -3,7 +3,8 @@
 // Transactions | Wallet | Disputes | Transfers | PaymentMethods | Settings
 // ============================================================
 
-import { Injectable, BadRequestException, ConflictException, NotFoundException, UnauthorizedException, InternalServerErrorException, ServiceUnavailableException, Logger } from '@nestjs/common'
+import { Injectable, BadRequestException, ConflictException, NotFoundException, UnauthorizedException, InternalServerErrorException, ServiceUnavailableException, Logger, Optional } from '@nestjs/common'
+import { WhopPayoutDestinationsService } from '../../orchestrator/whop/whop-payout-destinations.service'
 import { supabase } from '../../lib/supabase.client'
 import * as bcrypt from 'bcrypt';
 import { generateKey, hashKey } from '../../utils/apikeys.utils';
@@ -22,6 +23,34 @@ import {
 
 // Hash estável do que define o saque. Reusar a mesma chave com outro valor,
 // método ou destino é recusado pelo banco em vez de devolver o saque anterior.
+/**
+ * Status do saque como o seller entende. `approved` e `processing` são saques
+ * andando (aprovado, enviando para a conta) — não falhas.
+ */
+export function payoutStatusForSeller(status: string | null | undefined): string {
+  if (status === 'completed') return 'paid'
+  if (status === 'pending') return 'pending'
+  if (status === 'approved' || status === 'processing') return 'processing'
+  if (status === 'rejected') return 'rejected'
+  return 'failed'
+}
+
+/** Conta de destino para o histórico — só a parte mascarada. */
+export function describePayoutAccount(metadata: any): string | null {
+  const d = metadata?.destination ?? {}
+  const tail = (value: unknown) => {
+    const text = String(value ?? '').replace(/\s/g, '')
+    return text.length > 4 ? `••••${text.slice(-4)}` : text || null
+  }
+  if (d.whopPayoutMethodId) {
+    return [d.bankName ?? d.whopMethodName, d.accountReference].filter(Boolean).join(' ') || null
+  }
+  if (d.achAccountNumber) return [d.bankName, tail(d.achAccountNumber)].filter(Boolean).join(' ')
+  if (d.iban) return [d.bankName, tail(d.iban)].filter(Boolean).join(' ')
+  if (d.pixKey) return `Pix ${tail(d.pixKey)}`
+  return null
+}
+
 export function payoutRequestHash(
   amountCents: number,
   method: string,
@@ -193,6 +222,46 @@ export class TransactionsService {
 export class WalletService {
   private readonly logger = new Logger(WalletService.name)
 
+  // Opcional: o WalletService também é montado sem o OrchestratorModule
+  // (testes, módulos que só creditam). Sem ele, ninguém saca pela Whop.
+  constructor(@Optional() private readonly whopDestinations?: WhopPayoutDestinationsService) { }
+
+  // ── Conta de recebimento ───────────────────────────────────────────────────
+  // Seller com conta conectada saca pela Whop; os demais, pelos métodos
+  // manuais. Misturar faria o CRM aprovar um Pix que ninguém paga.
+  async getPayoutDestinations(sellerId: string, country?: unknown) {
+    if (!this.whopDestinations) return { mode: 'manual' as const, saved: [], supported: [] }
+    return this.whopDestinations.overview(sellerId, country)
+  }
+
+  async getPayoutDestinationFields(sellerId: string, query: Record<string, unknown>) {
+    if (!this.whopDestinations) throw new BadRequestException('Sua conta não recebe saques pela Whop.')
+    return this.whopDestinations.fields(sellerId, query)
+  }
+
+  private async resolvePayoutDestination(
+    sellerId: string,
+    dto: RequestPayoutDto,
+    idempotencyKey?: string,
+  ): Promise<Record<string, string>> {
+    const whopMode = this.whopDestinations
+      ? (await this.whopDestinations.overviewMode(sellerId)) === 'whop'
+      : false
+
+    if ((dto.method as string) === 'whop') {
+      if (!whopMode) throw new BadRequestException('Sua conta não recebe saques pela Whop.')
+      const destination = await this.whopDestinations!.resolveForRequest(sellerId, dto, idempotencyKey)
+      // Só o que é exibível: id da conta e referência mascarada.
+      return Object.fromEntries(
+        Object.entries(destination).filter(([, value]) => value != null && value !== ''),
+      ) as Record<string, string>
+    }
+    if (whopMode) {
+      throw new BadRequestException('Sua conta recebe saques pela Whop: escolha uma conta salva ou informe uma nova.')
+    }
+    return this.buildDestination(dto)
+  }
+
   async getBalance(sellerId: string) {
     const { data: balance, error } = await supabase
       .from('wallet_balance')
@@ -309,13 +378,13 @@ export class WalletService {
 
     const mapped = (data ?? []).map(p => ({
       id: p.id,
-      method: 'bank',
-      bankAccount: null,
-      cryptoAddress: null,
-      cryptoNetwork: null,
+      method: p.metadata?.method ?? 'bank',
+      bankAccount: describePayoutAccount(p.metadata),
+      cryptoAddress: p.metadata?.destination?.cryptoAddress ?? null,
+      cryptoNetwork: p.metadata?.destination?.cryptoNetwork ?? null,
       // 🔥 amount em centavos → USD
       amount: fromCents(p.amount),
-      status: p.status === 'completed' ? 'paid' : p.status === 'pending' ? 'pending' : 'failed',
+      status: payoutStatusForSeller(p.status),
       date: new Date(p.created_at).toLocaleDateString('pt-BR'),
       processedAt: p.available_at ? new Date(p.available_at).toLocaleDateString('pt-BR') : null,
     }))
@@ -627,8 +696,6 @@ export class WalletService {
     //    O DTO já garantiu amount > 0 e >= mínimo via class-validator.
     const amountCents = this.usdToCents(dto.amount)
 
-    // 2. Monta os dados de destino (valida campos obrigatórios do método).
-    const destination = this.buildDestination(dto)
 
     // 3. 2FA — TODO.
     //    Ainda não implementado. Quando for, validar dto.twoFactorCode aqui
@@ -643,6 +710,10 @@ export class WalletService {
     //    available→pending, inserir no ledger) roda atômica no banco.
     const quote = await this.quotePayout(dto.sellerId, dto.amount, dto.method)
     this.assertPayoutQuote(dto.amount, quote)
+
+    // Destino depois da cotação: na Whop, uma conta nova é cadastrada aqui —
+    // não vale cadastrar para um saque que nem cobre as taxas.
+    const destination = await this.resolvePayoutDestination(dto.sellerId, dto)
 
     const { data, error } = await supabase.rpc('request_payout', {
       p_seller_id: dto.sellerId,
@@ -718,9 +789,10 @@ export class WalletService {
     this.assertPayoutInput(dto)
 
     const amountCents = this.usdToCents(dto.amount)
-    const destination = this.buildDestination(dto)
     const quote = await this.quotePayout(sellerId, dto.amount, dto.method)
     this.assertPayoutQuote(dto.amount, quote)
+    // A mesma chave cadastra a mesma conta na Whop: o hash abaixo bate no retry.
+    const destination = await this.resolvePayoutDestination(sellerId, dto, idempotencyKey)
 
     const { data, error } = await supabase.rpc('request_payout_idempotent', {
       p_seller_id: sellerId,

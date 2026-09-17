@@ -23,6 +23,7 @@
 import {
   IsIn,
   IsNumber,
+  IsObject,
   IsOptional,
   IsPositive,
   IsString,
@@ -30,7 +31,8 @@ import {
 } from 'class-validator'
 
 export const MIN_WITHDRAW_USD = 200
-export const VALID_METHODS = ['ach', 'iban', 'pix', 'crypto'] as const
+// `whop`: seller com conta conectada — a conta bancária é salva na Whop.
+export const VALID_METHODS = ['ach', 'iban', 'pix', 'crypto', 'whop'] as const
 export type WithdrawMethod = (typeof VALID_METHODS)[number]
 
 /**
@@ -103,6 +105,33 @@ export class RequestPayoutDto {
   @IsOptional()
   @IsString()
   bankName?: string
+
+  // ── Whop (seller com conta conectada) ────────────────────────────────────
+  // Conta já salva na Whop…
+  @IsOptional()
+  @IsString()
+  whopPayoutMethodId?: string
+
+  // …ou uma nova, informada no próprio pedido (campos do schema da Whop).
+  @IsOptional()
+  @IsString()
+  whopSupportedPayoutMethodId?: string
+
+  @IsOptional()
+  @IsObject()
+  whopFields?: Record<string, string>
+
+  @IsOptional()
+  @IsString()
+  whopDestinationCurrency?: string
+
+  @IsOptional()
+  @IsString()
+  whopNickname?: string
+
+  @IsOptional()
+  @IsString()
+  whopCountry?: string
 
   // ── Criptomoeda (USDT) ───────────────────────────────────────────────────
   @IsOptional()

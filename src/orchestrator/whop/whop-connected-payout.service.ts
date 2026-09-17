@@ -7,13 +7,15 @@ import {
   ACTIVE_PAYOUT_STAGES,
   PAYOUT_EXECUTION_MODE,
   PayoutExecution,
-  classifyWhopWithdrawal,
+  classifyWhopPayout,
   isWhopConnectedPayout,
   newPayoutExecution,
   payoutNetCents,
   payoutTransferKey,
   payoutWithdrawalKey,
   pickPayoutMethod,
+  toSavedDestination,
+  whopPayoutFailureReason,
 } from './whop-connected-payout';
 import { WhopApiError, WhopPlatformClient } from './whop-platform.client';
 
@@ -67,10 +69,6 @@ export class WhopConnectedPayoutService implements OnModuleInit {
   // master, e o primeiro saque precisa ser acompanhado.
   static enabled(): boolean {
     return process.env.WHOP_CONNECTED_PAYOUTS === 'true';
-  }
-
-  private static platformCoversFees(): boolean {
-    return process.env.WHOP_PAYOUT_PLATFORM_COVERS_FEES === 'true';
   }
 
   onModuleInit() {
@@ -139,7 +137,7 @@ export class WhopConnectedPayoutService implements OnModuleInit {
     }
     const chosen = payoutMethodId?.trim() || null;
     if (chosen) {
-      const methods = await this.whop.listPayoutMethods(exec.whop_account_id);
+      const methods = await this.whop.listSavedPayoutMethods(exec.whop_account_id);
       const choice = pickPayoutMethod(methods?.data ?? methods, chosen);
       if (!choice.ok) throw new BadRequestException(choice.reason);
     }
@@ -154,12 +152,24 @@ export class WhopConnectedPayoutService implements OnModuleInit {
       ...exec,
       stage: 'paying_out',
       attempt: exec.attempt + 1,
-      withdrawal: null,
+      payout: null,
       payout_method_id: chosen || exec.payout_method_id || null,
       last_error: null,
     });
     await this.advance(payoutId);
     return this.describe(await this.load(payoutId));
+  }
+
+  /** Contas salvas na conta conectada do saque (a escolhida vem marcada). */
+  async savedMethods(payoutId: string) {
+    const entry = await this.load(payoutId);
+    const exec = this.execution(entry);
+    const response = await this.whop.listSavedPayoutMethods(exec.whop_account_id);
+    const items: any[] = Array.isArray(response?.data) ? response.data : Array.isArray(response) ? response : [];
+    return items.map(method => ({
+      ...toSavedDestination(method),
+      selected: method?.id === (exec.payout_method_id ?? entry.metadata?.destination?.whopPayoutMethodId),
+    }));
   }
 
   /** Estado legível para o CRM. */
@@ -172,8 +182,8 @@ export class WhopConnectedPayoutService implements OnModuleInit {
       payoutMethodId: exec.payout_method_id ?? null,
       transferId: exec.transfer?.id ?? null,
       transferStatus: exec.transfer?.status ?? null,
-      withdrawalId: exec.withdrawal?.id ?? null,
-      withdrawalStatus: exec.withdrawal?.status ?? null,
+      payoutId: exec.payout?.id ?? null,
+      payoutStatus: exec.payout?.status ?? null,
       attempt: exec.attempt,
       lastError: exec.last_error ?? null,
     };
@@ -198,7 +208,7 @@ export class WhopConnectedPayoutService implements OnModuleInit {
         entry = await this.settleTransfer(entry);
       }
       if (this.execution(entry).stage === 'paying_out') {
-        await this.settleWithdrawal(entry);
+        await this.settlePayout(entry);
       }
     } finally {
       this.inFlight.delete(payoutId);
@@ -222,7 +232,7 @@ export class WhopConnectedPayoutService implements OnModuleInit {
 
     let methods: any;
     try {
-      methods = await this.whop.listPayoutMethods(exec.whop_account_id);
+      methods = await this.whop.listSavedPayoutMethods(exec.whop_account_id);
     } catch (err) {
       return this.block(entry, `contas bancárias indisponíveis: ${this.message(err)}`);
     }
@@ -287,62 +297,65 @@ export class WhopConnectedPayoutService implements OnModuleInit {
     return (await this.update(entry, { execution: next })) ?? entry;
   }
 
-  private async settleWithdrawal(entry: PayoutEntry): Promise<PayoutEntry> {
+  private async settlePayout(entry: PayoutEntry): Promise<PayoutEntry> {
     const exec = this.execution(entry);
     const net = payoutNetCents(entry);
-    const current = exec.withdrawal?.attempt === exec.attempt ? exec.withdrawal : null;
+    const current = exec.payout?.attempt === exec.attempt ? exec.payout : null;
 
-    let withdrawal: any;
+    let payout: any;
     try {
       if (current?.id) {
-        withdrawal = await this.whop.getWithdrawal(current.id);
+        payout = await this.whop.getPayout(current.id);
       } else {
         // A transferência pode levar um instante para aparecer no saldo.
         const connectedUsd = await this.connect.accountAvailableCents(exec.whop_account_id, 'usd');
         if (connectedUsd < net) {
           return this.note(entry, `aguardando saldo na conta conectada (US$ ${(connectedUsd / 100).toFixed(2)} de US$ ${(net / 100).toFixed(2)})`);
         }
-        withdrawal = await this.whop.createWithdrawal({
-          company_id: exec.whop_account_id,
+        payout = await this.whop.createPayout({
+          account_id: exec.whop_account_id,
           payout_method_id: exec.payout_method_id,
           amount: net / 100,
           currency: 'usd',
-          platform_covers_fees: WhopConnectedPayoutService.platformCoversFees(),
+          // Explícito: omitido, a Whop aplica a política da plataforma. A taxa
+          // de entrega é do seller.
+          platform_covers_fees: false,
+          notes: 'Saque Koopfy',
+          metadata: { koopfy_payout_id: entry.id, koopfy_seller_id: entry.seller_id },
         }, payoutWithdrawalKey(entry.id, exec.attempt));
       }
     } catch (err) {
       if (!current?.id && err instanceof WhopApiError && isDefinitiveWhopFailure(err.status)) {
-        return this.failWithdrawal(entry, this.message(err), null);
+        return this.failPayout(entry, this.message(err), null);
       }
       return this.note(entry, `saque em aberto: ${this.message(err)}`);
     }
 
-    const outcome = classifyWhopWithdrawal(withdrawal);
-    const withdrawalState = { id: withdrawal?.id ?? current?.id ?? null, status: withdrawal?.status ?? null, attempt: exec.attempt };
+    const outcome = classifyWhopPayout(payout);
+    const payoutState = { id: payout?.id ?? current?.id ?? null, status: payout?.status ?? null, attempt: exec.attempt };
 
     if (outcome === 'failed') {
-      const reason = String(withdrawal?.error_message ?? withdrawal?.error_code ?? `saque ${withdrawal?.status ?? 'recusado'}`);
-      return this.failWithdrawal(entry, reason, withdrawalState);
+      return this.failPayout(entry, whopPayoutFailureReason(payout), payoutState);
     }
 
     if (outcome === 'succeeded') {
       const done = await this.update(entry, {
         status: 'completed',
         completed_at: new Date().toISOString(),
-        provider_payout_id: withdrawalState.id,
-        execution: { ...exec, stage: 'completed', withdrawal: withdrawalState, last_error: null },
+        provider_payout_id: payoutState.id,
+        execution: { ...exec, stage: 'completed', payout: payoutState, last_error: null },
       }, 'processing');
       if (done) {
         void notifySellerPayout(entry.seller_id, 'completed', {
           ...this.emailInfo(entry),
-          providerPayoutId: withdrawalState.id,
+          providerPayoutId: payoutState.id,
         });
       }
       return done ?? entry;
     }
 
     return (await this.update(entry, {
-      execution: { ...exec, withdrawal: withdrawalState, last_error: null },
+      execution: { ...exec, payout: payoutState, last_error: null },
     })) ?? entry;
   }
 
@@ -379,12 +392,12 @@ export class WhopConnectedPayoutService implements OnModuleInit {
     return updated ?? entry;
   }
 
-  private async failWithdrawal(entry: PayoutEntry, reason: string, withdrawal: PayoutExecution['withdrawal']): Promise<PayoutEntry> {
+  private async failPayout(entry: PayoutEntry, reason: string, payout: PayoutExecution['payout']): Promise<PayoutEntry> {
     const exec = this.execution(entry);
     console.error(`[WhopPayout] 🚨 saque ${entry.id}: dinheiro na conta conectada ${exec.whop_account_id}, saque recusado (${reason}). Reenviar pelo CRM.`);
     await this.log(entry.seller_id, 'whop_payout.withdrawal_failed', { payout_id: entry.id, reason, attempt: exec.attempt });
     return (await this.update(entry, {
-      execution: { ...exec, stage: 'payout_failed', withdrawal: withdrawal ?? exec.withdrawal ?? null, last_error: reason.slice(0, 500) },
+      execution: { ...exec, stage: 'payout_failed', payout: payout ?? exec.payout ?? null, last_error: reason.slice(0, 500) },
     })) ?? entry;
   }
 

@@ -1,6 +1,9 @@
 import {
   availableCents,
-  classifyWhopWithdrawal,
+  classifyWhopPayout,
+  checkPayoutFields,
+  toRequiredField,
+  whopPayoutFailureReason,
   isWhopConnectedPayout,
   newPayoutExecution,
   payoutNetCents,
@@ -55,18 +58,63 @@ describe('payoutNetCents', () => {
   });
 });
 
-describe('classifyWhopWithdrawal', () => {
+describe('classifyWhopPayout', () => {
   it.each([
     ['completed', 'succeeded'],
     ['failed', 'failed'],
     ['canceled', 'failed'],
     ['denied', 'failed'],
+    // Voltou depois de liquidado: o dinheiro está de novo na conta conectada.
+    ['reversed', 'failed'],
     ['requested', 'processing'],
-    ['awaiting_payment', 'processing'],
-    ['in_transit', 'processing'],
+    ['in_review', 'processing'],
+    ['processing', 'processing'],
     [undefined, 'processing'],
   ])('%s → %s', (status, expected) => {
-    expect(classifyWhopWithdrawal({ status })).toBe(expected);
+    expect(classifyWhopPayout({ status })).toBe(expected);
+  });
+
+  it('usa a mensagem de falha da Whop', () => {
+    expect(whopPayoutFailureReason({ status: 'failed', failure: { message: 'Conta encerrada' } })).toBe('Conta encerrada');
+    expect(whopPayoutFailureReason({ status: 'denied', failure: null })).toBe('saque denied');
+  });
+});
+
+describe('pickPayoutMethod com conta quebrada', () => {
+  it('ignora conta marcada como broken pela Whop', () => {
+    const methods = [{ id: 'potk_ok' }, { id: 'potk_broken', status: 'broken', is_default: true }];
+    expect(pickPayoutMethod(methods)).toEqual({ ok: true, id: 'potk_ok' });
+  });
+});
+
+describe('checkPayoutFields', () => {
+  const schema = [
+    toRequiredField({ id: 'fld_bank_account_number', label: 'Número da conta', required: true, validation: '^[0-9]{4,17}$', input_type: 'text' }),
+    toRequiredField({ id: 'fld_bank_account_type', label: 'Tipo', required: true, input_type: 'options', options: ['Checking', 'Savings'] }),
+    toRequiredField({ id: 'fld_nickname', label: 'Apelido', required: false, input_type: 'text' }),
+  ];
+
+  it('aceita valores válidos e só repassa campos do schema', () => {
+    const result = checkPayoutFields(schema, {
+      fld_bank_account_number: ' 8825310472 ',
+      fld_bank_account_type: 'Checking',
+      fld_intruso: 'x',
+    });
+    expect(result.ok).toBe(true);
+    expect(result.fields).toEqual({ fld_bank_account_number: '8825310472', fld_bank_account_type: 'Checking' });
+  });
+
+  it('aponta obrigatório vazio, regex e opção inválida', () => {
+    const result = checkPayoutFields(schema, { fld_bank_account_number: '12ab', fld_bank_account_type: 'Poupança' });
+    expect(result.ok).toBe(false);
+    expect(Object.keys(result.errors).sort()).toEqual(['fld_bank_account_number', 'fld_bank_account_type']);
+
+    expect(checkPayoutFields(schema, {}).errors).toHaveProperty('fld_bank_account_number');
+  });
+
+  it('regex inválida da Whop não derruba a validação', () => {
+    const broken = [toRequiredField({ id: 'fld_x', label: 'X', required: true, validation: '([' })];
+    expect(checkPayoutFields(broken, { fld_x: 'qualquer' }).ok).toBe(true);
   });
 });
 

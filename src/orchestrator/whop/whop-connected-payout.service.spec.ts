@@ -71,11 +71,11 @@ function seedPayout(overrides: Row = {}) {
 
 function makeService() {
   const whop = {
-    listPayoutMethods: jest.fn<Promise<any>, any[]>(async () => ({ data: [{ id: 'potk_1', is_default: true }] })),
+    listSavedPayoutMethods: jest.fn<Promise<any>, any[]>(async () => ({ data: [{ id: 'potk_1', is_default: true }] })),
     createTransfer: jest.fn<Promise<any>, any[]>(async () => ({ id: 'xfer_1', status: 'succeeded' })),
     getTransfer: jest.fn<Promise<any>, any[]>(async () => ({ id: 'xfer_1', status: 'succeeded' })),
-    createWithdrawal: jest.fn<Promise<any>, any[]>(async () => ({ id: 'wd_1', status: 'requested' })),
-    getWithdrawal: jest.fn<Promise<any>, any[]>(async () => ({ id: 'wd_1', status: 'completed' })),
+    createPayout: jest.fn<Promise<any>, any[]>(async () => ({ id: 'cofr_1', status: 'requested' })),
+    getPayout: jest.fn<Promise<any>, any[]>(async () => ({ id: 'cofr_1', status: 'completed' })),
   };
   const balances: Record<string, number> = { [MASTER]: 1_000_000, [BIZ]: 9700 };
   const connect = {
@@ -95,7 +95,6 @@ beforeEach(() => {
   ledger.clear();
   rpcCalls.length = 0;
   process.env.WHOP_CONNECTED_PAYOUTS = 'true';
-  delete process.env.WHOP_PAYOUT_PLATFORM_COVERS_FEES;
   jest.spyOn(console, 'error').mockImplementation(() => undefined);
   jest.spyOn(console, 'warn').mockImplementation(() => undefined);
 });
@@ -114,8 +113,8 @@ describe('caminho feliz', () => {
       expect.objectContaining({ origin_id: MASTER, destination_id: BIZ, amount: 97, currency: 'usd' }),
       payoutTransferKey('pay_1'),
     );
-    expect(whop.createWithdrawal).toHaveBeenCalledWith(
-      expect.objectContaining({ company_id: BIZ, payout_method_id: 'potk_1', amount: 97, platform_covers_fees: false }),
+    expect(whop.createPayout).toHaveBeenCalledWith(
+      expect.objectContaining({ account_id: BIZ, payout_method_id: 'potk_1', amount: 97, currency: 'usd', platform_covers_fees: false }),
       payoutWithdrawalKey('pay_1', 1),
     );
     expect(stage()).toBe('paying_out');
@@ -124,7 +123,7 @@ describe('caminho feliz', () => {
     // Próximo ciclo: o banco confirmou.
     await service.advance('pay_1');
     expect(row().status).toBe('completed');
-    expect(row().provider_payout_id).toBe('wd_1');
+    expect(row().provider_payout_id).toBe('cofr_1');
     expect(stage()).toBe('completed');
     expect(credits()).toHaveLength(0);
   });
@@ -137,13 +136,13 @@ describe('caminho feliz', () => {
     await service.advance('pay_1');
 
     expect(stage()).toBe('transferring');
-    expect(whop.createWithdrawal).not.toHaveBeenCalled();
+    expect(whop.createPayout).not.toHaveBeenCalled();
 
     // Próximo ciclo consulta a MESMA transferência, não cria outra.
     await service.advance('pay_1');
     expect(whop.createTransfer).toHaveBeenCalledTimes(1);
     expect(whop.getTransfer).toHaveBeenCalledWith('xfer_1');
-    expect(whop.createWithdrawal).toHaveBeenCalledTimes(1);
+    expect(whop.createPayout).toHaveBeenCalledTimes(1);
   });
 
   it('espera o saldo aparecer na conta conectada antes de sacar', async () => {
@@ -153,11 +152,11 @@ describe('caminho feliz', () => {
 
     await service.advance('pay_1');
     expect(stage()).toBe('paying_out');
-    expect(whop.createWithdrawal).not.toHaveBeenCalled();
+    expect(whop.createPayout).not.toHaveBeenCalled();
 
     balances[BIZ] = 9700;
     await service.advance('pay_1');
-    expect(whop.createWithdrawal).toHaveBeenCalledTimes(1);
+    expect(whop.createPayout).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -165,7 +164,7 @@ describe('antes de o dinheiro sair', () => {
   it('sem conta bancária: bloqueia e não transfere', async () => {
     seedPayout();
     const { service, whop } = makeService();
-    whop.listPayoutMethods.mockResolvedValue({ data: [] });
+    whop.listSavedPayoutMethods.mockResolvedValue({ data: [] });
 
     await service.advance('pay_1');
 
@@ -226,7 +225,7 @@ describe('transferência recusada', () => {
     expect(credits()).toEqual([
       { fn: 'credit_balance', args: { p_seller_id: SELLER, p_bucket: 'available', p_amount_cents: 10000 } },
     ]);
-    expect(whop.createWithdrawal).not.toHaveBeenCalled();
+    expect(whop.createPayout).not.toHaveBeenCalled();
   });
 
   it('timeout NÃO devolve saldo e repete com a mesma chave', async () => {
@@ -267,7 +266,7 @@ describe('saque recusado pelo banco', () => {
   it('não devolve saldo na Koopfy — o dinheiro já é do seller na conta dele', async () => {
     seedPayout();
     const { service, whop } = makeService();
-    whop.getWithdrawal.mockResolvedValue({ id: 'wd_1', status: 'denied', error_message: 'conta encerrada' });
+    whop.getPayout.mockResolvedValue({ id: 'cofr_1', status: 'denied', failure: { message: 'conta encerrada' } });
 
     await service.advance('pay_1'); // transfere e cria o saque
     await service.advance('pay_1'); // banco recusa
@@ -278,57 +277,69 @@ describe('saque recusado pelo banco', () => {
     expect(credits()).toHaveLength(0);
   });
 
+  it('payout estornado pelo banco (reversed) também para em payout_failed', async () => {
+    seedPayout();
+    const { service, whop } = makeService();
+    whop.getPayout.mockResolvedValue({ id: 'cofr_1', status: 'reversed', failure: { code: 'account_closed' } });
+
+    await service.advance('pay_1');
+    await service.advance('pay_1');
+
+    expect(stage()).toBe('payout_failed');
+    expect(credits()).toHaveLength(0);
+  });
+
   it('o ciclo não insiste sozinho num saque recusado', async () => {
     seedPayout();
     const { service, whop } = makeService();
-    whop.createWithdrawal.mockRejectedValue(new WhopApiError('invalid payout method', 400, null, null));
+    whop.createPayout.mockRejectedValue(new WhopApiError('invalid payout method', 400, null, null));
 
     await service.advance('pay_1');
     expect(stage()).toBe('payout_failed');
 
     await service.advance('pay_1');
-    expect(whop.createWithdrawal).toHaveBeenCalledTimes(1);
+    expect(whop.createPayout).toHaveBeenCalledTimes(1);
   });
 
   it('reenvio do CRM cria um saque novo, sem transferir de novo', async () => {
     seedPayout();
     const { service, whop } = makeService();
-    whop.getWithdrawal.mockResolvedValueOnce({ id: 'wd_1', status: 'failed' });
+    whop.getPayout.mockResolvedValueOnce({ id: 'cofr_1', status: 'failed' });
 
     await service.advance('pay_1');
     await service.advance('pay_1');
     expect(stage()).toBe('payout_failed');
 
-    whop.listPayoutMethods.mockResolvedValue({ data: [{ id: 'potk_1' }, { id: 'potk_2' }] });
-    whop.createWithdrawal.mockResolvedValueOnce({ id: 'wd_2', status: 'completed' });
+    whop.listSavedPayoutMethods.mockResolvedValue({ data: [{ id: 'potk_1' }, { id: 'potk_2' }] });
+    whop.createPayout.mockResolvedValueOnce({ id: 'cofr_2', status: 'completed' });
 
     const state = await service.retryWithdrawal('pay_1', 'potk_2');
 
     expect(whop.createTransfer).toHaveBeenCalledTimes(1);
-    expect(whop.createWithdrawal).toHaveBeenLastCalledWith(
+    expect(whop.createPayout).toHaveBeenLastCalledWith(
       expect.objectContaining({ payout_method_id: 'potk_2' }),
       payoutWithdrawalKey('pay_1', 2),
     );
     expect(row().status).toBe('completed');
-    expect(state).toMatchObject({ stage: 'completed', attempt: 2, withdrawalId: 'wd_2' });
+    expect(state).toMatchObject({ stage: 'completed', attempt: 2, payoutId: 'cofr_2' });
   });
 
   it('reenvio para conta bancária inexistente é recusado na hora', async () => {
     seedPayout();
     const { service, whop } = makeService();
-    whop.getWithdrawal.mockResolvedValueOnce({ id: 'wd_1', status: 'failed' });
+    whop.getPayout.mockResolvedValueOnce({ id: 'cofr_1', status: 'failed' });
     await service.advance('pay_1');
     await service.advance('pay_1');
 
     await expect(service.retryWithdrawal('pay_1', 'potk_fantasma')).rejects.toThrow(/não está mais cadastrada/);
     expect(stage()).toBe('payout_failed');
-    expect(whop.createWithdrawal).toHaveBeenCalledTimes(1);
+    expect(whop.createPayout).toHaveBeenCalledTimes(1);
   });
 
   it('bloqueado por várias contas: o CRM escolhe e o envio começa', async () => {
     seedPayout();
     const { service, whop } = makeService();
-    whop.listPayoutMethods.mockResolvedValue({ data: [{ id: 'potk_a' }, { id: 'potk_b' }] });
+    whop.listSavedPayoutMethods.mockResolvedValue({ data: [{ id: 'potk_a' }, { id: 'potk_b' }] });
 
     await service.advance('pay_1');
     expect(stage()).toBe('blocked');
@@ -337,7 +348,7 @@ describe('saque recusado pelo banco', () => {
     await service.retryWithdrawal('pay_1', 'potk_b');
 
     expect(whop.createTransfer).toHaveBeenCalledTimes(1);
-    expect(whop.createWithdrawal).toHaveBeenCalledWith(
+    expect(whop.createPayout).toHaveBeenCalledWith(
       expect.objectContaining({ payout_method_id: 'potk_b' }),
       payoutWithdrawalKey('pay_1', 1),
     );

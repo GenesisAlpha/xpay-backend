@@ -76,6 +76,11 @@ function normalizeDestination(metadata: any) {
     // Crypto
     wallet_address: dest.cryptoAddress ?? dest.wallet_address,
     network: dest.cryptoNetwork ?? dest.network,
+    // Whop (conta conectada): conta salva na Whop, só a referência mascarada
+    whop_payout_method_id: dest.whopPayoutMethodId,
+    whop_method_name: dest.whopMethodName,
+    account_reference: dest.accountReference,
+    destination_currency: dest.destinationCurrency,
     // IBAN (SEPA/internacional) — método ativo hoje
     iban: dest.iban,
     swift: dest.swift,
@@ -700,9 +705,17 @@ export class CrmAdminService {
       throw new BadRequestException(`Saque está com status ${w.status}, não pode ser aprovado`)
     }
 
-    // Seller com conta conectada ativa: o envio é automático (master → conta
-    // conectada → banco). Sem ela, o saque segue manual como antes.
-    const whopAccountId = await this.connectedPayouts.eligibleAccount(w.seller_id)
+    // Saque pedido pela Whop (seller com conta conectada ativa): o envio é
+    // automático (master → conta conectada → banco). Os demais — inclusive um
+    // Pix antigo de quem virou conectado depois — seguem manuais.
+    const whopAccountId = w.metadata?.method === 'whop'
+      ? await this.connectedPayouts.eligibleAccount(w.seller_id)
+      : null
+    if (w.metadata?.method === 'whop' && !whopAccountId) {
+      throw new BadRequestException(
+        'Saque pela Whop, mas a conta conectada do seller não está ativa (ou o envio automático está desligado). Rejeite ou reative a conta.',
+      )
+    }
 
     // Debita withdrawing (sem destino = sai do sistema)
     await this.transferBalance(w.seller_id, 'withdrawing', null, Number(w.amount))
@@ -946,6 +959,16 @@ export class CrmAdminService {
     void notifySellerPayout(w.seller_id, 'failed', { ...payoutEmailInfo(id, w), reason })
 
     return { message: 'Envio cancelado e saldo devolvido' }
+  }
+
+  // Contas salvas na conta conectada do seller — para escolher no reenvio.
+  async listConnectedPayoutMethods(ctx: AdminContext, id: string) {
+    this.assertAdmin(ctx.role)
+    const w = await this.fetchLedgerPayout(id)
+    if (!isWhopConnectedPayout(w.metadata)) {
+      throw new BadRequestException('Este saque não é enviado pela conta conectada.')
+    }
+    return this.connectedPayouts.savedMethods(id)
   }
 
   // Saque recusado pelo banco: o dinheiro está na conta conectada. Reenvia
