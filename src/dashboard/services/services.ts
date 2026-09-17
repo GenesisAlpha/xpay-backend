@@ -4,6 +4,7 @@
 // ============================================================
 
 import { Injectable, BadRequestException, ConflictException, NotFoundException, UnauthorizedException, InternalServerErrorException, ServiceUnavailableException, Logger } from '@nestjs/common'
+import { formatBusinessDate } from '../../shared/business-time'
 import { supabase } from '../../lib/supabase.client'
 import * as bcrypt from 'bcrypt';
 import { generateKey, hashKey } from '../../utils/apikeys.utils';
@@ -226,7 +227,7 @@ export class WalletService {
       total: available + pending + reserved + inTransit,
       nextPayout: nextPayout ? {
         amount: fromCents(nextPayout.amount),
-        date: new Date(nextPayout.available_at).toLocaleDateString('pt-BR'),
+        date: formatBusinessDate(nextPayout.available_at),
         method: nextPayout.metadata.method,
       } : null,
     }
@@ -282,7 +283,7 @@ export class WalletService {
         // 🔥 amount em centavos → USD
         amount: fromCents(entry.amount),
         status: entry.status === 'completed' ? 'completed' : 'pending',
-        date: new Date(entry.created_at).toLocaleDateString('pt-BR'),
+        date: formatBusinessDate(entry.created_at),
         transactionId: entry.transaction_id,
         // 🚚 Rastreio da venda de origem (débitos = false/null)
         orderShipped: isCredit ? tracking?.status === 'synced' : false,
@@ -316,8 +317,8 @@ export class WalletService {
       // 🔥 amount em centavos → USD
       amount: fromCents(p.amount),
       status: p.status === 'completed' ? 'paid' : p.status === 'pending' ? 'pending' : 'failed',
-      date: new Date(p.created_at).toLocaleDateString('pt-BR'),
-      processedAt: p.available_at ? new Date(p.available_at).toLocaleDateString('pt-BR') : null,
+      date: formatBusinessDate(p.created_at),
+      processedAt: p.available_at ? formatBusinessDate(p.available_at) : null,
     }))
 
     return paginatedResponse(mapped, count ?? 0, page, pageSize)
@@ -869,8 +870,8 @@ export class DisputesService {
       reason: d.reason,
       reasonCode: d.reason_code,
       status: d.status,
-      deadline: d.deadline ? new Date(d.deadline).toLocaleDateString('pt-BR') : null,
-      createdAt: new Date(d.created_at).toLocaleDateString('pt-BR'),
+      deadline: d.deadline ? formatBusinessDate(d.deadline) : null,
+      createdAt: formatBusinessDate(d.created_at),
       seller: d.seller_name ?? 'Vendedor',
     }))
 
@@ -985,16 +986,16 @@ export class TransfersService {
         netAmount: amountUSD,
         status: entryStatus,
         releaseDate: entry.available_at
-          ? new Date(entry.available_at).toLocaleDateString('pt-BR')
+          ? formatBusinessDate(entry.available_at)
           : '-',
-        createdAt: new Date(entry.created_at).toLocaleDateString('pt-BR'),
+        createdAt: formatBusinessDate(entry.created_at),
         paidAt: entry.status === 'completed'
-          ? new Date(entry.created_at).toLocaleDateString('pt-BR')
+          ? formatBusinessDate(entry.created_at)
           : null,
         failReason: null,
         transactions: entry.transaction_id ? [{
           id: entry.transaction_id,
-          date: new Date(entry.created_at).toLocaleDateString('pt-BR'),
+          date: formatBusinessDate(entry.created_at),
           amount: amountUSD,
           status: 'included',
         }] : [],

@@ -1,5 +1,6 @@
 // dashboard/dashboard.service.ts
 import { Injectable } from '@nestjs/common'
+import { BUSINESS_TZ } from '../../shared/business-time'
 import { supabase } from '../../lib/supabase.client'
 
 export type Period = 'today' | 'yesterday' | '7d' | '30d' | '90d'
@@ -303,7 +304,7 @@ export class DashboardService {
       company: tx.customer_name ?? 'Cliente',
       description: `Pagamento recebido - ${this.formatMethodName(tx.method)}`,
       amount: c(tx.amount_usd_gross_cents),
-      time: new Date(tx.created_at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
+      time: new Date(tx.created_at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: BUSINESS_TZ }),
       status: tx.status === 'approved' ? 'approved' : tx.status === 'pending' ? 'pending' : 'completed',
       icon: this.resolveIcon(tx.method, tx.payment_brand),
     }))
