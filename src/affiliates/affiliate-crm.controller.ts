@@ -48,6 +48,24 @@ export class AffiliateCrmController {
     return this.affiliates.setRate(ctxFromReq(req), sellerId, Number(body?.ratePct))
   }
 
+  /** Ativa o programa para a conta e devolve o link de indicação. */
+  @Post(':sellerId/activate')
+  @Roles('admin')
+  activate(@Req() req: any, @Param('sellerId') sellerId: string, @Body() body: { ratePct?: number }) {
+    return this.affiliates.activate(ctxFromReq(req), sellerId, body ?? {})
+  }
+
+  /** Tira o link do ar; com closeReferrals, também encerra a comissão dos indicados. */
+  @Post(':sellerId/deactivate')
+  @Roles('admin')
+  deactivate(
+    @Req() req: any,
+    @Param('sellerId') sellerId: string,
+    @Body() body: { closeReferrals?: boolean; reason?: string },
+  ) {
+    return this.affiliates.deactivate(ctxFromReq(req), sellerId, body ?? {})
+  }
+
   @Post(':sellerId/suspend')
   @Roles('admin')
   suspend(@Req() req: any, @Param('sellerId') sellerId: string, @Body() body: { reason?: string }) {
