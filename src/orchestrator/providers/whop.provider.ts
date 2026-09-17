@@ -1,4 +1,5 @@
 import { ChargeResponse } from './provider.types';
+import { whopRenewalTerms } from './whop-subscription-terms';
 import { supabase } from '../../lib/supabase.client';
 import { connectedApplicationFee } from '../whop/whop-connected';
 import { maskedPlanTitle } from './whop-plan-title';
@@ -301,6 +302,10 @@ export class WhopProvider {
       initialCharge: number;
       renewalPrice: number;
       installments: number | null;
+      /** Teste enviado à Whop (o do seller, ou um ciclo para o valor inicial). */
+      whopTrialDays: number;
+      /** Plano novo na Whop: quem já usou teste num plano reaproveitado não ganha outro. */
+      freshPlan: boolean;
     } | null = null;
 
     if (isRecurring) {
@@ -319,11 +324,19 @@ export class WhopProvider {
       if (!Number.isFinite(renewalPrice) || renewalPrice <= 0) {
         return this.failure(id, transactionId, 'Whop: valor da renovação ausente na moeda da cobrança');
       }
-      // Na Whop, initial_price é ADICIONAL à primeira cobrança: com teste ele é
-      // tudo o que se cobra hoje; sem teste, hoje = initial_price + renewal_price.
-      const initialCharge = trialPeriodDays > 0
-        ? initialPrice
-        : Number((initialPrice - renewalPrice).toFixed(2));
+      // Valor inicial NO LUGAR da primeira mensalidade (regra da Koopfy); a Whop
+      // soma initial_price à primeira cobrança. whopRenewalTerms traduz.
+      const whopTerms = whopRenewalTerms({
+        todayCharge: initialPrice,
+        renewalPrice,
+        billingPeriodDays,
+        trialPeriodDays,
+        planInitialPrice: Number(metadata?.pricing_plan?.initial_price ?? 0),
+      });
+      if ('error' in whopTerms) {
+        return this.failure(id, transactionId, `Whop: ${whopTerms.error}`);
+      }
+      const initialCharge = whopTerms.initialPrice;
       const installments = metadata?.pricing_plan?.split_pay_required_payments == null
         ? null
         : Number(metadata.pricing_plan.split_pay_required_payments);
@@ -343,7 +356,15 @@ export class WhopProvider {
         return this.failure(id, transactionId, 'Whop: quantidade de cobranças inválida');
       }
 
-      subscriptionTerms = { billingPeriodDays, trialPeriodDays, initialCharge, renewalPrice, installments };
+      subscriptionTerms = {
+        billingPeriodDays,
+        trialPeriodDays,
+        initialCharge,
+        renewalPrice,
+        installments,
+        whopTrialDays: whopTerms.trialPeriodDays,
+        freshPlan: whopTerms.freshPlan,
+      };
     }
 
     // ⚠️ Ver aviso de reconciliação no topo do arquivo. É o que o webhook usa pra
@@ -420,19 +441,21 @@ export class WhopProvider {
         // chars da API (acima disso a compra inteira falha com 400).
         title,
         plan_type: isRecurring ? 'renewal' : 'one_time',
-        // Em renewal, initial_price é uma taxa ADICIONAL à primeira cobrança.
-        // O valor recorrente normal pertence a renewal_price.
+        // Em renewal, a Whop soma initial_price à primeira cobrança sem teste —
+        // os termos já vêm traduzidos da regra da Koopfy (whopRenewalTerms).
         initial_price: isRecurring ? subscriptionTerms?.initialCharge ?? 0 : initialPrice,
         ...(subscriptionTerms ? {
           renewal_price: subscriptionTerms.renewalPrice,
           billing_period: subscriptionTerms.billingPeriodDays,
-          trial_period_days: subscriptionTerms.trialPeriodDays || null,
+          trial_period_days: subscriptionTerms.whopTrialDays || null,
           ...(subscriptionTerms.installments
             ? { split_pay_required_payments: subscriptionTerms.installments }
             : {}),
           // Contrato oficial da checkout configuration: permite uma sessão nova
           // (metadata por pedido) sem criar outro plano com os mesmos termos.
-          force_create_new_plan: false,
+          // Plano reaproveitado não dá teste a quem já usou: com o ciclo de
+          // teste do valor inicial, cada compra precisa de um plano próprio.
+          force_create_new_plan: subscriptionTerms.freshPlan,
           internal_notes: `Koopfy ${String(metadata?.product_id).slice(0, 60)} / ${String(metadata?.pricing_plan?.id ?? 'default').slice(0, 40)}`,
         } : {}),
         // Sem isto o plano nasce 'visible' e cada compra publica um item na
@@ -606,6 +629,10 @@ export class WhopProvider {
       initialCharge: number;
       renewalPrice: number;
       installments: number | null;
+      /** Teste enviado à Whop (o do seller, ou um ciclo para o valor inicial). */
+      whopTrialDays: number;
+      /** Plano novo na Whop: quem já usou teste num plano reaproveitado não ganha outro. */
+      freshPlan: boolean;
     } | null;
     metadata: Record<string, any>;
     returnUrl: string;
@@ -626,12 +653,12 @@ export class WhopProvider {
       title: args.title,
       visibility: 'quick_link',
       plan_type: subscriptionTerms ? 'renewal' : 'one_time',
-      // Em renewal, initial_price é taxa ADICIONAL à primeira cobrança.
+      // Termos já traduzidos da regra da Koopfy (whopRenewalTerms).
       initial_price: subscriptionTerms ? subscriptionTerms.initialCharge : args.initialPrice,
       ...(subscriptionTerms ? {
         renewal_price: subscriptionTerms.renewalPrice,
         billing_period: subscriptionTerms.billingPeriodDays,
-        trial_period_days: subscriptionTerms.trialPeriodDays || null,
+        trial_period_days: subscriptionTerms.whopTrialDays || null,
       } : {}),
       ...(args.applicationFee != null ? { application_fee_amount: args.applicationFee } : {}),
       ...this.buildProductLink(args.config),
