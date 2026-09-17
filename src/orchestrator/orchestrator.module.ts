@@ -3,6 +3,7 @@ import { AccountRouterService } from './router/account-router.service';
 import { WhopAccountsService } from './whop/whop-accounts.service';
 import { WhopConnectService } from './whop/whop-connect.service';
 import { WhopPlatformClient } from './whop/whop-platform.client';
+import { WhopConnectedPayoutService } from './whop/whop-connected-payout.service';
 import { WhopLinkedAccountsService } from './whop/whop-linked.service';
 import { StripeAccountsService } from './stripe/stripe-accounts.service';
 import { ClipAccountsService } from './clip/clip-accounts.service';
@@ -27,6 +28,8 @@ import { CryptoModule } from '../crypto/crypto.module';
     // WhopAccountsService resolve os ids 'whopc_…' por aqui.
     WhopPlatformClient,
     WhopConnectService,
+    // Saque aprovado de seller conectado: master → conta conectada → banco.
+    WhopConnectedPayoutService,
     // Conta Whop própria do seller (modo conexão): a cobrança sai na conta dele.
     WhopLinkedAccountsService,
     StripeAccountsService,
@@ -52,6 +55,8 @@ import { CryptoModule } from '../crypto/crypto.module';
     // WhopConnectService: o CRM cria/suspende a conta conectada e o webhook das
     // contas conectadas sincroniza status e risco.
     WhopConnectService,
+    // WhopConnectedPayoutService: aprovar saque no CRM enfileira a execução.
+    WhopConnectedPayoutService,
     // WhopLinkedAccountsService: o CRM e o painel conectam/desligam a conta
     // própria do seller, e o webhook precisa resolver os ids 'whopl_…'.
     WhopLinkedAccountsService,

@@ -100,6 +100,22 @@ export class WhopPlatformClient {
     return this.request('GET', `/transfers/${encodeURIComponent(transferId)}`);
   }
 
+  // Contas bancárias que o seller cadastrou na conta conectada (portal da Whop).
+  listPayoutMethods(accountId: string) {
+    return this.request('GET', '/payout_methods', { query: { account_id: accountId, first: '50' } });
+  }
+
+  // Saque da conta conectada para a conta bancária dela. A chave de plataforma
+  // saca em nome da filha; como na transferência, a chave vai no header e no
+  // corpo (`idempotency_key`, que é o nome que este endpoint usa).
+  createWithdrawal(body: Record<string, any>, idempotencyKey: string) {
+    return this.request('POST', '/withdrawals', { body: { ...body, idempotency_key: idempotencyKey }, idempotencyKey });
+  }
+
+  getWithdrawal(withdrawalId: string) {
+    return this.request('GET', `/withdrawals/${encodeURIComponent(withdrawalId)}`);
+  }
+
   private apiKey(): string {
     return process.env.WHOP_PLATFORM_API_KEY?.trim() || process.env.WHOP_API_KEY?.trim() || '';
   }

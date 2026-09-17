@@ -5,6 +5,8 @@ import { supabase } from '../lib/supabase.client'
 import { getEffectiveSellerFees } from '../shared/fee.calculator'
 import { providerCostCents, saleProfitCents } from '../orchestrator/fees/provider-fees'
 import { notifySellerPayout, type PayoutEmailInfo } from '../utils/seller-mail'
+import { WhopConnectedPayoutService } from '../orchestrator/whop/whop-connected-payout.service'
+import { isWhopConnectedPayout } from '../orchestrator/whop/whop-connected-payout'
 
 // Linha do ledger (debit_payout) → dados do e-mail de saque. O destino fica em
 // metadata.destination (camelCase), igual ao que o CRM exibe.
@@ -93,6 +95,7 @@ function normalizeDestination(metadata: any) {
 
 @Injectable()
 export class CrmAdminService {
+  constructor(private readonly connectedPayouts: WhopConnectedPayoutService) { }
 
   // ─── Guard: admin (rw) ou supervisor (ro) ────────────────────────────
   private assertAdmin(role: string, writeOp = false) {
@@ -630,7 +633,12 @@ export class CrmAdminService {
       .single()
 
     if (error || !data) throw new NotFoundException('Saque não encontrado')
-    return this.formatWithdrawalRow(data)
+    const ledger = await this.fetchLedgerPayout(id)
+    return {
+      ...this.formatWithdrawalRow(data),
+      // Seller com conta conectada: em que perna o envio está.
+      whop_payout: this.connectedPayouts.describe(ledger),
+    }
   }
 
   private formatWithdrawalRow(w: any) {
@@ -692,6 +700,10 @@ export class CrmAdminService {
       throw new BadRequestException(`Saque está com status ${w.status}, não pode ser aprovado`)
     }
 
+    // Seller com conta conectada ativa: o envio é automático (master → conta
+    // conectada → banco). Sem ela, o saque segue manual como antes.
+    const whopAccountId = await this.connectedPayouts.eligibleAccount(w.seller_id)
+
     // Debita withdrawing (sem destino = sai do sistema)
     await this.transferBalance(w.seller_id, 'withdrawing', null, Number(w.amount))
 
@@ -723,7 +735,19 @@ export class CrmAdminService {
 
     void notifySellerPayout(w.seller_id, 'approved', payoutEmailInfo(id, w))
 
-    return { message: 'Saque aprovado e saldo debitado' }
+    if (whopAccountId) {
+      try {
+        await this.connectedPayouts.queue(id, whopAccountId)
+      } catch (err: any) {
+        // Aprovado e sem execução: fica no fluxo manual. Melhor avisar do que
+        // desfazer uma aprovação que já debitou e notificou.
+        console.error(`[CrmAdmin] saque ${id} aprovado, envio automático não enfileirado:`, err?.message ?? err)
+        return { message: 'Saque aprovado, mas o envio automático não foi iniciado — conclua manualmente', automatic: false }
+      }
+      return { message: 'Saque aprovado — envio automático para a conta conectada iniciado', automatic: true }
+    }
+
+    return { message: 'Saque aprovado e saldo debitado', automatic: false }
   }
 
   // ─── Reject: só pending → rejected (devolve withdrawing → available) ──
@@ -795,6 +819,9 @@ export class CrmAdminService {
     if (!['approved', 'processing'].includes(w.status)) {
       throw new BadRequestException(`Saque ${w.status} não pode ser concluído`)
     }
+    if (isWhopConnectedPayout(w.metadata)) {
+      throw new BadRequestException('Este saque é enviado automaticamente pela conta conectada e é concluído quando o banco confirma.')
+    }
 
     // ⚠️ NÃO debita saldo aqui — já foi debitado na aprovação (Modelo A)
 
@@ -839,6 +866,10 @@ export class CrmAdminService {
       throw new BadRequestException(`Saque ${w.status} não pode ser marcado como falhou`)
     }
 
+    if (isWhopConnectedPayout(w.metadata)) {
+      return this.cancelConnectedPayout(ctx, id, w, dto.reason.trim())
+    }
+
     // Devolve direto pra available (saldo foi debitado de withdrawing no approve)
     await this.creditAvailable(w.seller_id, Number(w.amount))
 
@@ -868,6 +899,73 @@ export class CrmAdminService {
     void notifySellerPayout(w.seller_id, 'failed', { ...payoutEmailInfo(id, w), reason: dto.reason.trim() })
 
     return { message: 'Saque marcado como falhou e saldo devolvido' }
+  }
+
+  // ─── Envio automático (conta conectada) ───────────────────────────────
+
+  // Cancelar só enquanto nada saiu da master: com o saque ainda 'approved', o
+  // ciclo não o pegou. O CAS vem ANTES do crédito — se o ciclo pegar primeiro,
+  // nenhum saldo é devolvido (o dinheiro pode estar indo para o seller).
+  private async cancelConnectedPayout(ctx: AdminContext, id: string, w: any, reason: string) {
+    if (w.status !== 'approved') {
+      throw new BadRequestException(
+        'O envio para a conta conectada já começou. Se o banco recusar, reenvie pelo CRM — não dá para devolver o saldo, o dinheiro já é do seller na conta dele.',
+      )
+    }
+
+    const { data: cancelled, error } = await supabase
+      .from('wallet_ledger')
+      .update({
+        status: 'failed',
+        failure_reason: reason,
+        metadata: {
+          ...(w.metadata ?? {}),
+          execution: { ...w.metadata.execution, stage: 'transfer_failed', last_error: `cancelado no CRM: ${reason}` },
+        },
+      })
+      .eq('id', id)
+      .eq('type', 'debit_payout')
+      .eq('status', 'approved')
+      .select('id')
+      .maybeSingle()
+
+    if (error) throw new BadRequestException(error.message)
+    if (!cancelled) {
+      throw new BadRequestException('O envio para a conta conectada começou agora — o saque não pode mais ser cancelado.')
+    }
+
+    await this.creditAvailable(w.seller_id, Number(w.amount))
+
+    await this.audit(ctx, 'withdrawal.failed', 'withdrawal', id, {
+      reason,
+      amount_cents: w.amount,
+      seller_id: w.seller_id,
+      whop_connected: true,
+    })
+
+    void notifySellerPayout(w.seller_id, 'failed', { ...payoutEmailInfo(id, w), reason })
+
+    return { message: 'Envio cancelado e saldo devolvido' }
+  }
+
+  // Saque recusado pelo banco: o dinheiro está na conta conectada. Reenvia
+  // (opcionalmente para outra conta bancária cadastrada pelo seller).
+  async retryConnectedPayout(ctx: AdminContext, id: string, dto: { payout_method_id?: string }) {
+    this.assertAdmin(ctx.role, true)
+    const w = await this.fetchLedgerPayout(id)
+    if (!isWhopConnectedPayout(w.metadata)) {
+      throw new BadRequestException('Este saque não é enviado pela conta conectada.')
+    }
+
+    const state = await this.connectedPayouts.retryWithdrawal(id, dto.payout_method_id ?? null)
+
+    await this.audit(ctx, 'withdrawal.payout_retried', 'withdrawal', id, {
+      seller_id: w.seller_id,
+      payout_method_id: dto.payout_method_id ?? null,
+      stage: state?.stage ?? null,
+    })
+
+    return { message: 'Saque reenviado para o banco', whop_payout: state }
   }
 
   // ─── Helpers ────────────────────────────────────────────────────────
