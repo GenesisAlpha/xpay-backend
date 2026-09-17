@@ -293,7 +293,12 @@ export class WhopConnectService implements OnModuleInit {
     });
     const list: any[] = Array.isArray(verifications?.data) ? verifications.data : [];
     const verification = list.find(v => v?.kind === 'business') ?? null;
-    const individual = list.find(v => v?.kind === 'individual') ?? null;
+    // A conta só opera com as DUAS verificações. Quando a da pessoa não existe
+    // — conta criada antes desta função, ou dado do responsável que faltava na
+    // hora do provisionamento — o sync cria agora. Sem isto a conta ficava para
+    // sempre em "continue verificando" na Whop, e nada aqui a destravava.
+    const individual = list.find(v => v?.kind === 'individual')
+      ?? (verifications ? await this.ensureIndividualVerification(sellerId, row.whop_account_id) : null);
 
     const verificationStatus = verification?.status
       ?? account?.verification?.business?.status
@@ -1147,6 +1152,48 @@ export class WhopConnectService implements OnModuleInit {
       .eq('seller_id', sellerId);
     if (error) throw new Error(`[WhopConnect] reserva do seller ${sellerId}: ${error.message}`);
     await this.log(sellerId, null, 'whop_connect.reserve_set', { reserve_percentage: percentage });
+  }
+
+  /**
+   * Cria a verificação da pessoa responsável quando ela ainda não existe na
+   * conta. Roda no sync, então vale tanto para conta antiga (criada antes de a
+   * Koopfy criar as duas) quanto para a que nasceu com dado faltando e só
+   * depois foi completada pelo seller.
+   *
+   * Falha aqui não derruba o sync: a conta continua sendo sincronizada e o
+   * motivo fica no log — mas ela seguiria parada sem este passo.
+   */
+  private async ensureIndividualVerification(sellerId: string, whopAccountId: string) {
+    try {
+      const source = await this.loadSellerSource(sellerId);
+      const plan = planIndividualVerification(source.kyc);
+      if (!plan.verification) {
+        console.warn(
+          `[WhopConnect] seller ${sellerId}: verificação da pessoa ainda não pode ser criada — falta ${plan.missing.join(', ')}`,
+        );
+        return null;
+      }
+
+      // Mesma chave do provisionamento: se ela já foi criada lá, a Whop devolve
+      // a mesma verificação em vez de abrir uma segunda.
+      const documentsVersion = String(source.documents?.updated_at ?? source.documents?.submitted_at ?? 'v1')
+        .replace(/[^0-9A-Za-z]/g, '')
+        .slice(0, 40);
+
+      const individual = await this.whop.createVerification(
+        whopAccountId,
+        plan.verification,
+        `koopfy_connect_kyc_${sellerId}_${documentsVersion}`,
+      );
+      await this.log(sellerId, null, 'whop_connect.individual_verification_created', {
+        verification_id: individual?.id ?? null,
+        status: individual?.status ?? null,
+      });
+      return individual ?? null;
+    } catch (err: any) {
+      console.error(`[WhopConnect] verificação da pessoa de ${sellerId}:`, this.errorMessage(err));
+      return null;
+    }
   }
 
   private async loadSellerSource(sellerId: string) {
