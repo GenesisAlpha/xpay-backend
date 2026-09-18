@@ -52,6 +52,11 @@ export class WhopPlatformClient {
     return this.request('POST', '/accounts', { body, idempotencyKey });
   }
 
+  /** Contas conectadas da plataforma, uma página por vez (`after` = end_cursor). */
+  listAccounts(after?: string) {
+    return this.request('GET', '/accounts', { query: { first: '100', ...(after ? { after } : {}) } });
+  }
+
   updateAccount(accountId: string, body: Record<string, any>) {
     return this.request('PATCH', `/accounts/${encodeURIComponent(accountId)}`, { body });
   }

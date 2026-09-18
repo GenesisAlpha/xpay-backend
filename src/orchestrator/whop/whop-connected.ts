@@ -270,6 +270,23 @@ export function isTransientProviderFailure(message: string): boolean {
 }
 
 /**
+ * Conta que a Whop já criou para este seller, pelo metadata que mandamos na
+ * criação. Existe quando a Whop cria a conta mas responde erro (ex.: Privy
+ * fora do ar): sem adotá-la, o banco fica sem o id, as verificações nunca são
+ * abertas e a próxima tentativa cria uma segunda conta. Havendo mais de uma,
+ * fica a mais antiga — é a que o seller pode já ter começado a verificar.
+ */
+export function existingSellerAccount(accounts: any[], sellerId: string): any | null {
+  const owned = (accounts ?? []).filter(
+    a =>
+      String(a?.id ?? '').startsWith('biz_') &&
+      (a?.metadata?.koopfy_seller_id === sellerId || a?.metadata?.external_id === sellerId),
+  );
+  owned.sort((a, b) => String(a?.created_at ?? '').localeCompare(String(b?.created_at ?? '')));
+  return owned[0] ?? null;
+}
+
+/**
  * Chave de idempotência da criação da conta conectada: seller + e-mail +
  * número da tentativa. A 1ª tentativa mantém o formato antigo (sem sufixo),
  * para quem já criou continuar reconhecido pela Whop.
@@ -295,6 +312,16 @@ export interface ConnectedAccountSettings {
    */
   tax_collection_enabled_states: string[];
   product_tax_code_id?: string;
+}
+
+/**
+ * Configuração da conta recém-criada. Sem a lista de estados: conta nova não
+ * remete o próprio imposto, e a Whop recusa o PATCH que a traz (ver
+ * accountSettingsPatch).
+ */
+export function newAccountSettings(env: NodeJS.ProcessEnv = process.env) {
+  const { tax_collection_enabled_states: _states, ...settings } = connectedAccountSettings(env);
+  return settings;
 }
 
 /** O que toda conta conectada precisa ter na Whop. */
@@ -336,6 +363,8 @@ export function connectedStatementDescriptor(
   return isValidStatementDescriptor(text) ? text : CONNECTED_STATEMENT_DESCRIPTOR_DEFAULT;
 }
 
+const TAX_STATES_EDITABLE = new Set(['self', 'none']);
+
 /**
  * Só o que difere entre a conta na Whop e o desejado — ou null quando já
  * está certa. É o que o sync manda, para não fazer PATCH a cada webhook.
@@ -352,7 +381,14 @@ export function accountSettingsPatch(
   if (account?.tax_type !== desired.tax_type) patch.tax_type = desired.tax_type;
   const states = Array.isArray(account?.tax_collection_enabled_states) ? account.tax_collection_enabled_states : [];
   const wanted = desired.tax_collection_enabled_states;
-  if (states.length !== wanted.length || states.some((state: string) => !wanted.includes(state))) {
+  // A Whop valida a lista contra o modo que a conta JÁ tem: em conta nova
+  // (modo vazio) ou `whop` ela recusa o PATCH inteiro ("Tax collection states
+  // can only be set when the account remits its own tax"). A limpeza fica para
+  // depois que o modo virou `none` (settleTaxStates / próximo sync).
+  if (
+    TAX_STATES_EDITABLE.has(String(account?.tax_remitted_by ?? '')) &&
+    (states.length !== wanted.length || states.some((state: string) => !wanted.includes(state)))
+  ) {
     patch.tax_collection_enabled_states = wanted;
   }
   if (desired.product_tax_code_id) {

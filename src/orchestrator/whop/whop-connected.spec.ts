@@ -605,3 +605,28 @@ describe('nova tentativa de criar a conta conectada', () => {
     expect(isTransientProviderFailure('business_name is required')).toBe(false);
   });
 });
+
+describe('existingSellerAccount', () => {
+  const { existingSellerAccount } = require('./whop-connected');
+  it('acha a conta criada numa tentativa que respondeu erro', () => {
+    const accounts = [
+      { id: 'biz_outro', metadata: { koopfy_seller_id: 'x' } },
+      { id: 'biz_novo', created_at: '2026-09-18T22:00:00Z', metadata: { koopfy_seller_id: 's1' } },
+      { id: 'biz_velho', created_at: '2026-09-18T21:59:00Z', metadata: { external_id: 's1' } },
+    ];
+    expect(existingSellerAccount(accounts, 's1')?.id).toBe('biz_velho');
+  });
+  it('sem conta do seller devolve null', () => {
+    expect(existingSellerAccount([{ id: 'biz_a', metadata: {} }], 's1')).toBeNull();
+    expect(existingSellerAccount(undefined as any, 's1')).toBeNull();
+  });
+});
+
+describe('estados de imposto em conta nova', () => {
+  const { accountSettingsPatch, connectedAccountSettings, newAccountSettings } = require('./whop-connected');
+  it('conta recém-criada (modo vazio) não recebe a lista de estados', () => {
+    const nova = { send_customer_emails: false, tax_remitted_by: null, tax_type: 'exclusive', tax_collection_enabled_states: ['CA'] };
+    expect(accountSettingsPatch(nova, connectedAccountSettings({}))).toEqual({ tax_remitted_by: 'none', tax_type: 'inclusive' });
+    expect(newAccountSettings({})).not.toHaveProperty('tax_collection_enabled_states');
+  });
+});

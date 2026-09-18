@@ -34,6 +34,8 @@ import {
   isAddressRejection,
   isTransientProviderFailure,
   connectedAccountIdempotencyKey,
+  existingSellerAccount,
+  newAccountSettings,
   planRfiAnswers,
   sellerRequirementItems,
   toConnectedProviderAccountId,
@@ -198,6 +200,17 @@ export class WhopConnectService implements OnModuleInit {
       let whopAccountId = row.whop_account_id;
 
       if (!whopAccountId) {
+        // A Whop pode ter criado a conta numa tentativa que respondeu erro:
+        // adota a que já existe em vez de criar outra.
+        const existing = await this.findSellerAccount(sellerId);
+        if (existing) {
+          whopAccountId = String(existing.id);
+          await this.updateRow(sellerId, { whop_account_id: whopAccountId });
+          await this.log(sellerId, managerId, 'whop_connect.account_adopted', { whop_account_id: whopAccountId });
+        }
+      }
+
+      if (!whopAccountId) {
         // Dono = o próprio seller. Cada conta com dono próprio mantém o risco
         // isolado (dono em comum é sinal clássico para a Whop ligar contas: o
         // bloqueio de uma derrubaria as outras) e segue a orientação da Whop
@@ -236,7 +249,7 @@ export class WhopConnectService implements OnModuleInit {
 
       // Imposto da LLC, incluso no preço, sem e-mail ao comprador — ver
       // connectedAccountSettings.
-      await this.whop.updateAccount(whopAccountId, { ...plan.account, ...connectedAccountSettings() });
+      await this.whop.updateAccount(whopAccountId, { ...plan.account, ...newAccountSettings() });
 
       // A chave muda quando os documentos mudam: reenviar depois de uma
       // recusa com documento novo cria outra verificação; clique duplo não.
@@ -1585,6 +1598,20 @@ export class WhopConnectService implements OnModuleInit {
   }
 
   /** Quantas tentativas de criar a conta deste seller já falharam (pelo log). */
+  /** Conta já criada na Whop para o seller (ver existingSellerAccount). */
+  private async findSellerAccount(sellerId: string): Promise<any | null> {
+    const accounts: any[] = [];
+    let after: string | undefined;
+    // Teto de 50 páginas (5 mil contas): a lista é da plataforma inteira.
+    for (let page = 0; page < 50; page++) {
+      const res: any = await this.whop.listAccounts(after);
+      accounts.push(...(res?.data ?? []));
+      if (!res?.page_info?.has_next_page || !res?.page_info?.end_cursor) break;
+      after = res.page_info.end_cursor;
+    }
+    return existingSellerAccount(accounts, sellerId);
+  }
+
   private async failedProvisionAttempts(sellerId: string): Promise<number> {
     const { count, error } = await supabase
       .from('crm_action_log')
