@@ -307,19 +307,28 @@ export class WhopConnectService implements OnModuleInit {
       throw new BadRequestException(`Não foi possível ler a conta na Whop: ${message}`);
     }
 
+    // O que este sync fez e o que não conseguiu fazer. Antes, cada etapa
+    // engolia o próprio erro e o fim gravava `last_error: null`: o CRM mostrava
+    // "tudo certo" e a Whop ficava igual, sem pista do motivo.
+    const report: { done: string[]; warnings: string[] } = { done: [], warnings: [] };
+
     // Conta criada antes destas regras (ou alterada no painel da Whop): o sync
     // devolve a configuração certa. Só manda o que difere, para não fazer
     // PATCH a cada webhook; falhar aqui não derruba o sync.
     const settingsPatch = accountSettingsPatch(account, connectedAccountSettings());
     if (settingsPatch) {
-      await this.whop.updateAccount(row.whop_account_id, settingsPatch)
-        .then(() => this.log(sellerId, null, 'whop_connect.settings_applied', settingsPatch))
-        .catch((err: any) => console.error(`[WhopConnect] configuração de ${row.whop_account_id}:`, this.errorMessage(err)));
+      try {
+        await this.whop.updateAccount(row.whop_account_id, settingsPatch);
+        await this.log(sellerId, null, 'whop_connect.settings_applied', settingsPatch);
+        report.done.push(`configuração aplicada (${Object.keys(settingsPatch).join(', ')})`);
+      } catch (err: any) {
+        report.warnings.push(`a Whop recusou a configuração de imposto/e-mails: ${this.errorMessage(err)}`);
+      }
     }
 
     // Sem a lista de verificações ainda dá para sincronizar status/capacidades.
     const verifications = await this.whop.listVerifications(row.whop_account_id).catch((err: any) => {
-      console.error(`[WhopConnect] verificações de ${row.whop_account_id}:`, err?.message);
+      report.warnings.push(`não foi possível ler as verificações na Whop: ${this.errorMessage(err)}`);
       return null;
     });
     const list: any[] = Array.isArray(verifications?.data) ? verifications.data : [];
@@ -328,8 +337,13 @@ export class WhopConnectService implements OnModuleInit {
     // — conta criada antes desta função, ou dado do responsável que faltava na
     // hora do provisionamento — o sync cria agora. Sem isto a conta ficava para
     // sempre em "continue verificando" na Whop, e nada aqui a destravava.
-    const individual = list.find(v => v?.kind === 'individual')
-      ?? (verifications ? await this.ensureIndividualVerification(sellerId, row.whop_account_id) : null);
+    let individual = list.find(v => v?.kind === 'individual') ?? null;
+    if (!individual && verifications) {
+      const created = await this.ensureIndividualVerification(sellerId, row.whop_account_id);
+      individual = created.verification;
+      if (created.verification) report.done.push(`verificação da pessoa criada (${created.verification.status ?? 'enviada'})`);
+      if (created.warning) report.warnings.push(created.warning);
+    }
 
     const verificationStatus = verification?.status
       ?? account?.verification?.business?.status
@@ -380,8 +394,18 @@ export class WhopConnectService implements OnModuleInit {
     }
 
     if (requested.length > 0) {
-      await this.answerRequestedInformation(sellerId).catch((err: any) =>
-        console.error(`[WhopConnect] pedidos de informação do seller ${sellerId}:`, err?.message));
+      try {
+        const rfi = await this.answerRequestedInformation(sellerId);
+        if (rfi?.answered) report.done.push(`${rfi.answered} pedido(s) de informação respondido(s)`);
+        const open = (rfi?.unanswered ?? []) as Array<{ label?: string | null; requirement?: string }>;
+        if (open.length > 0) {
+          report.warnings.push(
+            `a Whop pede o que não temos no cadastro: ${open.map(item => item.label || item.requirement).join(', ')}`,
+          );
+        }
+      } catch (err: any) {
+        report.warnings.push(`não foi possível responder os pedidos da Whop: ${this.errorMessage(err)}`);
+      }
     }
 
     // Verificações aprovadas e conta liberada na Whop: a venda passa a nascer na
@@ -392,7 +416,23 @@ export class WhopConnectService implements OnModuleInit {
         console.error(`[WhopConnect] modo conectado automático do seller ${sellerId}:`, err?.message));
     }
 
-    return this.getStatus(sellerId);
+    // O que ficou pendente aparece no CRM (last_error) e no log do seller, em
+    // vez de só no console do servidor.
+    if (report.warnings.length > 0) {
+      await this.updateRow(sellerId, { last_error: report.warnings.join(' · ').slice(0, 500) }).catch(() => { /* best-effort */ });
+    }
+    if (report.done.length > 0 || report.warnings.length > 0) {
+      await this.log(sellerId, null, 'whop_connect.sync_report', report);
+    }
+
+    return {
+      ...(await this.getStatus(sellerId)),
+      syncReport: {
+        ...report,
+        // A leitura que explica o "continue verificando" da Whop.
+        state: `empresa: ${verificationStatus ?? 'não criada'} · pessoa: ${individual?.status ?? individualStatus ?? 'não criada'}`,
+      },
+    };
   }
 
   // ─────────────────────────────────────────────
@@ -1196,15 +1236,15 @@ export class WhopConnectService implements OnModuleInit {
    * Falha aqui não derruba o sync: a conta continua sendo sincronizada e o
    * motivo fica no log — mas ela seguiria parada sem este passo.
    */
-  private async ensureIndividualVerification(sellerId: string, whopAccountId: string) {
+  private async ensureIndividualVerification(
+    sellerId: string,
+    whopAccountId: string,
+  ): Promise<{ verification: any | null; warning: string | null }> {
     try {
       const source = await this.loadSellerSource(sellerId);
       const plan = planIndividualVerification(source.kyc);
       if (!plan.verification) {
-        console.warn(
-          `[WhopConnect] seller ${sellerId}: verificação da pessoa ainda não pode ser criada — falta ${plan.missing.join(', ')}`,
-        );
-        return null;
+        return { verification: null, warning: `verificação da pessoa não criada: falta ${plan.missing.join(', ')}` };
       }
 
       // Mesma chave do provisionamento: se ela já foi criada lá, a Whop devolve
@@ -1222,10 +1262,9 @@ export class WhopConnectService implements OnModuleInit {
         verification_id: individual?.id ?? null,
         status: individual?.status ?? null,
       });
-      return individual ?? null;
+      return { verification: individual ?? null, warning: null };
     } catch (err: any) {
-      console.error(`[WhopConnect] verificação da pessoa de ${sellerId}:`, this.errorMessage(err));
-      return null;
+      return { verification: null, warning: `a Whop recusou a verificação da pessoa: ${this.errorMessage(err)}` };
     }
   }
 
