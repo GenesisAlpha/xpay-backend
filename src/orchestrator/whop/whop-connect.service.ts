@@ -32,6 +32,8 @@ import {
   KOOPFY_PRODUCT_TITLE,
   isOwnerEmailRejection,
   isAddressRejection,
+  isTransientProviderFailure,
+  connectedAccountIdempotencyKey,
   planRfiAnswers,
   sellerRequirementItems,
   toConnectedProviderAccountId,
@@ -202,6 +204,12 @@ export class WhopConnectService implements OnModuleInit {
         // ("the email should belong to the connected account"). Os avisos da
         // Whop ao seller são desligados à mão, na conta dele (2026-09-18).
         const ownerEmail = String(source.seller.email ?? '').trim().toLowerCase();
+        // Cada tentativa depois de uma falha registrada ganha chave nova: se a
+        // Whop guardou a resposta de erro sob a chave anterior, repetir com ela
+        // devolveria o mesmo 400 sem tentar de novo — e falha passageira dela
+        // (ex.: "Privy API error (0)") viraria permanente. Cliques simultâneos
+        // veem o mesmo número e continuam idempotentes.
+        const attempt = await this.failedProvisionAttempts(sellerId);
         const account = await this.whop.createAccount(
           {
             email: ownerEmail,
@@ -215,10 +223,9 @@ export class WhopConnectService implements OnModuleInit {
             send_customer_emails: false,
             metadata: { external_id: sellerId, koopfy_seller_id: sellerId },
           },
-          // O e-mail entra na chave: se a Whop guardou a resposta de uma
-          // tentativa recusada (e-mail inválido), repetir com a mesma chave
-          // devolveria o mesmo 400 mesmo depois de corrigido.
-          `koopfy_connect_account_${sellerId}_${createHash('sha256').update(ownerEmail).digest('hex').slice(0, 10)}`,
+          // E-mail e tentativa na chave: corrigir o e-mail ou tentar de novo
+          // depois de uma falha nunca reaproveita uma resposta de erro guardada.
+          connectedAccountIdempotencyKey(sellerId, createHash('sha256').update(ownerEmail).digest('hex').slice(0, 10), attempt),
         );
         whopAccountId = String(account?.id ?? '');
         if (!whopAccountId.startsWith('biz_')) {
@@ -307,6 +314,14 @@ export class WhopConnectService implements OnModuleInit {
           `A Whop recusou o e-mail do seller (${source.seller.email ?? 'sem e-mail'}). `
           + 'Confira se ele é real e recebe mensagens. '
           + `Resposta da Whop: ${message}`,
+        );
+      }
+      // Falha da Whop com os fornecedores dela (a Privy cria o usuário dono):
+      // não é problema do cadastro, e tentar de novo em instantes resolve.
+      if (isTransientProviderFailure(message)) {
+        throw new BadRequestException(
+          'A Whop teve uma falha passageira ao criar o usuário da conta. Nada foi criado; '
+          + `tente novamente em alguns minutos. Resposta da Whop: ${message}`,
         );
       }
       throw new BadRequestException(`Whop recusou a conta conectada: ${message}`);
@@ -1567,6 +1582,19 @@ export class WhopConnectService implements OnModuleInit {
     } catch (err: any) {
       return { ok: false, error: `${this.errorMessage(err)} (confira o estado e o ZIP da LLC no cadastro)` };
     }
+  }
+
+  /** Quantas tentativas de criar a conta deste seller já falharam (pelo log). */
+  private async failedProvisionAttempts(sellerId: string): Promise<number> {
+    const { count, error } = await supabase
+      .from('crm_action_log')
+      .select('id', { count: 'exact', head: true })
+      .eq('seller_id', sellerId)
+      .eq('action', 'whop_connect.provision_failed');
+    // Sem conseguir contar, usa um número novo: melhor uma chave inédita do
+    // que reaproveitar a de uma tentativa que falhou.
+    if (error) return Date.now();
+    return count ?? 0;
   }
 
   /** Esta correção já foi feita nesta verificação? */

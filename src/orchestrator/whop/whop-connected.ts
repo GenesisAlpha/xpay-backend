@@ -260,6 +260,25 @@ export function isAddressRejection(message: string): boolean {
   return /postal code|business address|zip/i.test(String(message ?? ''));
 }
 
+/**
+ * Falha da Whop ao falar com um fornecedor dela — ex.: "Privy API error (0)",
+ * a Privy cria o usuário dono da conta. Status 0 é chamada sem resposta: não
+ * é o cadastro do seller, e uma nova tentativa (com chave nova) costuma passar.
+ */
+export function isTransientProviderFailure(message: string): boolean {
+  return /privy api error|\(0\)|timed? ?out|temporar|try again/i.test(String(message ?? ''));
+}
+
+/**
+ * Chave de idempotência da criação da conta conectada: seller + e-mail +
+ * número da tentativa. A 1ª tentativa mantém o formato antigo (sem sufixo),
+ * para quem já criou continuar reconhecido pela Whop.
+ */
+export function connectedAccountIdempotencyKey(sellerId: string, emailHash: string, attempt: number): string {
+  const base = `koopfy_connect_account_${sellerId}_${emailHash}`;
+  return attempt > 0 ? `${base}_a${attempt}` : base;
+}
+
 /** Recusa da Whop pelo e-mail do dono (o do seller), e não pelo resto do cadastro. */
 export function isOwnerEmailRejection(message: string): boolean {
   return /invalid email|real email address/i.test(String(message ?? ''));

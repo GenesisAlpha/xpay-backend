@@ -1,5 +1,7 @@
 import * as crypto from 'crypto';
 import {
+  connectedAccountIdempotencyKey,
+  isTransientProviderFailure,
   connectedActivationBlocker,
   connectedStatementDescriptor,
   isValidStatementDescriptor,
@@ -587,5 +589,19 @@ describe('ativação do Koopfy Payments com conta conectada', () => {
 
   it('quem vende na conta Whop própria não depende da conta conectada', () => {
     expect(connectedActivationBlocker({ required: true, status: 'pending_verification', externalProviderConnected: true })).toBeNull();
+  });
+});
+
+describe('nova tentativa de criar a conta conectada', () => {
+  it('primeira tentativa mantém a chave de antes; as seguintes ganham chave nova', () => {
+    expect(connectedAccountIdempotencyKey('s1', 'abc', 0)).toBe('koopfy_connect_account_s1_abc');
+    expect(connectedAccountIdempotencyKey('s1', 'abc', 1)).toBe('koopfy_connect_account_s1_abc_a1');
+    expect(connectedAccountIdempotencyKey('s1', 'abc', 2)).not.toBe(connectedAccountIdempotencyKey('s1', 'abc', 1));
+  });
+
+  it('reconhece falha passageira da Whop com a Privy', () => {
+    expect(isTransientProviderFailure('Privy API error (0):  (HTTP 400)')).toBe(true);
+    expect(isTransientProviderFailure('You entered an invalid email address.')).toBe(false);
+    expect(isTransientProviderFailure('business_name is required')).toBe(false);
   });
 });
