@@ -1498,9 +1498,9 @@ export class WhopConnectService implements OnModuleInit {
   }
 
   /**
-   * Ao virar `tax_remitted_by: self`, a Whop liga sozinha a coleta de sales tax
-   * nos 51 estados — DEPOIS do nosso PATCH, mesmo com a lista vazia nele
-   * (visto em 2026-09-18). Relê a conta e zera de novo.
+   * Ao mudar `tax_remitted_by`, a Whop pode religar sozinha a coleta de sales
+   * tax nos 51 estados — DEPOIS do nosso PATCH, mesmo com a lista vazia nele
+   * (visto com `self` em 2026-09-18). Relê a conta e zera de novo.
    */
   private async settleTaxStates(
     sellerId: string,

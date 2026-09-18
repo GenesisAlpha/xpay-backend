@@ -227,9 +227,11 @@ function extensionOf(path: string): string {
 //     processadora ligar contas, e o risco de uma contaminaria as outras — o
 //     oposto do isolamento que justifica a conta conectada. Os avisos da Whop
 //     ao seller são desligados à mão, na conta dele;
-//   • o imposto é da LLC do seller (`tax_remitted_by: self`) e vem INCLUSO no
-//     preço — o comprador paga o que viu no checkout, e as taxas da Koopfy
-//     são calculadas sobre esse mesmo valor;
+//   • o imposto é todo do seller, por fora da Whop: `tax_remitted_by: none`.
+//     Na tela da Whop, `self` aparece como "Whop collects, I remit" (a Whop
+//     calcula e cobra no checkout e o seller repassa) — não é isso; `whop` é
+//     a Whop cobrando e recolhendo. O preço segue INCLUSO: o comprador paga o
+//     que viu, e as taxas da Koopfy saem sobre esse mesmo valor;
 //   • classificação fiscal padrão "Digital - SaaS". O id (`ptc_…`) não tem
 //     endpoint de listagem documentado, então vem por env; sem ele, o resto
 //     da configuração vale igual.
@@ -246,13 +248,12 @@ export function isOwnerEmailRejection(message: string): boolean {
 
 export interface ConnectedAccountSettings {
   send_customer_emails: false;
-  tax_remitted_by: 'self';
+  tax_remitted_by: 'none';
   tax_type: 'inclusive';
   /**
-   * Nenhum estado: ao virar `self`, a Whop liga a coleta de sales tax nos 51
-   * estados, e parte de toda venda a comprador americano viraria imposto que a
-   * LLC teria de recolher em cada um. Decisão do dono (2026-09-18): o seller é
-   * o responsável, mas nada é calculado na venda.
+   * Nenhum estado. Quando a conta passa por `self`, a Whop liga sozinha a
+   * coleta nos 51 estados; com `none` a lista vazia garante que nada seja
+   * calculado na venda, mesmo em conta que já passou por `self`.
    */
   tax_collection_enabled_states: string[];
   product_tax_code_id?: string;
@@ -264,7 +265,7 @@ export function connectedAccountSettings(env: NodeJS.ProcessEnv = process.env): 
   return {
     // Nenhum e-mail transacional da Whop para o comprador: quem fala com ele é a Koopfy.
     send_customer_emails: false,
-    tax_remitted_by: 'self',
+    tax_remitted_by: 'none',
     tax_type: 'inclusive',
     tax_collection_enabled_states: [],
     ...(taxCode.startsWith('ptc_') ? { product_tax_code_id: taxCode } : {}),

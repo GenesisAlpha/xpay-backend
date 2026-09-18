@@ -471,17 +471,17 @@ describe('recusa do e-mail do dono', () => {
 });
 
 describe('configuração da conta conectada', () => {
-  it('imposto da LLC, incluso no preço, sem e-mail ao comprador e sem estado coletando', () => {
+  it('imposto por fora da Whop (none), preço incluso, sem e-mail ao comprador e sem estado coletando', () => {
     expect(connectedAccountSettings({})).toEqual({
       send_customer_emails: false,
-      tax_remitted_by: 'self',
+      tax_remitted_by: 'none',
       tax_type: 'inclusive',
       tax_collection_enabled_states: [],
     });
   });
 
-  it('desliga a coleta que a Whop liga sozinha ao virar self', () => {
-    const conta = { send_customer_emails: false, tax_remitted_by: 'self', tax_type: 'inclusive', tax_collection_enabled_states: ['CA', 'NY'] };
+  it('desliga a coleta por estado que a Whop deixou ligada', () => {
+    const conta = { send_customer_emails: false, tax_remitted_by: 'none', tax_type: 'inclusive', tax_collection_enabled_states: ['CA', 'NY'] };
     expect(accountSettingsPatch(conta, connectedAccountSettings({}))).toEqual({ tax_collection_enabled_states: [] });
     expect(accountSettingsPatch({ ...conta, tax_collection_enabled_states: [] }, connectedAccountSettings({}))).toBeNull();
   });
@@ -493,7 +493,7 @@ describe('configuração da conta conectada', () => {
 
   it('sync só manda o que está diferente', () => {
     const desired = connectedAccountSettings({ WHOP_CONNECTED_PRODUCT_TAX_CODE_ID: 'ptc_saas' });
-    const certa = { send_customer_emails: false, tax_remitted_by: 'self', tax_type: 'inclusive', tax_collection_enabled_states: [], product_tax_code: { id: 'ptc_saas' } };
+    const certa = { send_customer_emails: false, tax_remitted_by: 'none', tax_type: 'inclusive', tax_collection_enabled_states: [], product_tax_code: { id: 'ptc_saas' } };
     expect(accountSettingsPatch(certa, desired)).toBeNull();
 
     expect(accountSettingsPatch({ ...certa, tax_type: 'exclusive', send_customer_emails: true }, desired))
@@ -503,7 +503,7 @@ describe('configuração da conta conectada', () => {
   it('conta nunca configurada recebe tudo (lista vazia não gera patch)', () => {
     expect(accountSettingsPatch({}, connectedAccountSettings({}))).toEqual({
       send_customer_emails: false,
-      tax_remitted_by: 'self',
+      tax_remitted_by: 'none',
       tax_type: 'inclusive',
     });
   });
