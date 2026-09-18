@@ -449,7 +449,11 @@ export function planBusinessVerification(kyc: any, docs: any, extra: { website?:
       kind: 'business',
       business_name: company.legal_name,
       business_structure: company.structure,
-      business_tax_identification_number: company.ein,
+      // O EIN vai em `tax_identification_number` ("SSN for individuals, EIN
+      // for businesses"). `business_tax_identification_number` não existe na
+      // API — era ignorado, e o CPF do representante ocupava o lugar do EIN:
+      // a Whop pedia o EIN de novo no "continue verificando".
+      tax_identification_number: company.ein,
       ...(company.website ? { business_website: company.website } : {}),
       country: 'US',
       place_of_incorporation: company.formation_state,
@@ -457,10 +461,43 @@ export function planBusinessVerification(kyc: any, docs: any, extra: { website?:
       first_name: rep.first_name,
       last_name: rep.last_name,
       date_of_birth: rep.date_of_birth,
-      // Representante brasileiro: o documento fiscal do país dele é o CPF.
-      tax_identification_number: rep.tax_identification_number,
+      // O CPF do representante vai na verificação DELE (individual), não aqui.
     },
   };
+}
+
+// ─── Documentos da pessoa, direto na verificação ────────────────────────────
+//
+// Sem documentos, a verificação nasce `pending` — "while a session needs the
+// user's input": a Whop espera a PESSOA abrir o `session_url` e concluir lá, e
+// os campos que mandamos só pré-preenchem esse formulário. Ninguém abria o link
+// e a conta ficava em "continue verificando" para sempre.
+//
+// Com o documento e a selfie no próprio pedido não existe sessão: a Whop
+// analisa direto ("one POST, then poll"). Os arquivos já estão no cadastro —
+// as chaves (`id_card_front`, `passport_front`, `selfie`…) são as mesmas das
+// respostas de pedido de documento. Base64 cru, até 5 MB por arquivo (o limite
+// é conferido no download, em loadDocuments).
+
+export interface IdentityDocumentsPlan {
+  documentType: WhopDocumentType | null;
+  /** Arquivo do storage por chave da Whop, na ordem em que são enviados. */
+  files: Array<{ slot: string; path: string }>;
+  problems: RequirementGap[];
+}
+
+export function identityDocumentsPlan(docs: any): IdentityDocumentsPlan {
+  const identity = identitySlotsFrom(docs);
+  const problems = [...identity.problems];
+  const files = [...identity.slots];
+
+  const selfie = docs?.selfie_path;
+  if (!selfie) problems.push({ key: 'selfie', label: 'selfie' });
+  // A selfie precisa ser foto: PDF, que vale para o documento, aqui é recusado.
+  else if (!SELFIE_EXTENSIONS.has(extensionOf(selfie))) problems.push({ key: 'selfie', label: 'selfie em JPEG ou PNG' });
+  else files.push({ slot: 'selfie', path: selfie });
+
+  return { documentType: identity.type, files: problems.length > 0 ? [] : files, problems };
 }
 
 // ─── Verificação da pessoa responsável (KYC) ────────────────────────────────

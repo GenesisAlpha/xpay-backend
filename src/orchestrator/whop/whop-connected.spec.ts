@@ -1,5 +1,6 @@
 import * as crypto from 'crypto';
 import {
+  identityDocumentsPlan,
   accountSettingsPatch,
   connectedAccountSettings,
   connectedOwnerEmail,
@@ -91,7 +92,8 @@ describe('planBusinessVerification (LLC)', () => {
       kind: 'business',
       business_name: 'Petal Post, LLC',
       business_structure: 'single_member_llc',
-      business_tax_identification_number: '12-3456789',
+      // EIN no campo que a Whop lê; o CPF vai só na verificação da pessoa.
+      tax_identification_number: '12-3456789',
       business_website: 'https://petalpost.com',
       country: 'US',
       place_of_incorporation: 'WY',
@@ -99,7 +101,6 @@ describe('planBusinessVerification (LLC)', () => {
       first_name: 'Maria',
       last_name: 'da Silva Souza',
       date_of_birth: '1990-05-17',
-      tax_identification_number: '52998224725',
     });
   });
 
@@ -514,5 +515,49 @@ describe('configuração da conta conectada', () => {
       tax_remitted_by: 'self',
       tax_type: 'inclusive',
     });
+  });
+});
+
+describe('documentos da pessoa direto na verificação', () => {
+  const docs = {
+    identity_document_type: 'ID_CARD',
+    identity_front_path: 'u1/rg-frente.jpg',
+    identity_back_path: 'u1/rg-verso.pdf',
+    selfie_path: 'u1/selfie.png',
+  };
+
+  it('RG: frente, verso e selfie nas chaves que a Whop analisa sem sessão', () => {
+    expect(identityDocumentsPlan(docs)).toEqual({
+      documentType: 'ID_CARD',
+      files: [
+        { slot: 'id_card_front', path: 'u1/rg-frente.jpg' },
+        { slot: 'id_card_back', path: 'u1/rg-verso.pdf' },
+        { slot: 'selfie', path: 'u1/selfie.png' },
+      ],
+      problems: [],
+    });
+  });
+
+  it('passaporte só tem frente', () => {
+    const plan = identityDocumentsPlan({ identity_document_type: 'PASSPORT', identity_front_path: 'u1/p.jpg', selfie_path: 'u1/s.jpg' });
+    expect(plan.files.map(f => f.slot)).toEqual(['passport_front', 'selfie']);
+  });
+
+  it('selfie em PDF não serve: a Whop exige foto', () => {
+    const plan = identityDocumentsPlan({ ...docs, selfie_path: 'u1/selfie.pdf' });
+    expect(plan.files).toEqual([]);
+    expect(plan.problems.map(p => p.label)).toContain('selfie em JPEG ou PNG');
+  });
+
+  it('faltando algo, não manda nada pela metade', () => {
+    const plan = identityDocumentsPlan({ ...docs, identity_back_path: null });
+    expect(plan.files).toEqual([]);
+    expect(plan.problems.map(p => p.label)).toContain('verso do documento');
+  });
+
+  it('sem tipo de documento, diz o que falta', () => {
+    const plan = identityDocumentsPlan({ selfie_path: 'u1/s.jpg' });
+    expect(plan.documentType).toBeNull();
+    expect(plan.problems[0].key).toBe('identity_document_type');
   });
 });

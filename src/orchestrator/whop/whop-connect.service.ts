@@ -23,6 +23,8 @@ import {
   negativeFiatBalances,
   planBusinessVerification,
   planIndividualVerification,
+  identityDocumentsPlan,
+  companyFrom,
   accountSettingsPatch,
   connectedAccountSettings,
   connectedOwnerEmail,
@@ -70,6 +72,11 @@ const RISK_WINDOW_DAYS = 30;
 
 // Limite da Whop por arquivo, antes do base64.
 const WHOP_DOCUMENT_MAX_BYTES = 5 * 1024 * 1024;
+
+// Ações do log que marcam uma correção já feita numa verificação (o
+// `verification_id` vai no payload): o sync não repete envio de arquivo.
+const IDENTITY_DOCUMENTS_SENT = 'whop_connect.individual_documents_sent';
+const BUSINESS_TIN_SENT = 'whop_connect.business_tin_sent';
 
 // Tipo no wallet_ledger da saída para a conta conectada.
 const RELEASE_LEDGER_TYPE = 'debit_whop_transfer';
@@ -229,6 +236,10 @@ export class WhopConnectService implements OnModuleInit {
         plan.verification,
         `koopfy_connect_kyb_${sellerId}_${documentsVersion}`,
       );
+      // O EIN já vai no campo certo: o sync não precisa corrigi-lo depois.
+      if (verification?.id) {
+        await this.log(sellerId, managerId, BUSINESS_TIN_SENT, { verification_id: verification.id });
+      }
 
       // A conta só opera com as DUAS verificações: empresa e pessoa responsável.
       // Os dados da pessoa são os mesmos exigidos na verificação da empresa, que
@@ -237,11 +248,20 @@ export class WhopConnectService implements OnModuleInit {
       const individualPlan = planIndividualVerification(source.kyc);
       let individual: any = null;
       if (individualPlan.verification) {
+        // Documento e selfie no próprio pedido: sem eles a Whop abre uma sessão
+        // e espera a pessoa concluir num link que ninguém abre (ver
+        // identityDocumentsPlan). Sem documento no cadastro, segue sem — e o
+        // sync envia assim que ele chegar.
+        const identityDocs = await this.identityDocumentsPayload(source.documents);
+        if (identityDocs.warning) console.warn(`[WhopConnect] seller ${sellerId}: ${identityDocs.warning}`);
         individual = await this.whop.createVerification(
           whopAccountId,
-          individualPlan.verification,
+          { ...individualPlan.verification, ...(identityDocs.payload ?? {}) },
           `koopfy_connect_kyc_${sellerId}_${documentsVersion}`,
         );
+        if (identityDocs.payload && individual?.id) {
+          await this.log(sellerId, managerId, IDENTITY_DOCUMENTS_SENT, { verification_id: individual.id });
+        }
       } else {
         console.warn(
           `[WhopConnect] seller ${sellerId}: verificação da pessoa não criada — falta ${individualPlan.missing.join(', ')}`,
@@ -344,6 +364,14 @@ export class WhopConnectService implements OnModuleInit {
       if (created.verification) report.done.push(`verificação da pessoa criada (${created.verification.status ?? 'enviada'})`);
       if (created.warning) report.warnings.push(created.warning);
     }
+
+    // Verificações já abertas que dependem de alguém: completar com o que o
+    // cadastro tem, uma vez por verificação (o log impede reenviar a cada
+    // webhook). É o que tira do "continue verificando" as contas criadas antes.
+    const completed = await this.completeOpenVerifications(sellerId, { business: verification, individual });
+    report.done.push(...completed.done);
+    report.warnings.push(...completed.warnings);
+    if (completed.individual) individual = completed.individual;
 
     const verificationStatus = verification?.status
       ?? account?.verification?.business?.status
@@ -1253,19 +1281,126 @@ export class WhopConnectService implements OnModuleInit {
         .replace(/[^0-9A-Za-z]/g, '')
         .slice(0, 40);
 
+      const identityDocs = await this.identityDocumentsPayload(source.documents);
       const individual = await this.whop.createVerification(
         whopAccountId,
-        plan.verification,
+        { ...plan.verification, ...(identityDocs.payload ?? {}) },
         `koopfy_connect_kyc_${sellerId}_${documentsVersion}`,
       );
       await this.log(sellerId, null, 'whop_connect.individual_verification_created', {
         verification_id: individual?.id ?? null,
         status: individual?.status ?? null,
       });
+      if (identityDocs.payload && individual?.id) {
+        await this.log(sellerId, null, IDENTITY_DOCUMENTS_SENT, { verification_id: individual.id });
+      }
       return { verification: individual ?? null, warning: null };
     } catch (err: any) {
       return { verification: null, warning: `a Whop recusou a verificação da pessoa: ${this.errorMessage(err)}` };
     }
+  }
+
+  /**
+   * Documento + selfie do cadastro no formato que a Whop analisa direto, sem
+   * sessão hospedada. Sem payload, o motivo — para o CRM e o log.
+   */
+  private async identityDocumentsPayload(
+    docs: any,
+  ): Promise<{ payload: Record<string, any> | null; warning: string | null }> {
+    const plan = identityDocumentsPlan(docs);
+    if (!plan.documentType || plan.files.length === 0) {
+      return {
+        payload: null,
+        warning: `documento da pessoa não enviado à Whop: falta ${plan.problems.map(p => p.label).join(', ')}`,
+      };
+    }
+    try {
+      const documents = await this.loadDocuments(plan.files);
+      return { payload: { document_type: plan.documentType, documents }, warning: null };
+    } catch (err: any) {
+      return { payload: null, warning: `documento da pessoa não enviado à Whop: ${this.errorMessage(err)}` };
+    }
+  }
+
+  /**
+   * Completa as verificações que estão esperando alguém:
+   *   • pessoa em `pending` ("a session needs the user's input") → documento e
+   *     selfie do cadastro, que dispensam a sessão;
+   *   • empresa ainda não aprovada → EIN no campo certo. Até 2026-09-18 ele ia
+   *     num campo que a Whop ignora, com o CPF no lugar dele.
+   * Cada correção acontece uma vez por verificação.
+   */
+  private async completeOpenVerifications(
+    sellerId: string,
+    current: { business: any | null; individual: any | null },
+  ): Promise<{ done: string[]; warnings: string[]; individual: any | null }> {
+    const done: string[] = [];
+    const warnings: string[] = [];
+    let individual: any | null = null;
+
+    const businessOpen = current.business?.id
+      && !['approved', 'rejected'].includes(String(current.business.status))
+      && !(await this.alreadyLogged(sellerId, BUSINESS_TIN_SENT, current.business.id));
+    const individualWaiting = current.individual?.id && current.individual.status === 'pending';
+    if (!businessOpen && !individualWaiting) return { done, warnings, individual };
+
+    let source: Awaited<ReturnType<WhopConnectService['loadSellerSource']>>;
+    try {
+      source = await this.loadSellerSource(sellerId);
+    } catch (err: any) {
+      return { done, warnings: [`não foi possível ler o cadastro: ${this.errorMessage(err)}`], individual };
+    }
+
+    if (businessOpen) {
+      const ein = companyFrom(source.documents).ein;
+      if (!ein) {
+        warnings.push('EIN não corrigido na Whop: o cadastro não tem EIN válido');
+      } else {
+        try {
+          await this.whop.updateVerification(current.business.id, { tax_identification_number: ein });
+          await this.log(sellerId, null, BUSINESS_TIN_SENT, { verification_id: current.business.id });
+          done.push('EIN enviado à verificação da empresa');
+        } catch (err: any) {
+          warnings.push(`a Whop recusou o EIN: ${this.errorMessage(err)}`);
+        }
+      }
+    }
+
+    if (individualWaiting) {
+      if (await this.alreadyLogged(sellerId, IDENTITY_DOCUMENTS_SENT, current.individual.id)) {
+        warnings.push('documento e selfie já enviados; a Whop ainda não começou a análise da pessoa');
+      } else {
+        const identityDocs = await this.identityDocumentsPayload(source.documents);
+        if (!identityDocs.payload) {
+          warnings.push(identityDocs.warning ?? 'documento da pessoa não enviado à Whop');
+        } else {
+          try {
+            const updated = await this.whop.updateVerification(current.individual.id, identityDocs.payload);
+            await this.log(sellerId, null, IDENTITY_DOCUMENTS_SENT, { verification_id: current.individual.id });
+            individual = updated?.id ? updated : null;
+            done.push(`documento e selfie enviados à verificação da pessoa${updated?.status ? ` (${updated.status})` : ''}`);
+          } catch (err: any) {
+            warnings.push(`a Whop recusou o documento da pessoa: ${this.errorMessage(err)}`);
+          }
+        }
+      }
+    }
+
+    return { done, warnings, individual };
+  }
+
+  /** Esta correção já foi feita nesta verificação? */
+  private async alreadyLogged(sellerId: string, action: string, verificationId: string): Promise<boolean> {
+    const { data, error } = await supabase
+      .from('crm_action_log')
+      .select('id')
+      .eq('seller_id', sellerId)
+      .eq('action', action)
+      .eq('payload->>verification_id', verificationId)
+      .limit(1);
+    // Sem conseguir ler o log, melhor não reenviar arquivos às cegas.
+    if (error) return true;
+    return (data ?? []).length > 0;
   }
 
   private async loadSellerSource(sellerId: string) {
