@@ -252,6 +252,11 @@ export function connectedOwnerEmail(
   return `${local.split('+')[0]}@${domain}`;
 }
 
+/** Recusa da Whop por endereço da empresa (ZIP que não bate com o estado, etc.). */
+export function isAddressRejection(message: string): boolean {
+  return /postal code|business address|zip/i.test(String(message ?? ''));
+}
+
 /** Erro da Whop que diz respeito ao e-mail do dono, e não ao cadastro do seller. */
 export function isOwnerEmailRejection(message: string): boolean {
   return /invalid email|real email address/i.test(String(message ?? ''));
@@ -261,6 +266,13 @@ export interface ConnectedAccountSettings {
   send_customer_emails: false;
   tax_remitted_by: 'self';
   tax_type: 'inclusive';
+  /**
+   * Nenhum estado: ao virar `self`, a Whop liga a coleta de sales tax nos 51
+   * estados, e parte de toda venda a comprador americano viraria imposto que a
+   * LLC teria de recolher em cada um. Decisão do dono (2026-09-18): o seller é
+   * o responsável, mas nada é calculado na venda.
+   */
+  tax_collection_enabled_states: string[];
   product_tax_code_id?: string;
 }
 
@@ -272,8 +284,35 @@ export function connectedAccountSettings(env: NodeJS.ProcessEnv = process.env): 
     send_customer_emails: false,
     tax_remitted_by: 'self',
     tax_type: 'inclusive',
+    tax_collection_enabled_states: [],
     ...(taxCode.startsWith('ptc_') ? { product_tax_code_id: taxCode } : {}),
   };
+}
+
+// ─── Produto da cobrança: descritor na fatura ───────────────────────────────
+//
+// A conta conectada cobra num produto único (`external_identifier: koopfy`,
+// o mesmo que o whop.provider usa no plano). O que o comprador vê na fatura do
+// cartão é o `custom_statement_descriptor` DESTE produto — não há campo na
+// conta. `WHOP*KOOPFY` (decisão do dono, 2026-09-18) é o mesmo nome que a área
+// do cliente e o e-mail de confirmação mostram: fatura e tela têm de bater.
+// O prefixo entra no valor: a Whop guarda como mandado (testado).
+
+export const KOOPFY_PRODUCT_EXTERNAL_ID = 'koopfy';
+export const KOOPFY_PRODUCT_TITLE = 'Koopfy';
+export const CONNECTED_STATEMENT_DESCRIPTOR_DEFAULT = 'WHOP*KOOPFY';
+
+/** Regras da Whop: 5 a 22 caracteres, ao menos uma letra, sem < > \ ' ". */
+export function isValidStatementDescriptor(value: unknown): value is string {
+  const text = String(value ?? '');
+  return text.length >= 5 && text.length <= 22 && /[a-z]/i.test(text) && !/[<>\\'"]/.test(text);
+}
+
+export function connectedStatementDescriptor(
+  value: string | undefined = process.env.WHOP_CONNECTED_STATEMENT_DESCRIPTOR,
+): string {
+  const text = String(value ?? '').trim().toUpperCase();
+  return isValidStatementDescriptor(text) ? text : CONNECTED_STATEMENT_DESCRIPTOR_DEFAULT;
 }
 
 /**
@@ -290,6 +329,11 @@ export function accountSettingsPatch(
   }
   if (account?.tax_remitted_by !== desired.tax_remitted_by) patch.tax_remitted_by = desired.tax_remitted_by;
   if (account?.tax_type !== desired.tax_type) patch.tax_type = desired.tax_type;
+  const states = Array.isArray(account?.tax_collection_enabled_states) ? account.tax_collection_enabled_states : [];
+  const wanted = desired.tax_collection_enabled_states;
+  if (states.length !== wanted.length || states.some((state: string) => !wanted.includes(state))) {
+    patch.tax_collection_enabled_states = wanted;
+  }
   if (desired.product_tax_code_id) {
     const current = account?.product_tax_code?.id ?? account?.product_tax_code_id ?? null;
     if (current !== desired.product_tax_code_id) patch.product_tax_code_id = desired.product_tax_code_id;

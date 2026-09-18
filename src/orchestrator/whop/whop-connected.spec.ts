@@ -1,5 +1,7 @@
 import * as crypto from 'crypto';
 import {
+  connectedStatementDescriptor,
+  isValidStatementDescriptor,
   identityDocumentsPlan,
   accountSettingsPatch,
   connectedAccountSettings,
@@ -487,12 +489,19 @@ describe('dono da conta conectada', () => {
 });
 
 describe('configuração da conta conectada', () => {
-  it('imposto da LLC, incluso no preço, sem e-mail ao comprador', () => {
+  it('imposto da LLC, incluso no preço, sem e-mail ao comprador e sem estado coletando', () => {
     expect(connectedAccountSettings({})).toEqual({
       send_customer_emails: false,
       tax_remitted_by: 'self',
       tax_type: 'inclusive',
+      tax_collection_enabled_states: [],
     });
+  });
+
+  it('desliga a coleta que a Whop liga sozinha ao virar self', () => {
+    const conta = { send_customer_emails: false, tax_remitted_by: 'self', tax_type: 'inclusive', tax_collection_enabled_states: ['CA', 'NY'] };
+    expect(accountSettingsPatch(conta, connectedAccountSettings({}))).toEqual({ tax_collection_enabled_states: [] });
+    expect(accountSettingsPatch({ ...conta, tax_collection_enabled_states: [] }, connectedAccountSettings({}))).toBeNull();
   });
 
   it('classificação fiscal só entra com um id ptc_ válido', () => {
@@ -502,14 +511,14 @@ describe('configuração da conta conectada', () => {
 
   it('sync só manda o que está diferente', () => {
     const desired = connectedAccountSettings({ WHOP_CONNECTED_PRODUCT_TAX_CODE_ID: 'ptc_saas' });
-    const certa = { send_customer_emails: false, tax_remitted_by: 'self', tax_type: 'inclusive', product_tax_code: { id: 'ptc_saas' } };
+    const certa = { send_customer_emails: false, tax_remitted_by: 'self', tax_type: 'inclusive', tax_collection_enabled_states: [], product_tax_code: { id: 'ptc_saas' } };
     expect(accountSettingsPatch(certa, desired)).toBeNull();
 
     expect(accountSettingsPatch({ ...certa, tax_type: 'exclusive', send_customer_emails: true }, desired))
       .toEqual({ tax_type: 'inclusive', send_customer_emails: false });
   });
 
-  it('conta nunca configurada recebe tudo', () => {
+  it('conta nunca configurada recebe tudo (lista vazia não gera patch)', () => {
     expect(accountSettingsPatch({}, connectedAccountSettings({}))).toEqual({
       send_customer_emails: false,
       tax_remitted_by: 'self',
@@ -559,5 +568,24 @@ describe('documentos da pessoa direto na verificação', () => {
     const plan = identityDocumentsPlan({ selfie_path: 'u1/s.jpg' });
     expect(plan.documentType).toBeNull();
     expect(plan.problems[0].key).toBe('identity_document_type');
+  });
+});
+
+describe('descritor da fatura', () => {
+  it('padrão é WHOP*KOOPFY, o mesmo nome da área do cliente', () => {
+    expect(connectedStatementDescriptor(undefined)).toBe('WHOP*KOOPFY');
+  });
+
+  it('segue as regras da Whop: 5 a 22, com letra, sem aspas nem < > \\', () => {
+    expect(isValidStatementDescriptor('WHOP*KOOPFY')).toBe(true);
+    expect(isValidStatementDescriptor('KOOP')).toBe(false);
+    expect(isValidStatementDescriptor('WHOP*UM NOME LONGO DEMAIS')).toBe(false);
+    expect(isValidStatementDescriptor('12345')).toBe(false);
+    expect(isValidStatementDescriptor('WHOP*"X"')).toBe(false);
+  });
+
+  it('valor inválido no env cai no padrão, em vez de derrubar o produto', () => {
+    expect(connectedStatementDescriptor('x')).toBe('WHOP*KOOPFY');
+    expect(connectedStatementDescriptor('whop*loja')).toBe('WHOP*LOJA');
   });
 });

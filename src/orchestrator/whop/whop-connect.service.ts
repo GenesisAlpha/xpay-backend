@@ -28,7 +28,11 @@ import {
   accountSettingsPatch,
   connectedAccountSettings,
   connectedOwnerEmail,
+  connectedStatementDescriptor,
+  KOOPFY_PRODUCT_EXTERNAL_ID,
+  KOOPFY_PRODUCT_TITLE,
   isOwnerEmailRejection,
+  isAddressRejection,
   planRfiAnswers,
   sellerRequirementItems,
   toConnectedProviderAccountId,
@@ -341,10 +345,29 @@ export class WhopConnectService implements OnModuleInit {
         await this.whop.updateAccount(row.whop_account_id, settingsPatch);
         await this.log(sellerId, null, 'whop_connect.settings_applied', settingsPatch);
         report.done.push(`configuração aplicada (${Object.keys(settingsPatch).join(', ')})`);
+        await this.settleTaxStates(sellerId, row.whop_account_id, settingsPatch, report);
       } catch (err: any) {
-        report.warnings.push(`a Whop recusou a configuração de imposto/e-mails: ${this.errorMessage(err)}`);
+        // A Whop valida o endereço GUARDADO nela em qualquer alteração da conta.
+        // Endereço errado na criação (ex.: estado de abertura no lugar do estado
+        // do endereço) travava tudo; corrigido o cadastro, vai junto e destrava.
+        const retried = isAddressRejection(this.errorMessage(err))
+          ? await this.retryWithRegisteredAddress(sellerId, row.whop_account_id, settingsPatch)
+          : null;
+        if (retried?.ok) {
+          report.done.push(`configuração aplicada com o endereço do cadastro (${Object.keys(settingsPatch).join(', ')}, business_address)`);
+          await this.settleTaxStates(sellerId, row.whop_account_id, settingsPatch, report);
+        } else {
+          report.warnings.push(
+            `a Whop recusou a configuração de imposto/e-mails: ${retried?.error ?? this.errorMessage(err)}`,
+          );
+        }
       }
     }
+
+    // Descritor da fatura: vive no produto da cobrança, não na conta.
+    const product = await this.ensureCheckoutProduct(row.whop_account_id);
+    if (product.done) report.done.push(product.done);
+    if (product.warning) report.warnings.push(product.warning);
 
     // Sem a lista de verificações ainda dá para sincronizar status/capacidades.
     const verifications = await this.whop.listVerifications(row.whop_account_id).catch((err: any) => {
@@ -1443,6 +1466,76 @@ export class WhopConnectService implements OnModuleInit {
     }
 
     return { done, warnings, individual };
+  }
+
+  /**
+   * Descritor da fatura no produto em que a conta conectada cobra
+   * (`external_identifier: koopfy`). Só ATUALIZA: produto criado pela API de
+   * produtos nunca ganha o `external_identifier` (a Whop ignora o campo no POST
+   * e no PATCH — testado em 2026-09-18), então a cobrança não o acharia e
+   * criaria outro. Quem cria o produto é a primeira venda; o webhook dela chama
+   * este passo e a partir daí toda venda sai com o descritor.
+   */
+  async ensureCheckoutProduct(accountId: string): Promise<{ done?: string; warning?: string }> {
+    const descriptor = connectedStatementDescriptor();
+    const taxCode = connectedAccountSettings().product_tax_code_id;
+    try {
+      const list = await this.whop.listProducts(accountId);
+      const existing = (list?.data ?? []).find((item: any) => item?.external_identifier === KOOPFY_PRODUCT_EXTERNAL_ID);
+      if (!existing) return {}; // ainda sem venda: a primeira cria o produto
+      const current = await this.whop.getProduct(existing.id);
+      const taxOk = !taxCode || (current?.product_tax_code?.id ?? current?.product_tax_code_id) === taxCode;
+      if (current?.custom_statement_descriptor === descriptor && taxOk) return {};
+      await this.whop.updateProduct(existing.id, {
+        custom_statement_descriptor: descriptor,
+        ...(taxCode ? { product_tax_code_id: taxCode } : {}),
+      });
+      return { done: `descritor da fatura: ${descriptor}` };
+    } catch (err: any) {
+      return { warning: `a Whop recusou o descritor da fatura: ${this.errorMessage(err)}` };
+    }
+  }
+
+  /**
+   * Ao virar `tax_remitted_by: self`, a Whop liga sozinha a coleta de sales tax
+   * nos 51 estados — DEPOIS do nosso PATCH, mesmo com a lista vazia nele
+   * (visto em 2026-09-18). Relê a conta e zera de novo.
+   */
+  private async settleTaxStates(
+    sellerId: string,
+    whopAccountId: string,
+    applied: Record<string, any>,
+    report: { done: string[]; warnings: string[] },
+  ) {
+    if (!('tax_remitted_by' in applied)) return;
+    try {
+      const account = await this.whop.getAccount(whopAccountId);
+      const again = accountSettingsPatch(account, connectedAccountSettings());
+      if (!again?.tax_collection_enabled_states) return;
+      await this.whop.updateAccount(whopAccountId, { tax_collection_enabled_states: again.tax_collection_enabled_states });
+      await this.log(sellerId, null, 'whop_connect.settings_applied', { tax_collection_enabled_states: again.tax_collection_enabled_states });
+      report.done.push('coleta de imposto desligada nos estados que a Whop ligou');
+    } catch (err: any) {
+      report.warnings.push(`não foi possível desligar a coleta de imposto por estado: ${this.errorMessage(err)}`);
+    }
+  }
+
+  /** Reenvia a configuração com o endereço da LLC que está no cadastro. */
+  private async retryWithRegisteredAddress(
+    sellerId: string,
+    whopAccountId: string,
+    settingsPatch: Record<string, any>,
+  ): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const source = await this.loadSellerSource(sellerId);
+      const address = companyFrom(source.documents).address;
+      if (!address) return { ok: false, error: 'endereço da LLC inválido no cadastro — corrija rua, cidade, estado e ZIP' };
+      await this.whop.updateAccount(whopAccountId, { ...settingsPatch, business_address: address });
+      await this.log(sellerId, null, 'whop_connect.settings_applied', { ...settingsPatch, business_address: address });
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: `${this.errorMessage(err)} (confira o estado e o ZIP da LLC no cadastro)` };
+    }
   }
 
   /** Esta correção já foi feita nesta verificação? */

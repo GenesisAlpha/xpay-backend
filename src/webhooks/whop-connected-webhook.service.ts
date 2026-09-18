@@ -146,6 +146,20 @@ export class WhopConnectedWebhookService {
 
     const result = await this.webhooks.handleWhopWebhook(providerAccountId, body, rawBody, headers)
 
+    // A primeira venda cria o produto da conta (sem descritor); gravar aqui faz
+    // todas as seguintes saírem com o nome certo na fatura. Barato quando já
+    // está certo (uma listagem e uma leitura) e nunca derruba o evento.
+    if (eventType === 'payment.succeeded') {
+      // Promise.resolve().then: até uma falha síncrona vira rejeição e cai no
+      // catch — o pagamento já foi processado e não pode quebrar aqui.
+      await Promise.resolve()
+        .then(() => this.connect.ensureCheckoutProduct(whopAccountId))
+        .then(r => {
+          if (r?.warning) console.error(`[WhopConnectedWebhook] descritor da conta ${whopAccountId}: ${r.warning}`)
+        })
+        .catch((err: any) => console.error(`[WhopConnectedWebhook] descritor da conta ${whopAccountId}:`, err?.message))
+    }
+
     if (eventType === 'dispute.created' || eventType === 'refund.created') {
       const data = body?.data ?? {}
       const eventId = String(data?.id ?? body?.id)

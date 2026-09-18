@@ -1,7 +1,7 @@
 import { ChargeResponse } from './provider.types';
 import { whopRenewalTerms } from './whop-subscription-terms';
 import { supabase } from '../../lib/supabase.client';
-import { connectedApplicationFee } from '../whop/whop-connected';
+import { KOOPFY_PRODUCT_EXTERNAL_ID, connectedApplicationFee } from '../whop/whop-connected';
 import { maskedPlanTitle } from './whop-plan-title';
 
 /** Membership da Whop reduzida ao que a área do cliente usa. */
@@ -1129,7 +1129,9 @@ export class WhopProvider {
 
     return {
       product: {
-        external_identifier: String(config?.product_external_id ?? 'koopfy'),
+        // O mesmo produto em que o sync grava o descritor da fatura (ver
+        // KOOPFY_PRODUCT_EXTERNAL_ID em whop-connected.ts).
+        external_identifier: String(config?.product_external_id ?? KOOPFY_PRODUCT_EXTERNAL_ID),
         title: String(config?.product_title ?? 'Koopfy').slice(0, WHOP_PLAN_TITLE_MAX),
       },
     };

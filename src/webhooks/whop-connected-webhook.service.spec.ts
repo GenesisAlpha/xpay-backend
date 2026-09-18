@@ -35,6 +35,7 @@ function setup(row: any = { seller_id: 'seller-1', whop_account_id: 'biz_seller'
     sync: jest.fn().mockResolvedValue({}),
     recordRiskSignal: jest.fn().mockResolvedValue(undefined),
     coverNegativeBalance: jest.fn().mockResolvedValue({ covered: [] }),
+    ensureCheckoutProduct: jest.fn().mockResolvedValue({}),
   };
   return { service: new WhopConnectedWebhookService(webhooks as any, connect as any), webhooks, connect };
 }
@@ -147,6 +148,19 @@ describe('WhopConnectedWebhookService', () => {
 
     expect(webhooks.handleWhopWebhook).toHaveBeenCalledWith('whopc_biz_seller', body, raw, headers);
     expect(connect.coverNegativeBalance).not.toHaveBeenCalled();
+    // A venda aprovada grava o descritor no produto que ela acabou de criar.
+    expect(connect.ensureCheckoutProduct).toHaveBeenCalledWith('biz_seller');
+  });
+
+  it('falha ao gravar o descritor não derruba o pagamento', async () => {
+    const { service, webhooks, connect } = setup();
+    connect.ensureCheckoutProduct.mockImplementation(() => { throw new Error('whop fora'); });
+    const body = paymentBody({ koopfy_transaction_id: 'tx-1', koopfy_seller_id: 'seller-1', koopfy_account_id: 'whopc_biz_seller' });
+    const { raw, headers } = signed(body);
+    mockTransaction({ id: 'tx-1', seller_id: 'seller-1', provider_account_id: 'whopc_biz_seller' });
+
+    await expect(service.handle(body, raw, headers)).resolves.toEqual({ received: true });
+    expect(webhooks.handleWhopWebhook).toHaveBeenCalled();
   });
 
   it('evento que aponta para transação de outro seller não toca em nada', async () => {

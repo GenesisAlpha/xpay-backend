@@ -74,6 +74,18 @@ export class WhopPlatformClient {
     return this.request('PATCH', `/verifications/${encodeURIComponent(verificationId)}`, { body });
   }
 
+  listProducts(accountId: string) {
+    return this.request('GET', '/products', { query: { account_id: accountId, first: '100' } });
+  }
+
+  getProduct(productId: string) {
+    return this.request('GET', `/products/${encodeURIComponent(productId)}`);
+  }
+
+  updateProduct(productId: string, body: Record<string, any>) {
+    return this.request('PATCH', `/products/${encodeURIComponent(productId)}`, { body });
+  }
+
   /**
    * Link hospedado e temporário para a conta conectada (ex.: `account_onboarding`,
    * o formulário de verificação). ⚠️ O token dele carrega permissões de saque e
