@@ -1,5 +1,8 @@
 import * as crypto from 'crypto';
 import {
+  accountSettingsPatch,
+  connectedAccountSettings,
+  connectedOwnerEmail,
   CONNECTED_FALLBACK_MAX_MS,
   checkConnectedEventOwnership,
   classifyConnectedRisk,
@@ -454,5 +457,53 @@ describe('verifyWhopWebhookSignature', () => {
     expect(verifyWhopWebhookSignature('{"type":"x"}', headers(), secret, 300, now).valid).toBe(false);
     expect(verifyWhopWebhookSignature(body, headers(body, now - 600), secret, 300, now).valid).toBe(false);
     expect(verifyWhopWebhookSignature(body, {}, secret, 300, now).valid).toBe(false);
+  });
+});
+
+describe('dono da conta conectada', () => {
+  const seller = '5eb29c87-7b85-464d-b373-9e00c23c5b2e';
+
+  it('é a caixa da Koopfy com o seller no "+", nunca o e-mail dele', () => {
+    expect(connectedOwnerEmail(seller, 'contas@koopfy.com')).toBe(`contas+${seller}@koopfy.com`);
+  });
+
+  it('base já com "+" não vira endereço com dois', () => {
+    expect(connectedOwnerEmail(seller, 'Contas+whop@Koopfy.com')).toBe(`contas+${seller}@koopfy.com`);
+  });
+
+  it('base inválida falha alto, em vez de criar conta com e-mail quebrado', () => {
+    expect(() => connectedOwnerEmail(seller, 'contas')).toThrow(/inválido/);
+  });
+});
+
+describe('configuração da conta conectada', () => {
+  it('imposto da LLC, incluso no preço, sem e-mail ao comprador', () => {
+    expect(connectedAccountSettings({})).toEqual({
+      send_customer_emails: false,
+      tax_remitted_by: 'self',
+      tax_type: 'inclusive',
+    });
+  });
+
+  it('classificação fiscal só entra com um id ptc_ válido', () => {
+    expect(connectedAccountSettings({ WHOP_CONNECTED_PRODUCT_TAX_CODE_ID: 'ptc_saas' }).product_tax_code_id).toBe('ptc_saas');
+    expect(connectedAccountSettings({ WHOP_CONNECTED_PRODUCT_TAX_CODE_ID: 'Digital - SaaS' }).product_tax_code_id).toBeUndefined();
+  });
+
+  it('sync só manda o que está diferente', () => {
+    const desired = connectedAccountSettings({ WHOP_CONNECTED_PRODUCT_TAX_CODE_ID: 'ptc_saas' });
+    const certa = { send_customer_emails: false, tax_remitted_by: 'self', tax_type: 'inclusive', product_tax_code: { id: 'ptc_saas' } };
+    expect(accountSettingsPatch(certa, desired)).toBeNull();
+
+    expect(accountSettingsPatch({ ...certa, tax_type: 'exclusive', send_customer_emails: true }, desired))
+      .toEqual({ tax_type: 'inclusive', send_customer_emails: false });
+  });
+
+  it('conta nunca configurada recebe tudo', () => {
+    expect(accountSettingsPatch({}, connectedAccountSettings({}))).toEqual({
+      send_customer_emails: false,
+      tax_remitted_by: 'self',
+      tax_type: 'inclusive',
+    });
   });
 });

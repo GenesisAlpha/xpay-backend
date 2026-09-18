@@ -23,6 +23,9 @@ import {
   negativeFiatBalances,
   planBusinessVerification,
   planIndividualVerification,
+  accountSettingsPatch,
+  connectedAccountSettings,
+  connectedOwnerEmail,
   planRfiAnswers,
   sellerRequirementItems,
   toConnectedProviderAccountId,
@@ -184,7 +187,9 @@ export class WhopConnectService implements OnModuleInit {
       if (!whopAccountId) {
         const account = await this.whop.createAccount(
           {
-            email: source.seller.email,
+            // Dono = caixa da Koopfy, não o seller: é para o dono que a Whop
+            // manda verificação, saque e disputa (ver connectedOwnerEmail).
+            email: connectedOwnerEmail(sellerId),
             // Título = nome que a Whop usa no extrato do comprador: a marca da
             // loja reconhecida por ele, não a razão social da LLC.
             title: String(source.seller.name || plan.account.business_name).slice(0, 80),
@@ -204,7 +209,9 @@ export class WhopConnectService implements OnModuleInit {
         await this.updateRow(sellerId, { whop_account_id: whopAccountId });
       }
 
-      await this.whop.updateAccount(whopAccountId, { ...plan.account, send_customer_emails: false });
+      // Imposto da LLC, incluso no preço, sem e-mail ao comprador — ver
+      // connectedAccountSettings.
+      await this.whop.updateAccount(whopAccountId, { ...plan.account, ...connectedAccountSettings() });
 
       // A chave muda quando os documentos mudam: reenviar depois de uma
       // recusa com documento novo cria outra verificação; clique duplo não.
@@ -284,6 +291,16 @@ export class WhopConnectService implements OnModuleInit {
       const message = this.errorMessage(err);
       await this.updateRow(sellerId, { last_error: message.slice(0, 500) }).catch(() => { /* best-effort */ });
       throw new BadRequestException(`Não foi possível ler a conta na Whop: ${message}`);
+    }
+
+    // Conta criada antes destas regras (ou alterada no painel da Whop): o sync
+    // devolve a configuração certa. Só manda o que difere, para não fazer
+    // PATCH a cada webhook; falhar aqui não derruba o sync.
+    const settingsPatch = accountSettingsPatch(account, connectedAccountSettings());
+    if (settingsPatch) {
+      await this.whop.updateAccount(row.whop_account_id, settingsPatch)
+        .then(() => this.log(sellerId, null, 'whop_connect.settings_applied', settingsPatch))
+        .catch((err: any) => console.error(`[WhopConnect] configuração de ${row.whop_account_id}:`, this.errorMessage(err)));
     }
 
     // Sem a lista de verificações ainda dá para sincronizar status/capacidades.
@@ -390,7 +407,9 @@ export class WhopConnectService implements OnModuleInit {
       const { answers, unanswered } = planRfiAnswers(pending, {
         kyc: source.kyc,
         docs: source.documents,
-        email: source.seller.email,
+        // Contato da conta = a mesma caixa do dono. Com o e-mail do seller
+        // aqui, a Whop voltaria a falar com ele direto.
+        email: connectedOwnerEmail(sellerId),
         description: source.description,
         website: source.website,
       }, { retryRequirements: [...retry] });

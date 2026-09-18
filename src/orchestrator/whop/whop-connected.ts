@@ -218,6 +218,80 @@ function extensionOf(path: string): string {
   return match ? match[1].toLowerCase() : '';
 }
 
+// ─── Configuração da conta conectada na Whop ────────────────────────────────
+//
+// Decisões do dono (2026-09-17):
+//
+//   • o DONO da conta na Whop é uma caixa da Koopfy (`contas+<seller>@…`), não
+//     o seller: é para o dono que a Whop manda verificação, saque, disputa e
+//     formulário fiscal. Com o e-mail dele, o seller recebia tudo direto da
+//     Whop e ainda ganhava login lá. A caixa precisa aceitar "+";
+//   • o imposto é da LLC do seller (`tax_remitted_by: self`) e vem INCLUSO no
+//     preço — o comprador paga o que viu no checkout, e as taxas da Koopfy
+//     são calculadas sobre esse mesmo valor;
+//   • classificação fiscal padrão "Digital - SaaS". O id (`ptc_…`) não tem
+//     endpoint de listagem documentado, então vem por env; sem ele, o resto
+//     da configuração vale igual.
+
+export const CONNECTED_OWNER_EMAIL_DEFAULT = 'contas@koopfy.com';
+
+/**
+ * E-mail do dono da conta conectada: a caixa base com o seller no "+", para
+ * cada conta ter um endereço único (a Whop não aceita repetir) e tudo cair
+ * numa caixa só.
+ */
+export function connectedOwnerEmail(
+  sellerId: string,
+  base: string = process.env.WHOP_CONNECTED_OWNER_EMAIL ?? CONNECTED_OWNER_EMAIL_DEFAULT,
+): string {
+  const [local, domain] = String(base).trim().toLowerCase().split('@');
+  if (!local || !domain) throw new Error(`WHOP_CONNECTED_OWNER_EMAIL inválido: "${base}"`);
+  // Já com "+": usa só a parte antes dele, senão viraria "contas+x+seller".
+  const mailbox = local.split('+')[0];
+  const tag = String(sellerId).toLowerCase().replace(/[^a-z0-9-]/g, '');
+  return `${mailbox}+${tag}@${domain}`;
+}
+
+export interface ConnectedAccountSettings {
+  send_customer_emails: false;
+  tax_remitted_by: 'self';
+  tax_type: 'inclusive';
+  product_tax_code_id?: string;
+}
+
+/** O que toda conta conectada precisa ter na Whop. */
+export function connectedAccountSettings(env: NodeJS.ProcessEnv = process.env): ConnectedAccountSettings {
+  const taxCode = String(env.WHOP_CONNECTED_PRODUCT_TAX_CODE_ID ?? '').trim();
+  return {
+    // Nenhum e-mail transacional da Whop para o comprador: quem fala com ele é a Koopfy.
+    send_customer_emails: false,
+    tax_remitted_by: 'self',
+    tax_type: 'inclusive',
+    ...(taxCode.startsWith('ptc_') ? { product_tax_code_id: taxCode } : {}),
+  };
+}
+
+/**
+ * Só o que difere entre a conta na Whop e o desejado — ou null quando já
+ * está certa. É o que o sync manda, para não fazer PATCH a cada webhook.
+ */
+export function accountSettingsPatch(
+  account: any,
+  desired: ConnectedAccountSettings,
+): Partial<ConnectedAccountSettings> | null {
+  const patch: Partial<ConnectedAccountSettings> = {};
+  if (account?.send_customer_emails !== desired.send_customer_emails) {
+    patch.send_customer_emails = desired.send_customer_emails;
+  }
+  if (account?.tax_remitted_by !== desired.tax_remitted_by) patch.tax_remitted_by = desired.tax_remitted_by;
+  if (account?.tax_type !== desired.tax_type) patch.tax_type = desired.tax_type;
+  if (desired.product_tax_code_id) {
+    const current = account?.product_tax_code?.id ?? account?.product_tax_code_id ?? null;
+    if (current !== desired.product_tax_code_id) patch.product_tax_code_id = desired.product_tax_code_id;
+  }
+  return Object.keys(patch).length > 0 ? patch : null;
+}
+
 /** Representante da LLC a partir do KYC (pessoa física no Brasil). Campo inválido vira null. */
 export function representativeFrom(kyc: any) {
   const nameParts = String(kyc?.full_name ?? '').trim().split(/\s+/).filter(Boolean);
