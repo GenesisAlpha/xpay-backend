@@ -98,7 +98,7 @@ describe('planBusinessVerification (LLC)', () => {
       business_structure: 'single_member_llc',
       // EIN no campo que a Whop lê; o CPF vai só na verificação da pessoa.
       tax_identification_number: '12-3456789',
-      business_website: 'https://petalpost.com',
+      // Sem business_website: o site da loja (company_website acima) não sai.
       country: 'US',
       place_of_incorporation: 'WY',
       address: { line1: '30 N Gould St', line2: 'Ste R', city: 'Sheridan', state: 'WY', postal_code: '82801', country: 'US' },
@@ -628,5 +628,15 @@ describe('estados de imposto em conta nova', () => {
     const nova = { send_customer_emails: false, tax_remitted_by: null, tax_type: 'exclusive', tax_collection_enabled_states: ['CA'] };
     expect(accountSettingsPatch(nova, connectedAccountSettings({}))).toEqual({ tax_remitted_by: 'none', tax_type: 'inclusive' });
     expect(newAccountSettings({})).not.toHaveProperty('tax_collection_enabled_states');
+  });
+});
+
+describe('site da loja não vai para a Whop', () => {
+  const { planRfiAnswers } = require('./whop-connected');
+  it('pedido de site fica sem resposta automática, mesmo com site no cadastro', () => {
+    const items = ['business_website', 'social_media_or_website', 'store_page_url'].map((requirement, i) => ({ id: `r${i}`, requirement }));
+    const { answers, unanswered } = planRfiAnswers(items, { kyc: null, docs: { company_website: 'https://loja.com' }, website: 'https://loja.com' } as any);
+    expect(answers).toEqual([]);
+    expect(unanswered.map((u: any) => u.requirement)).toEqual(['business_website', 'social_media_or_website', 'store_page_url']);
   });
 });

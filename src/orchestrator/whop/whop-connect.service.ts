@@ -140,7 +140,7 @@ export class WhopConnectService implements OnModuleInit {
 
   async getStatus(sellerId: string) {
     const [account, source] = await Promise.all([this.getRow(sellerId), this.loadSellerSource(sellerId)]);
-    const plan = planBusinessVerification(source.kyc, source.documents, { website: source.website });
+    const plan = planBusinessVerification(source.kyc, source.documents);
     return {
       sellerId,
       account,
@@ -170,7 +170,7 @@ export class WhopConnectService implements OnModuleInit {
       throw new BadRequestException('Seller sem e-mail: a Whop exige o e-mail do titular.');
     }
 
-    const plan = planBusinessVerification(source.kyc, source.documents, { website: source.website });
+    const plan = planBusinessVerification(source.kyc, source.documents);
     if (plan.missing.length > 0 || !plan.account || !plan.verification) {
       throw new BadRequestException({
         message: 'Dados incompletos para a verificação da Whop.',
@@ -230,7 +230,6 @@ export class WhopConnectService implements OnModuleInit {
             // loja reconhecida por ele, não a razão social da LLC.
             title: String(source.seller.name || plan.account.business_name).slice(0, 80),
             country: 'US',
-            ...(plan.verification.business_website ? { website: plan.verification.business_website } : {}),
             // Nenhum e-mail transacional da Whop para o comprador: quem fala
             // com ele é a Koopfy.
             send_customer_emails: false,
@@ -545,7 +544,6 @@ export class WhopConnectService implements OnModuleInit {
         // Contato da conta = o dono, que é o próprio seller.
         email: source.seller.email,
         description: source.description,
-        website: source.website,
       }, { retryRequirements: [...retry] });
 
       if (answers.length > 0) {
@@ -638,7 +636,7 @@ export class WhopConnectService implements OnModuleInit {
       };
     }
 
-    const plan = planBusinessVerification(source.kyc, source.documents, { website: source.website });
+    const plan = planBusinessVerification(source.kyc, source.documents);
     return {
       companyType,
       connectedStatus,
@@ -1647,7 +1645,7 @@ export class WhopConnectService implements OnModuleInit {
     if (error) throw new BadRequestException(`Erro ao ler o seller: ${error.message}`);
     if (!seller) throw new NotFoundException('Seller não encontrado.');
 
-    const [kyc, documents, operation, offer] = await Promise.all([
+    const [kyc, documents, operation] = await Promise.all([
       seller.user_id
         ? supabase.from('kyc_info').select('*').eq('user_id', seller.user_id).maybeSingle()
         : Promise.resolve({ data: null }),
@@ -1657,16 +1655,13 @@ export class WhopConnectService implements OnModuleInit {
       seller.user_id
         ? supabase.from('operation_config').select('description').eq('user_id', seller.user_id).maybeSingle()
         : Promise.resolve({ data: null }),
-      supabase.from('offers').select('sales_page_url').eq('seller_id', sellerId).limit(1).maybeSingle(),
     ]);
 
-    const website = String((offer as any)?.data?.sales_page_url ?? '').trim();
     return {
       seller,
       kyc: (kyc as any)?.data ?? null,
       documents: (documents as any)?.data ?? null,
       description: (operation as any)?.data?.description ?? null,
-      website: /^https?:\/\//i.test(website) ? website.slice(0, 255) : null,
     };
   }
 

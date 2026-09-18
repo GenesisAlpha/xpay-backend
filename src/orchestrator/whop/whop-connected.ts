@@ -427,8 +427,14 @@ export function representativeFrom(kyc: any) {
   };
 }
 
-/** LLC a partir de seller_documents. Campo inválido vira null. */
-export function companyFrom(docs: any, website?: string | null) {
+/**
+ * LLC a partir de seller_documents. Campo inválido vira null.
+ *
+ * Sem site: o endereço da loja NÃO vai para a Whop (decisão do dono,
+ * 2026-09-18). Ele revela o que o seller vende — a Whop suspendeu uma conta
+ * como "Unsupported business" logo depois de receber o site da loja.
+ */
+export function companyFrom(docs: any) {
   const einDigits = String(docs?.company_ein ?? '').replace(/\D/g, '');
   const address = docs?.company_address ?? null;
   const zip = String(address?.postal_code ?? '').trim();
@@ -436,7 +442,6 @@ export function companyFrom(docs: any, website?: string | null) {
   const validAddress = Boolean(String(address?.line1 ?? '').trim() && String(address?.city ?? '').trim())
     && /^[A-Z]{2}$/.test(state) && /^\d{5}(-\d{4})?$/.test(zip);
   const formationState = String(docs?.company_formation_state ?? '').trim().toUpperCase();
-  const siteCandidate = String(docs?.company_website ?? website ?? '').trim();
 
   return {
     isLlc: docs?.company_type === 'US',
@@ -454,7 +459,6 @@ export function companyFrom(docs: any, website?: string | null) {
         country: 'US',
       } as WhopAddress
       : null,
-    website: /^https?:\/\//i.test(siteCandidate) ? siteCandidate.slice(0, 255) : null,
   };
 }
 
@@ -507,8 +511,8 @@ export interface BusinessVerificationPlan {
  *
  * Devolve TODOS os faltantes de uma vez, para corrigir num passo só.
  */
-export function planBusinessVerification(kyc: any, docs: any, extra: { website?: string | null } = {}): BusinessVerificationPlan {
-  const company = companyFrom(docs, extra.website);
+export function planBusinessVerification(kyc: any, docs: any): BusinessVerificationPlan {
+  const company = companyFrom(docs);
   const rep = representativeFrom(kyc);
   const identity = identitySlotsFrom(docs);
   const gaps: RequirementGap[] = [];
@@ -555,7 +559,6 @@ export function planBusinessVerification(kyc: any, docs: any, extra: { website?:
       // API — era ignorado, e o CPF do representante ocupava o lugar do EIN:
       // a Whop pedia o EIN de novo no "continue verificando".
       tax_identification_number: company.ein,
-      ...(company.website ? { business_website: company.website } : {}),
       country: 'US',
       place_of_incorporation: company.formation_state,
       address: company.address,
@@ -703,11 +706,11 @@ function pickOption(options: any[] | undefined, preferred: Array<string | RegExp
 
 export function planRfiAnswers(
   items: RfiItem[],
-  source: { kyc: any; docs: any; email?: string | null; description?: string | null; website?: string | null },
+  source: { kyc: any; docs: any; email?: string | null; description?: string | null },
   opts: { retryRequirements?: string[] } = {},
 ): { answers: RfiAnswer[]; unanswered: RfiUnanswered[] } {
   const rep = representativeFrom(source.kyc);
-  const company = companyFrom(source.docs, source.website);
+  const company = companyFrom(source.docs);
   const identity = identitySlotsFrom(source.docs);
   const description = String(source.description ?? '').trim();
   const retry = new Set(opts.retryRequirements ?? []);
@@ -764,9 +767,8 @@ export function planRfiAnswers(
         answer = text(item.id, pickOption(item.options, ['Owner', /owner/i, /member/i, /manager/i])); break;
       case 'business_address':
         answer = company.address ? { id: item.id, address: company.address } : null; break;
-      case 'business_website':
-      case 'social_media_or_website':
-      case 'store_page_url': answer = text(item.id, company.website); break;
+      // Site da loja nunca é respondido por nós (ver companyFrom): o pedido
+      // fica pendente para a Koopfy decidir o que informar.
       case 'business_description':
         // A Whop exige 100–1000 caracteres; fora disso quem escreve é o seller.
         answer = text(item.id, description.length >= 100 ? description.slice(0, 1000) : null); break;
@@ -823,9 +825,8 @@ const RFI_ONBOARDING_KEY: Record<string, string> = {
   company_tax_id: 'company_ein',
   business_structure: 'company_structure',
   business_address: 'company_address',
-  business_website: 'company_website',
-  social_media_or_website: 'company_website',
-  store_page_url: 'company_website',
+  // Site: sem campo do cadastro — ele não vai para a Whop (ver companyFrom).
+  // Se ela pedir, aparece como pedido avulso e alguém decide o que responder.
   identity_document: 'identity',
   selfie: 'selfie',
   business_verification_document: 'ein_document',
