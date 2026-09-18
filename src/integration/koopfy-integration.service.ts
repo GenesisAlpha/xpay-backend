@@ -33,6 +33,7 @@ import { ActivationRequestsService } from '../activation/activation-requests.ser
 import { WhopConnectService } from '../orchestrator/whop/whop-connect.service';
 import { WhopLinkedAccountsService } from '../orchestrator/whop/whop-linked.service';
 import { sellerExternalProviderView } from '../orchestrator/whop/whop-linked';
+import { connectedActivationBlocker } from '../orchestrator/whop/whop-connected';
 import {
   buildSubscriptionReport,
   filterTransactionsByWorkspace,
@@ -496,6 +497,25 @@ export class KoopfyIntegrationService {
    * Emite uma nova API key sk_live_ e retorna o texto puro UMA vez — o checkout
    * deve guardá-la (o pay só persiste o hash).
    */
+  private async connectedActivationBlocker(sellerId: string): Promise<string | null> {
+    try {
+      const [requirements, external] = await Promise.all([
+        this.whopConnect.getSellerRequirements(sellerId),
+        this.whopLinked.status(sellerId).catch(() => null),
+      ]);
+      return connectedActivationBlocker({
+        required: Boolean(requirements?.connected?.required),
+        status: requirements?.connected?.status ?? null,
+        externalProviderConnected: Boolean((external as any)?.connected),
+      });
+    } catch (err: any) {
+      // Sem conseguir ler a situação, não trava a ativação por uma falha
+      // passageira — o pior caso é um seller ativar um pouco antes.
+      console.error(`[KoopfyIntegration] checagem da conta conectada de ${sellerId}:`, err?.message);
+      return null;
+    }
+  }
+
   async activate(ctx: SellerCtx) {
     const seller = ctx.seller;
     if (!seller) {
@@ -506,6 +526,12 @@ export class KoopfyIntegrationService {
         `Onboarding ainda não aprovado (status: ${seller.status}).`,
       );
     }
+
+    // Conta conectada ainda em verificação na Whop: não ativa (ver
+    // connectedActivationBlocker). O painel já esconde o botão; isto cobre
+    // chamada direta e painel antigo em cache.
+    const blocker = await this.connectedActivationBlocker(seller.id);
+    if (blocker) throw new ConflictException(blocker);
 
     const publishableKey = generateKey('pk_live');
     const secretKey = generateKey('sk_live');

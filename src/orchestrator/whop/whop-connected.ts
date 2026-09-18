@@ -162,6 +162,25 @@ export function decideConnectedMode(
   return { mode: 'fallback', reason: down, startsNow: !row.fallback_started_at };
 }
 
+/**
+ * Motivo que impede ATIVAR o Koopfy Payments na loja, ou null se pode.
+ *
+ * Decisão do dono (2026-09-18): seller que precisa de conta conectada (toda
+ * conta que não é CNPJ) só ativa depois que a Whop aprovar a verificação — a
+ * conta nunca aparece como ativa antes da hora, e ninguém começa a vender pela
+ * master esperando a verificação. Quem vende na conta Whop própria (modo conta
+ * externa) não depende da conta conectada.
+ */
+export function connectedActivationBlocker(input: {
+  required: boolean;
+  status: string | null | undefined;
+  externalProviderConnected?: boolean;
+}): string | null {
+  if (input.externalProviderConnected) return null;
+  if (!input.required || input.status === 'active') return null;
+  return 'A verificação da sua conta ainda não foi concluída. O Koopfy Payments é ativado nesta loja assim que ela for aprovada.';
+}
+
 /** Motivo que impede ligar o modo conectado, ou null se pode. */
 export function connectedChargeBlocker(row: Pick<WhopConnectedAccountRow, 'whop_account_id' | 'status'>): string | null {
   if (!row.whop_account_id) return 'A conta conectada ainda não foi criada na Whop.';

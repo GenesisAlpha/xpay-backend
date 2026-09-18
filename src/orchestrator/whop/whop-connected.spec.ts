@@ -1,5 +1,6 @@
 import * as crypto from 'crypto';
 import {
+  connectedActivationBlocker,
   connectedStatementDescriptor,
   isValidStatementDescriptor,
   identityDocumentsPlan,
@@ -569,5 +570,22 @@ describe('descritor da fatura', () => {
   it('valor inválido no env cai no padrão, em vez de derrubar o produto', () => {
     expect(connectedStatementDescriptor('x')).toBe('WHOP*KOOPFY');
     expect(connectedStatementDescriptor('whop*loja')).toBe('WHOP*LOJA');
+  });
+});
+
+describe('ativação do Koopfy Payments com conta conectada', () => {
+  it('só ativa depois que a Whop aprova a conta conectada', () => {
+    expect(connectedActivationBlocker({ required: true, status: 'pending_verification' })).toMatch(/verificação/);
+    expect(connectedActivationBlocker({ required: true, status: 'action_required' })).toMatch(/verificação/);
+    expect(connectedActivationBlocker({ required: true, status: null })).toMatch(/verificação/);
+    expect(connectedActivationBlocker({ required: true, status: 'active' })).toBeNull();
+  });
+
+  it('CNPJ não tem conta conectada e ativa normalmente', () => {
+    expect(connectedActivationBlocker({ required: false, status: null })).toBeNull();
+  });
+
+  it('quem vende na conta Whop própria não depende da conta conectada', () => {
+    expect(connectedActivationBlocker({ required: true, status: 'pending_verification', externalProviderConnected: true })).toBeNull();
   });
 });
