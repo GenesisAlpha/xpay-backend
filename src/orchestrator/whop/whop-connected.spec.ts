@@ -5,7 +5,6 @@ import {
   identityDocumentsPlan,
   accountSettingsPatch,
   connectedAccountSettings,
-  connectedOwnerEmail,
   isOwnerEmailRejection,
   CONNECTED_FALLBACK_MAX_MS,
   checkConnectedEventOwnership,
@@ -464,24 +463,7 @@ describe('verifyWhopWebhookSignature', () => {
   });
 });
 
-describe('dono da conta conectada', () => {
-  it('é a caixa da Koopfy, sem "+": a Whop recusa subendereço', () => {
-    expect(connectedOwnerEmail('contas@koopfy.com')).toBe('contas@koopfy.com');
-    expect(connectedOwnerEmail('Contas+whop@Koopfy.com')).toBe('contas@koopfy.com');
-  });
-
-  it('padrão é contas@koopfy.com', () => {
-    expect(connectedOwnerEmail(undefined)).toBe(process.env.WHOP_CONNECTED_OWNER_EMAIL
-      ? connectedOwnerEmail(process.env.WHOP_CONNECTED_OWNER_EMAIL)
-      : 'contas@koopfy.com');
-  });
-
-  it('base inválida falha alto, em vez de criar conta com e-mail quebrado', () => {
-    expect(() => connectedOwnerEmail('contas')).toThrow(/inválido/);
-    expect(() => connectedOwnerEmail('contas@koopfy')).toThrow(/inválido/);
-    expect(() => connectedOwnerEmail('a@b@koopfy.com')).toThrow(/inválido/);
-  });
-
+describe('recusa do e-mail do dono', () => {
   it('reconhece a recusa do e-mail pela Whop', () => {
     expect(isOwnerEmailRejection('You entered an invalid email address. Please enter a real email address.')).toBe(true);
     expect(isOwnerEmailRejection('business_name is required')).toBe(false);

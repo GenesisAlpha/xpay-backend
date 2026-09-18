@@ -220,14 +220,13 @@ function extensionOf(path: string): string {
 
 // ─── Configuração da conta conectada na Whop ────────────────────────────────
 //
-// Decisões do dono (2026-09-17):
+// Decisões do dono (2026-09-17/18):
 //
-//   • o DONO da conta na Whop é a caixa da Koopfy (`contas@koopfy.com`), não o
-//     seller: é para o dono que a Whop manda verificação, saque, disputa e
-//     formulário fiscal. Com o e-mail dele, o seller recebia tudo direto da
-//     Whop e ainda ganhava login lá. SEM "+": a Whop recusa subendereço
-//     ("You entered an invalid email address. Please enter a real email
-//     address", 2026-09-17). A mesma caixa vale para todas as contas;
+//   • o DONO da conta na Whop é o próprio seller (e-mail dele). Um dono comum
+//     a todas as contas foi descartado: dono em comum é sinal clássico para a
+//     processadora ligar contas, e o risco de uma contaminaria as outras — o
+//     oposto do isolamento que justifica a conta conectada. Os avisos da Whop
+//     ao seller são desligados à mão, na conta dele;
 //   • o imposto é da LLC do seller (`tax_remitted_by: self`) e vem INCLUSO no
 //     preço — o comprador paga o que viu no checkout, e as taxas da Koopfy
 //     são calculadas sobre esse mesmo valor;
@@ -235,29 +234,12 @@ function extensionOf(path: string): string {
 //     endpoint de listagem documentado, então vem por env; sem ele, o resto
 //     da configuração vale igual.
 
-export const CONNECTED_OWNER_EMAIL_DEFAULT = 'contas@koopfy.com';
-
-/**
- * E-mail do dono da conta conectada: a caixa da Koopfy, igual para todas as
- * contas. Um "+" configurado por engano é removido — a Whop recusa a criação
- * inteira com ele, e o provisionamento de todo seller novo pararia.
- */
-export function connectedOwnerEmail(
-  base: string = process.env.WHOP_CONNECTED_OWNER_EMAIL ?? CONNECTED_OWNER_EMAIL_DEFAULT,
-): string {
-  const [local, domain, ...rest] = String(base).trim().toLowerCase().split('@');
-  if (!local || !domain || rest.length > 0 || !domain.includes('.')) {
-    throw new Error(`WHOP_CONNECTED_OWNER_EMAIL inválido: "${base}"`);
-  }
-  return `${local.split('+')[0]}@${domain}`;
-}
-
 /** Recusa da Whop por endereço da empresa (ZIP que não bate com o estado, etc.). */
 export function isAddressRejection(message: string): boolean {
   return /postal code|business address|zip/i.test(String(message ?? ''));
 }
 
-/** Erro da Whop que diz respeito ao e-mail do dono, e não ao cadastro do seller. */
+/** Recusa da Whop pelo e-mail do dono (o do seller), e não pelo resto do cadastro. */
 export function isOwnerEmailRejection(message: string): boolean {
   return /invalid email|real email address/i.test(String(message ?? ''));
 }

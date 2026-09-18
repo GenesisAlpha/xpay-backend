@@ -27,7 +27,6 @@ import {
   companyFrom,
   accountSettingsPatch,
   connectedAccountSettings,
-  connectedOwnerEmail,
   connectedStatementDescriptor,
   KOOPFY_PRODUCT_EXTERNAL_ID,
   KOOPFY_PRODUCT_TITLE,
@@ -197,11 +196,14 @@ export class WhopConnectService implements OnModuleInit {
       let whopAccountId = row.whop_account_id;
 
       if (!whopAccountId) {
-        const ownerEmail = connectedOwnerEmail();
+        // Dono = o próprio seller. Cada conta com dono próprio mantém o risco
+        // isolado (dono em comum é sinal clássico para a Whop ligar contas: o
+        // bloqueio de uma derrubaria as outras) e segue a orientação da Whop
+        // ("the email should belong to the connected account"). Os avisos da
+        // Whop ao seller são desligados à mão, na conta dele (2026-09-18).
+        const ownerEmail = String(source.seller.email ?? '').trim().toLowerCase();
         const account = await this.whop.createAccount(
           {
-            // Dono = caixa da Koopfy, não o seller: é para o dono que a Whop
-            // manda verificação, saque e disputa (ver connectedOwnerEmail).
             email: ownerEmail,
             // Título = nome que a Whop usa no extrato do comprador: a marca da
             // loja reconhecida por ele, não a razão social da LLC.
@@ -298,12 +300,12 @@ export class WhopConnectService implements OnModuleInit {
       const message = this.errorMessage(err);
       await this.updateRow(sellerId, { last_error: message.slice(0, 500) }).catch(() => { /* best-effort */ });
       await this.log(sellerId, managerId, 'whop_connect.provision_failed', { error: message });
-      // O e-mail recusado é o da Koopfy, não o do seller: dizer isso evita que o
-      // time vá corrigir o cadastro dele à toa.
+      // Recusa do e-mail: o problema é o endereço do seller, não o resto do
+      // cadastro — dizer isso poupa o time de procurar no lugar errado.
       if (isOwnerEmailRejection(message)) {
         throw new BadRequestException(
-          `A Whop recusou o e-mail do dono da conta (${connectedOwnerEmail()}). `
-          + 'Confira se a caixa existe e recebe e-mail, ou ajuste WHOP_CONNECTED_OWNER_EMAIL. '
+          `A Whop recusou o e-mail do seller (${source.seller.email ?? 'sem e-mail'}). `
+          + 'Confira se ele é real e recebe mensagens. '
           + `Resposta da Whop: ${message}`,
         );
       }
@@ -512,9 +514,8 @@ export class WhopConnectService implements OnModuleInit {
       const { answers, unanswered } = planRfiAnswers(pending, {
         kyc: source.kyc,
         docs: source.documents,
-        // Contato da conta = a mesma caixa do dono. Com o e-mail do seller
-        // aqui, a Whop voltaria a falar com ele direto.
-        email: connectedOwnerEmail(),
+        // Contato da conta = o dono, que é o próprio seller.
+        email: source.seller.email,
         description: source.description,
         website: source.website,
       }, { retryRequirements: [...retry] });
