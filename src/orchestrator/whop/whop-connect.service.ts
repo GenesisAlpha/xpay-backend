@@ -590,10 +590,48 @@ export class WhopConnectService implements OnModuleInit {
     return {
       companyType,
       connectedStatus,
-      connected: { required: true, ready: plan.missing.length === 0, status: connectedStatus },
+      connected: {
+        required: true,
+        ready: plan.missing.length === 0,
+        status: connectedStatus,
+        // A verificação da empresa só se conclui no formulário da Whop (EIN e
+        // papéis da LLC): o painel mostra o botão enquanto ela não for aprovada.
+        businessPending: Boolean(row?.whop_account_id)
+          && !['approved', 'rejected'].includes(String(row?.verification_status ?? '')),
+      },
       switchToLlc: false,
       items: sellerRequirementItems(plan.gaps, row?.rfi_unanswered ?? []),
     };
+  }
+
+  /**
+   * Link para o seller concluir a verificação da empresa no formulário da Whop.
+   * A Whop não conclui KYB por API: o EIN enviado vai para o perfil fiscal, não
+   * para o formulário (testado em 2026-09-18). Gerado a cada clique porque
+   * vale ~1h e o token dá acesso a saque — nada disso fica gravado.
+   */
+  async onboardingLink(sellerId: string) {
+    const row = await this.getRow(sellerId);
+    if (!row?.whop_account_id) throw new NotFoundException('A conta conectada ainda não foi criada.');
+    if (row.verification_status === 'approved') {
+      throw new BadRequestException('A verificação da empresa já foi aprovada.');
+    }
+
+    const back = process.env.CHECKOUT_PAYMENTS_URL ?? 'https://app.koopfy.com/checkout/payments?modal=koopfy-payments';
+    try {
+      const link = await this.whop.createAccountLink({
+        company_id: row.whop_account_id,
+        use_case: 'account_onboarding',
+        refresh_url: back,
+        return_url: back,
+      });
+      const url = String(link?.url ?? '').trim();
+      if (!/^https:\/\/[^/]*whop\.com\//.test(url)) throw new Error('a Whop não devolveu um link válido');
+      await this.log(sellerId, null, 'whop_connect.onboarding_link', { expires_at: link?.expires_at ?? null });
+      return { url, expiresAt: link?.expires_at ?? null };
+    } catch (err: any) {
+      throw new BadRequestException(`Não foi possível abrir a verificação na Whop: ${this.errorMessage(err)}`);
+    }
   }
 
   /** Respostas do seller a pedidos da Whop que não têm campo no cadastro (texto, data, arquivo…). */

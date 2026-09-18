@@ -114,6 +114,12 @@ export class KoopfyIntegrationService {
     );
   }
 
+  /** Formulário da Whop para concluir a verificação da empresa (link de ~1h). */
+  connectedOnboardingLink(ctx: SellerCtx) {
+    if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
+    return this.whopConnect.onboardingLink(ctx.seller.id);
+  }
+
   getActivationRequest(ctx: SellerCtx) {
     return this.activationRequests.getForUser(ctx.userId);
   }

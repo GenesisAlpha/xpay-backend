@@ -102,6 +102,14 @@ export class KoopfyIntegrationController {
     return this.svc.requestActivation(req.sellerCtx, body);
   }
 
+  // Link para concluir a verificação da empresa no formulário da Whop. Gerado a
+  // cada clique: vale ~1h e dá acesso a saque, então não pode ser guardado.
+  @Post('onboarding/connected-link')
+  @UseGuards(CrossServiceJwtGuard)
+  connectedOnboardingLink(@Req() req: any) {
+    return this.svc.connectedOnboardingLink(req.sellerCtx);
+  }
+
   // Pendências do cadastro e pedidos da Whop, enviadas pelo painel do seller.
   @Post('onboarding/requirements')
   @UseGuards(CrossServiceJwtGuard)

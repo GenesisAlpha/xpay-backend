@@ -75,6 +75,15 @@ export class WhopPlatformClient {
   }
 
   /**
+   * Link hospedado e temporário para a conta conectada (ex.: `account_onboarding`,
+   * o formulário de verificação). ⚠️ O token dele carrega permissões de saque e
+   * de conta bancária: gerar na hora do clique, nunca guardar nem enviar por e-mail.
+   */
+  createAccountLink(body: { company_id: string; use_case: string; refresh_url: string; return_url: string }) {
+    return this.request('POST', '/account_links', { body });
+  }
+
+  /**
    * Sobe um arquivo privado e devolve o `file_` para usar em respostas de RFI.
    * Dois passos: cria o registro (POST /files) e manda os bytes para a URL
    * assinada que ele devolve.
