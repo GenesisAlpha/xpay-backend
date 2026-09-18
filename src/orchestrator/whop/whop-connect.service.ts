@@ -368,7 +368,7 @@ export class WhopConnectService implements OnModuleInit {
     // Verificações já abertas que dependem de alguém: completar com o que o
     // cadastro tem, uma vez por verificação (o log impede reenviar a cada
     // webhook). É o que tira do "continue verificando" as contas criadas antes.
-    const completed = await this.completeOpenVerifications(sellerId, { business: verification, individual });
+    const completed = await this.completeOpenVerifications(sellerId, row.whop_account_id, { business: verification, individual });
     report.done.push(...completed.done);
     report.warnings.push(...completed.warnings);
     if (completed.individual) individual = completed.individual;
@@ -1332,6 +1332,7 @@ export class WhopConnectService implements OnModuleInit {
    */
   private async completeOpenVerifications(
     sellerId: string,
+    whopAccountId: string,
     current: { business: any | null; individual: any | null },
   ): Promise<{ done: string[]; warnings: string[]; individual: any | null }> {
     const done: string[] = [];
@@ -1370,15 +1371,32 @@ export class WhopConnectService implements OnModuleInit {
       if (await this.alreadyLogged(sellerId, IDENTITY_DOCUMENTS_SENT, current.individual.id)) {
         warnings.push('documento e selfie já enviados; a Whop ainda não começou a análise da pessoa');
       } else {
+        // O PATCH não aceita documento ("Unsupported fields: document_type,
+        // documents", testado em 2026-09-18). Documento só vai na CRIAÇÃO, então
+        // a verificação é recriada com `restart: true`, que abandona a sessão
+        // parada — ninguém a concluiria mesmo.
+        const plan = planIndividualVerification(source.kyc);
         const identityDocs = await this.identityDocumentsPayload(source.documents);
-        if (!identityDocs.payload) {
+        if (!plan.verification) {
+          warnings.push(`verificação da pessoa não refeita: falta ${plan.missing.join(', ')}`);
+        } else if (!identityDocs.payload) {
           warnings.push(identityDocs.warning ?? 'documento da pessoa não enviado à Whop');
         } else {
+          const documentsVersion = String(source.documents?.updated_at ?? source.documents?.submitted_at ?? 'v1')
+            .replace(/[^0-9A-Za-z]/g, '')
+            .slice(0, 40);
           try {
-            const updated = await this.whop.updateVerification(current.individual.id, identityDocs.payload);
-            await this.log(sellerId, null, IDENTITY_DOCUMENTS_SENT, { verification_id: current.individual.id });
-            individual = updated?.id ? updated : null;
-            done.push(`documento e selfie enviados à verificação da pessoa${updated?.status ? ` (${updated.status})` : ''}`);
+            const created = await this.whop.createVerification(
+              whopAccountId,
+              { ...plan.verification, ...identityDocs.payload, restart: true },
+              `koopfy_connect_kyc_docs_${sellerId}_${documentsVersion}`,
+            );
+            // A antiga e a nova ficam marcadas: nenhuma das duas recebe o envio de novo.
+            for (const id of [current.individual.id, created?.id].filter(Boolean)) {
+              await this.log(sellerId, null, IDENTITY_DOCUMENTS_SENT, { verification_id: id, replaced: current.individual.id });
+            }
+            individual = created?.id ? created : null;
+            done.push(`verificação da pessoa refeita com documento e selfie${created?.status ? ` (${created.status})` : ''}`);
           } catch (err: any) {
             warnings.push(`a Whop recusou o documento da pessoa: ${this.errorMessage(err)}`);
           }
