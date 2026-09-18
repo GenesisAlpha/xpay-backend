@@ -222,10 +222,12 @@ function extensionOf(path: string): string {
 //
 // Decisões do dono (2026-09-17):
 //
-//   • o DONO da conta na Whop é uma caixa da Koopfy (`contas+<seller>@…`), não
-//     o seller: é para o dono que a Whop manda verificação, saque, disputa e
+//   • o DONO da conta na Whop é a caixa da Koopfy (`contas@koopfy.com`), não o
+//     seller: é para o dono que a Whop manda verificação, saque, disputa e
 //     formulário fiscal. Com o e-mail dele, o seller recebia tudo direto da
-//     Whop e ainda ganhava login lá. A caixa precisa aceitar "+";
+//     Whop e ainda ganhava login lá. SEM "+": a Whop recusa subendereço
+//     ("You entered an invalid email address. Please enter a real email
+//     address", 2026-09-17). A mesma caixa vale para todas as contas;
 //   • o imposto é da LLC do seller (`tax_remitted_by: self`) e vem INCLUSO no
 //     preço — o comprador paga o que viu no checkout, e as taxas da Koopfy
 //     são calculadas sobre esse mesmo valor;
@@ -236,20 +238,23 @@ function extensionOf(path: string): string {
 export const CONNECTED_OWNER_EMAIL_DEFAULT = 'contas@koopfy.com';
 
 /**
- * E-mail do dono da conta conectada: a caixa base com o seller no "+", para
- * cada conta ter um endereço único (a Whop não aceita repetir) e tudo cair
- * numa caixa só.
+ * E-mail do dono da conta conectada: a caixa da Koopfy, igual para todas as
+ * contas. Um "+" configurado por engano é removido — a Whop recusa a criação
+ * inteira com ele, e o provisionamento de todo seller novo pararia.
  */
 export function connectedOwnerEmail(
-  sellerId: string,
   base: string = process.env.WHOP_CONNECTED_OWNER_EMAIL ?? CONNECTED_OWNER_EMAIL_DEFAULT,
 ): string {
-  const [local, domain] = String(base).trim().toLowerCase().split('@');
-  if (!local || !domain) throw new Error(`WHOP_CONNECTED_OWNER_EMAIL inválido: "${base}"`);
-  // Já com "+": usa só a parte antes dele, senão viraria "contas+x+seller".
-  const mailbox = local.split('+')[0];
-  const tag = String(sellerId).toLowerCase().replace(/[^a-z0-9-]/g, '');
-  return `${mailbox}+${tag}@${domain}`;
+  const [local, domain, ...rest] = String(base).trim().toLowerCase().split('@');
+  if (!local || !domain || rest.length > 0 || !domain.includes('.')) {
+    throw new Error(`WHOP_CONNECTED_OWNER_EMAIL inválido: "${base}"`);
+  }
+  return `${local.split('+')[0]}@${domain}`;
+}
+
+/** Erro da Whop que diz respeito ao e-mail do dono, e não ao cadastro do seller. */
+export function isOwnerEmailRejection(message: string): boolean {
+  return /invalid email|real email address/i.test(String(message ?? ''));
 }
 
 export interface ConnectedAccountSettings {

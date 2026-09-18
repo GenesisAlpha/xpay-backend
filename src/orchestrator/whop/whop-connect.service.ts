@@ -1,5 +1,5 @@
 import { BadRequestException, Injectable, NotFoundException, OnModuleInit } from '@nestjs/common';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { supabase } from '../../lib/supabase.client';
 import { StorageService } from '../../lib/storage.service';
 import { ProviderAccountConfig } from '../provider-accounts.config';
@@ -26,6 +26,7 @@ import {
   accountSettingsPatch,
   connectedAccountSettings,
   connectedOwnerEmail,
+  isOwnerEmailRejection,
   planRfiAnswers,
   sellerRequirementItems,
   toConnectedProviderAccountId,
@@ -185,11 +186,12 @@ export class WhopConnectService implements OnModuleInit {
       let whopAccountId = row.whop_account_id;
 
       if (!whopAccountId) {
+        const ownerEmail = connectedOwnerEmail();
         const account = await this.whop.createAccount(
           {
             // Dono = caixa da Koopfy, não o seller: é para o dono que a Whop
             // manda verificação, saque e disputa (ver connectedOwnerEmail).
-            email: connectedOwnerEmail(sellerId),
+            email: ownerEmail,
             // Título = nome que a Whop usa no extrato do comprador: a marca da
             // loja reconhecida por ele, não a razão social da LLC.
             title: String(source.seller.name || plan.account.business_name).slice(0, 80),
@@ -200,7 +202,10 @@ export class WhopConnectService implements OnModuleInit {
             send_customer_emails: false,
             metadata: { external_id: sellerId, koopfy_seller_id: sellerId },
           },
-          `koopfy_connect_account_${sellerId}`,
+          // O e-mail entra na chave: se a Whop guardou a resposta de uma
+          // tentativa recusada (e-mail inválido), repetir com a mesma chave
+          // devolveria o mesmo 400 mesmo depois de corrigido.
+          `koopfy_connect_account_${sellerId}_${createHash('sha256').update(ownerEmail).digest('hex').slice(0, 10)}`,
         );
         whopAccountId = String(account?.id ?? '');
         if (!whopAccountId.startsWith('biz_')) {
@@ -269,6 +274,15 @@ export class WhopConnectService implements OnModuleInit {
       const message = this.errorMessage(err);
       await this.updateRow(sellerId, { last_error: message.slice(0, 500) }).catch(() => { /* best-effort */ });
       await this.log(sellerId, managerId, 'whop_connect.provision_failed', { error: message });
+      // O e-mail recusado é o da Koopfy, não o do seller: dizer isso evita que o
+      // time vá corrigir o cadastro dele à toa.
+      if (isOwnerEmailRejection(message)) {
+        throw new BadRequestException(
+          `A Whop recusou o e-mail do dono da conta (${connectedOwnerEmail()}). `
+          + 'Confira se a caixa existe e recebe e-mail, ou ajuste WHOP_CONNECTED_OWNER_EMAIL. '
+          + `Resposta da Whop: ${message}`,
+        );
+      }
       throw new BadRequestException(`Whop recusou a conta conectada: ${message}`);
     }
 
@@ -409,7 +423,7 @@ export class WhopConnectService implements OnModuleInit {
         docs: source.documents,
         // Contato da conta = a mesma caixa do dono. Com o e-mail do seller
         // aqui, a Whop voltaria a falar com ele direto.
-        email: connectedOwnerEmail(sellerId),
+        email: connectedOwnerEmail(),
         description: source.description,
         website: source.website,
       }, { retryRequirements: [...retry] });
