@@ -115,6 +115,12 @@ export class KoopfyIntegrationService {
     );
   }
 
+  /** Sessão (token de 1h) para a verificação embutida no painel. */
+  connectedVerificationSession(ctx: SellerCtx) {
+    if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
+    return this.whopConnect.verificationSession(ctx.seller.id);
+  }
+
   /** Formulário da Whop para concluir a verificação da empresa (link de ~1h). */
   connectedOnboardingLink(ctx: SellerCtx) {
     if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');

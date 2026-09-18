@@ -658,6 +658,36 @@ export class WhopConnectService implements OnModuleInit {
     }
   }
 
+  /**
+   * Sessão para o KycElement da Whop, embutido no Koopfy Payments: o seller
+   * conclui a verificação (EIN, documentos, etapa da Sumsub) sem sair do
+   * painel. Token da própria Whop, restrito a identity:read/write da conta
+   * conectada dele e válido por 1h — gerado a cada abertura, nunca guardado.
+   * Plataforma emite esse token para a conta conectada (testado em 2026-09-18).
+   */
+  async verificationSession(sellerId: string) {
+    const row = await this.getRow(sellerId);
+    if (!row?.whop_account_id) throw new NotFoundException('A conta conectada ainda não foi criada.');
+    if (row.verification_status === 'approved' && row.individual_verification_status === 'approved') {
+      throw new BadRequestException('A verificação da conta já foi aprovada.');
+    }
+
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    try {
+      const session = await this.whop.createAccessToken({
+        account_id: row.whop_account_id,
+        scoped_actions: ['identity:read', 'identity:write'],
+        expires_at: expiresAt,
+      });
+      const token = String(session?.token ?? '').trim();
+      if (!token) throw new Error('a Whop não devolveu o token');
+      await this.log(sellerId, null, 'whop_connect.verification_session', { expires_at: session?.expires_at ?? expiresAt });
+      return { accountId: row.whop_account_id, token, expiresAt: session?.expires_at ?? expiresAt };
+    } catch (err: any) {
+      throw new BadRequestException(`Não foi possível abrir a verificação: ${this.errorMessage(err)}`);
+    }
+  }
+
   /** Respostas do seller a pedidos da Whop que não têm campo no cadastro (texto, data, arquivo…). */
   async submitDirectRfiAnswers(
     sellerId: string,

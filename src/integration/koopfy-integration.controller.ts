@@ -102,6 +102,14 @@ export class KoopfyIntegrationController {
     return this.svc.requestActivation(req.sellerCtx, body);
   }
 
+  // Verificação embutida no painel (KycElement da Whop): token de identidade de
+  // 1h da conta conectada do seller, gerado a cada abertura.
+  @Post('onboarding/connected-verification')
+  @UseGuards(CrossServiceJwtGuard)
+  connectedVerificationSession(@Req() req: any) {
+    return this.svc.connectedVerificationSession(req.sellerCtx);
+  }
+
   // Link para concluir a verificação da empresa no formulário da Whop. Gerado a
   // cada clique: vale ~1h e dá acesso a saque, então não pode ser guardado.
   @Post('onboarding/connected-link')

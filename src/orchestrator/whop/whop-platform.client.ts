@@ -82,6 +82,11 @@ export class WhopPlatformClient {
     return this.request('GET', `/products/${encodeURIComponent(productId)}`);
   }
 
+  /** Token curto da própria Whop, restrito às ações pedidas (ex.: identity:*). */
+  createAccessToken(body: { account_id: string; scoped_actions: string[]; expires_at?: string }) {
+    return this.request('POST', '/access_tokens', { body });
+  }
+
   updateProduct(productId: string, body: Record<string, any>) {
     return this.request('PATCH', `/products/${encodeURIComponent(productId)}`, { body });
   }
