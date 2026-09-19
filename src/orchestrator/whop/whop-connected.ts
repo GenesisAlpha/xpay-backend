@@ -120,6 +120,52 @@ export function deriveConnectedStatus(input: {
   return card === undefined || card === 'active' ? 'active' : 'restricted';
 }
 
+// ─── Aviso ao seller: continuar a verificação / conta verificada ─────────────
+
+// `pending` é a sessão aberta esperando o seller (ex.: o EIN no formulário da
+// empresa); `action_required`, algo recusado ou pedido de novo.
+const WAITING_ON_SELLER = new Set(['pending', 'action_required', 'requires_input']);
+
+/** Reaviso do "continue a verificação" quando nada mudou: no máximo a cada 3 dias. */
+export const VERIFICATION_REMINDER_MS = 3 * 24 * 60 * 60 * 1000;
+
+export type VerificationEmailDecision =
+  | { send: 'verified' }
+  | { send: 'verification_needed'; signature: string }
+  | { send: null };
+
+/**
+ * Qual e-mail o sync manda. `verified` só na virada para `active` e uma vez na
+ * vida da conta. `verification_needed` quando alguma verificação espera o
+ * seller — de novo só se a situação mudou (assinatura) ou passaram 3 dias.
+ */
+export function verificationEmailDecision(input: {
+  previousStatus: string | null | undefined;
+  status: ConnectedStatus;
+  businessStatus?: string | null;
+  individualStatus?: string | null;
+  verifiedAlreadySent: boolean;
+  lastNeeded?: { signature?: string | null; at?: string | null } | null;
+  now?: number;
+}): VerificationEmailDecision {
+  if (input.status === 'active') {
+    return input.previousStatus !== 'active' && !input.verifiedAlreadySent ? { send: 'verified' } : { send: null };
+  }
+  if (input.status === 'suspended' || input.status === 'rejected') return { send: null };
+
+  const waiting = input.status === 'action_required'
+    || WAITING_ON_SELLER.has(String(input.businessStatus ?? ''))
+    || WAITING_ON_SELLER.has(String(input.individualStatus ?? ''));
+  if (!waiting) return { send: null };
+
+  const signature = `${input.status}|business:${input.businessStatus ?? '-'}|individual:${input.individualStatus ?? '-'}`;
+  const last = input.lastNeeded;
+  const lastAt = last?.at ? Date.parse(last.at) : NaN;
+  const fresh = Number.isFinite(lastAt) && (input.now ?? Date.now()) - lastAt < VERIFICATION_REMINDER_MS;
+  if (last && last.signature === signature && fresh) return { send: null };
+  return { send: 'verification_needed', signature };
+}
+
 // ─── Roteamento ──────────────────────────────────────────────────────────────
 
 // Janela do fallback na master enquanto a conta conectada está fora do ar.

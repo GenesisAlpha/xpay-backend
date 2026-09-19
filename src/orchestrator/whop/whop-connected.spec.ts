@@ -640,3 +640,45 @@ describe('site da loja não vai para a Whop', () => {
     expect(unanswered.map((u: any) => u.requirement)).toEqual(['business_website', 'social_media_or_website', 'store_page_url']);
   });
 });
+
+describe('verificationEmailDecision', () => {
+  const { verificationEmailDecision, VERIFICATION_REMINDER_MS } = require('./whop-connected');
+  const now = Date.parse('2026-09-18T12:00:00Z');
+  const base = { previousStatus: 'pending_verification', verifiedAlreadySent: false, now };
+
+  it('empresa esperando o seller (EIN) pede para continuar', () => {
+    const d = verificationEmailDecision({ ...base, status: 'pending_verification', businessStatus: 'pending', individualStatus: 'processing' });
+    expect(d).toEqual({ send: 'verification_needed', signature: 'pending_verification|business:pending|individual:processing' });
+  });
+
+  it('não repete a mesma situação antes de 3 dias, repete depois', () => {
+    const input = { ...base, status: 'pending_verification', businessStatus: 'pending', individualStatus: 'processing' };
+    const signature = 'pending_verification|business:pending|individual:processing';
+    const recent = new Date(now - 60_000).toISOString();
+    const old = new Date(now - VERIFICATION_REMINDER_MS - 1).toISOString();
+    expect(verificationEmailDecision({ ...input, lastNeeded: { signature, at: recent } }).send).toBeNull();
+    expect(verificationEmailDecision({ ...input, lastNeeded: { signature, at: old } }).send).toBe('verification_needed');
+  });
+
+  it('situação nova (pedido de novo) avisa mesmo com e-mail recente', () => {
+    const d = verificationEmailDecision({
+      ...base, status: 'action_required', businessStatus: 'approved', individualStatus: 'action_required',
+      lastNeeded: { signature: 'pending_verification|business:pending|individual:processing', at: new Date(now - 60_000).toISOString() },
+    });
+    expect(d.send).toBe('verification_needed');
+  });
+
+  it('só em análise (nada com o seller) não avisa', () => {
+    expect(verificationEmailDecision({ ...base, status: 'pending_verification', businessStatus: 'processing', individualStatus: 'manual_review' }).send).toBeNull();
+  });
+
+  it('conta verificada: uma vez, na virada para ativa', () => {
+    expect(verificationEmailDecision({ ...base, status: 'active' }).send).toBe('verified');
+    expect(verificationEmailDecision({ ...base, status: 'active', previousStatus: 'active' }).send).toBeNull();
+    expect(verificationEmailDecision({ ...base, status: 'active', verifiedAlreadySent: true }).send).toBeNull();
+  });
+
+  it('suspensa não recebe e-mail de verificação', () => {
+    expect(verificationEmailDecision({ ...base, status: 'suspended', businessStatus: 'pending' }).send).toBeNull();
+  });
+});

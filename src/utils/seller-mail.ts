@@ -746,3 +746,141 @@ export async function notifySellerPayout(
     console.error(`[SellerMail] payout ${event} (seller ${sellerId}) falhou:`, error?.response?.body ?? error?.message ?? error);
   }
 }
+
+// ── Conta de pagamento conectada: verificação pendente e aprovada ─────────
+//
+// Sem nome do provedor: para o seller, é a verificação do Koopfy Payments (o
+// formulário também fica embutido no painel). O botão leva direto a ele.
+
+export type VerificationEmailEvent = 'verification_needed' | 'verified';
+
+const VERIFICATION_COPY: Record<Lang, {
+  needed: { subject: string; badge: string; title: (name: string) => string; intro: string };
+  verified: { subject: string; badge: string; title: (name: string) => string; intro: string };
+  prepare: string; items: string[]; tip: string; next: string; nextSteps: string[];
+  continueCta: string; openCta: string; footer: string;
+}> = {
+  pt: {
+    needed: {
+      subject: 'Falta pouco para ativar seus recebimentos',
+      badge: 'Ação necessária',
+      title: (name) => (name ? `${name}, continue a verificação da sua conta` : 'Continue a verificação da sua conta'),
+      intro: 'Para liberar os recebimentos no Koopfy Payments, precisamos que você conclua a verificação da sua empresa. Leva poucos minutos e é feita dentro do painel da Koopfy.',
+    },
+    verified: {
+      subject: '✅ Conta verificada — seus recebimentos estão liberados',
+      badge: 'Conta verificada',
+      title: (name) => (name ? `Tudo certo, ${name}! Sua conta foi aprovada` : 'Tudo certo! Sua conta foi aprovada'),
+      intro: 'A verificação da sua empresa e do responsável foi concluída. Sua conta de pagamento no Koopfy Payments está aprovada e pronta para receber.',
+    },
+    prepare: 'Tenha em mãos',
+    items: ['EIN da sua LLC', 'Documento de identidade do responsável', 'Celular com câmera para a selfie'],
+    tip: 'Se a verificação já estiver em andamento, é só abrir o painel e continuar de onde parou.',
+    next: 'Próximos passos',
+    nextSteps: ['Abra o Koopfy Payments no painel e confira sua conta', 'Com a conta ativa, suas próximas vendas são recebidas nela'],
+    continueCta: 'Continuar verificação', openCta: 'Abrir Koopfy Payments',
+    footer: 'Aviso da sua conta de pagamento — sempre enviado.',
+  },
+  es: {
+    needed: {
+      subject: 'Falta poco para activar tus cobros',
+      badge: 'Acción necesaria',
+      title: (name) => (name ? `${name}, continúa la verificación de tu cuenta` : 'Continúa la verificación de tu cuenta'),
+      intro: 'Para habilitar los cobros en Koopfy Payments, necesitamos que completes la verificación de tu empresa. Toma pocos minutos y se hace dentro del panel de Koopfy.',
+    },
+    verified: {
+      subject: '✅ Cuenta verificada — tus cobros están habilitados',
+      badge: 'Cuenta verificada',
+      title: (name) => (name ? `¡Listo, ${name}! Tu cuenta fue aprobada` : '¡Listo! Tu cuenta fue aprobada'),
+      intro: 'La verificación de tu empresa y del responsable fue completada. Tu cuenta de pago en Koopfy Payments está aprobada y lista para recibir.',
+    },
+    prepare: 'Ten a mano',
+    items: ['EIN de tu LLC', 'Documento de identidad del responsable', 'Celular con cámara para la selfie'],
+    tip: 'Si la verificación ya está en curso, solo abre el panel y continúa donde la dejaste.',
+    next: 'Próximos pasos',
+    nextSteps: ['Abre Koopfy Payments en el panel y revisa tu cuenta', 'Con la cuenta activa, tus próximas ventas se reciben en ella'],
+    continueCta: 'Continuar verificación', openCta: 'Abrir Koopfy Payments',
+    footer: 'Aviso de tu cuenta de pago — siempre enviado.',
+  },
+  en: {
+    needed: {
+      subject: 'Almost there — finish activating your payouts',
+      badge: 'Action needed',
+      title: (name) => (name ? `${name}, continue your account verification` : 'Continue your account verification'),
+      intro: 'To enable payments on Koopfy Payments, please finish verifying your business. It takes a few minutes and happens right inside the Koopfy dashboard.',
+    },
+    verified: {
+      subject: '✅ Account verified — you are ready to get paid',
+      badge: 'Account verified',
+      title: (name) => (name ? `All set, ${name}! Your account is approved` : 'All set! Your account is approved'),
+      intro: 'Your business and representative verification is complete. Your Koopfy Payments account is approved and ready to receive payments.',
+    },
+    prepare: 'Have ready',
+    items: ["Your LLC's EIN", "Representative's ID document", 'A phone with a camera for the selfie'],
+    tip: 'If you already started, just open the dashboard and pick up where you left off.',
+    next: 'Next steps',
+    nextSteps: ['Open Koopfy Payments in the dashboard and review your account', 'Once the account is active, your next sales are received in it'],
+    continueCta: 'Continue verification', openCta: 'Open Koopfy Payments',
+    footer: 'Payment account notice — always sent.',
+  },
+};
+
+/** Devolve true só quando o e-mail saiu (quem chama registra o envio). Nunca lança. */
+export async function notifySellerVerification(
+  sellerId: string | null | undefined,
+  event: VerificationEmailEvent,
+): Promise<boolean> {
+  try {
+    const apiKey = process.env.SENDGRID_API_KEY;
+    if (!apiKey || !sellerId) {
+      if (!apiKey) console.warn(`[SellerMail] verification ${event}: SENDGRID_API_KEY ausente — e-mail não enviado.`);
+      return false;
+    }
+    const { data: seller } = await supabase
+      .from('seller_profiles').select('email, name, country').eq('id', sellerId).maybeSingle();
+    if (!seller?.email) {
+      console.warn(`[SellerMail] verification ${event}: seller ${sellerId} sem e-mail.`);
+      return false;
+    }
+
+    const lang = languageFor(seller.country);
+    const c = VERIFICATION_COPY[lang];
+    const dashboard = (process.env.SELLER_DASHBOARD_URL ?? 'https://app.koopfy.com').replace(/\/+$/, '');
+    const payments = process.env.CHECKOUT_PAYMENTS_URL ?? `${dashboard}/checkout/payments?modal=koopfy-payments`;
+    const firstName = String(seller.name ?? '').trim().split(/\s+/)[0];
+    const copy = event === 'verified' ? c.verified : c.needed;
+
+    const html = renderEmail({
+      lang,
+      tone: event === 'verified' ? 'success' : 'warning',
+      preheader: copy.intro,
+      badge: copy.badge,
+      title: copy.title(firstName),
+      intro: copy.intro,
+      sections: event === 'verified'
+        ? [section(c.next, checklist(c.nextSteps.map((s) => escapeHtml(s))))]
+        : [
+          section(c.prepare, checklist(c.items.map((s) => escapeHtml(s)), '•')),
+          section('', callout('info', escapeHtml(c.tip))),
+        ],
+      primary: { label: event === 'verified' ? c.openCta : c.continueCta, href: payments },
+      footerNote: c.footer,
+      prefsUrl: `${dashboard}/settings/notifications`,
+    });
+
+    sgMail.setApiKey(apiKey);
+    await sgMail.send({
+      to: seller.email,
+      from: {
+        email: process.env.SENDGRID_FROM_EMAIL ?? process.env.PLATFORM_FROM_EMAIL ?? 'no-reply@koopfy.com',
+        name: process.env.SENDGRID_FROM_NAME ?? 'Koopfy',
+      },
+      subject: copy.subject,
+      html,
+    });
+    return true;
+  } catch (error: any) {
+    console.error(`[SellerMail] verification ${event} (seller ${sellerId}) falhou:`, error?.response?.body ?? error?.message ?? error);
+    return false;
+  }
+}

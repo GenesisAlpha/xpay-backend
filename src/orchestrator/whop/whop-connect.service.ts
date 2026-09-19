@@ -35,6 +35,7 @@ import {
   isTransientProviderFailure,
   connectedAccountIdempotencyKey,
   existingSellerAccount,
+  verificationEmailDecision,
   newAccountSettings,
   planRfiAnswers,
   sellerRequirementItems,
@@ -42,6 +43,7 @@ import {
   whopAccountIdFromProviderAccountId,
 } from './whop-connected';
 import { availableCents } from './whop-connected-payout';
+import { notifySellerVerification } from '../../utils/seller-mail';
 
 // ============================================================================
 // CONTAS CONECTADAS DA WHOP — ciclo de vida, roteamento, risco e dinheiro
@@ -84,6 +86,9 @@ const WHOP_DOCUMENT_MAX_BYTES = 5 * 1024 * 1024;
 // `verification_id` vai no payload): o sync não repete envio de arquivo.
 const IDENTITY_DOCUMENTS_SENT = 'whop_connect.individual_documents_sent';
 const BUSINESS_TIN_SENT = 'whop_connect.business_tin_sent';
+// E-mails ao seller sobre a verificação (ver notifyVerification).
+const VERIFICATION_EMAIL_SENT = 'whop_connect.email_verification_needed';
+const VERIFIED_EMAIL_SENT = 'whop_connect.email_verified';
 
 // Tipo no wallet_ledger da saída para a conta conectada.
 const RELEASE_LEDGER_TYPE = 'debit_whop_transfer';
@@ -487,6 +492,8 @@ export class WhopConnectService implements OnModuleInit {
         report.warnings.push(`não foi possível responder os pedidos da Whop: ${this.errorMessage(err)}`);
       }
     }
+
+    await this.notifyVerification(sellerId, row.status, status, verificationStatus, individualStatus);
 
     // Verificações aprovadas e conta liberada na Whop: a venda passa a nascer na
     // conta do seller sem ninguém apertar botão. WHOP_CONNECTED_AUTO_ENABLE=false
@@ -1623,6 +1630,54 @@ export class WhopConnectService implements OnModuleInit {
   }
 
   /** Esta correção já foi feita nesta verificação? */
+  /**
+   * E-mail ao seller: "continue a verificação" enquanto ela depende dele e
+   * "conta verificada" quando vira ativa. O envio fica no crm_action_log, que
+   * também evita repetir a cada webhook. Nunca derruba o sync.
+   */
+  private async notifyVerification(
+    sellerId: string,
+    previousStatus: string | null,
+    status: ReturnType<typeof deriveConnectedStatus>,
+    businessStatus: string | null,
+    individualStatus: string | null,
+  ) {
+    try {
+      const [verified, needed] = await Promise.all([
+        supabase.from('crm_action_log').select('id').eq('seller_id', sellerId)
+          .eq('action', VERIFIED_EMAIL_SENT).limit(1),
+        supabase.from('crm_action_log').select('payload, created_at').eq('seller_id', sellerId)
+          .eq('action', VERIFICATION_EMAIL_SENT).order('created_at', { ascending: false }).limit(1).maybeSingle(),
+      ]);
+      // Sem ler o log não dá para saber se já avisamos: melhor não mandar em dobro.
+      if (verified.error || needed.error) return;
+
+      const decision = verificationEmailDecision({
+        previousStatus,
+        status,
+        businessStatus,
+        individualStatus,
+        verifiedAlreadySent: (verified.data ?? []).length > 0,
+        lastNeeded: needed.data
+          ? { signature: (needed.data as any).payload?.signature ?? null, at: (needed.data as any).created_at ?? null }
+          : null,
+      });
+      if (decision.send === null) return;
+      const action = decision.send === 'verified' ? VERIFIED_EMAIL_SENT : VERIFICATION_EMAIL_SENT;
+      const payload = {
+        status,
+        business_status: businessStatus,
+        individual_status: individualStatus,
+        ...('signature' in decision ? { signature: decision.signature } : {}),
+      };
+
+      if (!(await notifySellerVerification(sellerId, decision.send))) return;
+      await this.log(sellerId, null, action, payload);
+    } catch (err: any) {
+      console.error(`[WhopConnect] e-mail de verificação do seller ${sellerId}:`, err?.message);
+    }
+  }
+
   private async alreadyLogged(sellerId: string, action: string, verificationId: string): Promise<boolean> {
     const { data, error } = await supabase
       .from('crm_action_log')
