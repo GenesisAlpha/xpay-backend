@@ -1,5 +1,6 @@
 // nexor/src/webhooks/webhook.service.ts
 
+import { whopDeclineCode } from '../orchestrator/providers/whop.provider'
 import { Injectable } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
 import { WalletService } from '../wallets/wallet.service'
@@ -848,6 +849,9 @@ export class WebhookService {
       status: mapped,
       type: 'TRANSACTION',
       failure_message: body?.data?.failure_message ?? body?.data?.error?.message ?? null,
+      // Código do banco (insufficient_funds…): vai no postback e a página de
+      // resultado do checkout explica o motivo ao comprador.
+      failure_code: whopDeclineCode(body?.data),
     })
   }
 

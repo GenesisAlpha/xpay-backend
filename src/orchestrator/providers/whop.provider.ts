@@ -691,7 +691,11 @@ export class WhopProvider {
 
       if (!res.ok) {
         const message = json?.error?.message ?? json?.message ?? `Whop HTTP ${res.status}`;
-        return this.failure(accountId, transactionId, message, json);
+        const code = whopDeclineCode(json);
+        return {
+          ...this.failure(accountId, transactionId, message, json),
+          ...(code ? { failureCode: code } : {}),
+        };
       }
 
       const paymentId = typeof json?.id === 'string' ? json.id : null;
@@ -705,7 +709,7 @@ export class WhopProvider {
         return {
           ...this.failure(accountId, transactionId, reason, json),
           providerTransactionId: paymentId ?? undefined,
-          failureCode: json?.decline_code ?? 'WHOP_TOKEN_PAYMENT_FAILED',
+          failureCode: whopDeclineCode(json) ?? 'WHOP_TOKEN_PAYMENT_FAILED',
         };
       }
 
@@ -793,7 +797,11 @@ export class WhopProvider {
 
       if (!res.ok) {
         const message = json?.error?.message ?? json?.message ?? `Whop HTTP ${res.status}`;
-        return this.failure(accountId, transactionId, message, json);
+        const code = whopDeclineCode(json);
+        return {
+          ...this.failure(accountId, transactionId, message, json),
+          ...(code ? { failureCode: code } : {}),
+        };
       }
 
       const paymentId = typeof json?.id === 'string' ? json.id : null;
@@ -806,7 +814,7 @@ export class WhopProvider {
         return {
           ...this.failure(accountId, transactionId, reason, json),
           providerTransactionId: paymentId ?? undefined,
-          failureCode: json?.decline_code ?? 'WHOP_OFF_SESSION_FAILED',
+          failureCode: whopDeclineCode(json) ?? 'WHOP_OFF_SESSION_FAILED',
         };
       }
 
@@ -1221,4 +1229,20 @@ export class WhopProvider {
       data: raw,
     };
   }
+}
+
+/**
+ * Código da recusa na resposta da Whop (`insufficient_funds`, `expired_card`…).
+ * O checkout traduz o código para o comprador; a mensagem crua vem em inglês.
+ */
+export function whopDeclineCode(json: any): string | null {
+  const candidates = [
+    json?.decline_code,
+    json?.last_payment_error?.decline_code,
+    json?.error?.decline_code,
+    json?.last_payment_error?.code,
+    json?.error?.code,
+  ];
+  const code = candidates.find((c) => typeof c === 'string' && /^[a-z0-9_]{3,64}$/i.test(c));
+  return code ? code.toLowerCase() : null;
 }
