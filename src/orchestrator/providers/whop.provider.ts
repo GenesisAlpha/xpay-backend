@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import { ChargeResponse } from './provider.types';
 import { whopRenewalTerms } from './whop-subscription-terms';
 import { supabase } from '../../lib/supabase.client';
@@ -681,8 +682,10 @@ export class WhopProvider {
           Authorization: `Bearer ${args.apiKey}`,
           'Content-Type': 'application/json',
           Accept: 'application/json',
-          // Um token por transação nossa: retry de rede não cobra duas vezes.
-          'Idempotency-Key': `koopfy_ctok_${transactionId}`,
+          // Uma chave por tentativa (transação + token do cartão): retry de rede
+          // com o mesmo token não cobra duas vezes, e o comprador que tenta de
+          // novo depois de uma recusa gera um pagamento novo.
+          'Idempotency-Key': whopTokenIdempotencyKey(transactionId, args.confirmationToken),
         },
         body: JSON.stringify(body),
       });
@@ -1235,6 +1238,21 @@ export class WhopProvider {
  * Código da recusa na resposta da Whop (`insufficient_funds`, `expired_card`…).
  * O checkout traduz o código para o comprador; a mensagem crua vem em inglês.
  */
+/**
+ * Chave de idempotência do pagamento por token.
+ *
+ * Era só `koopfy_ctok_<transação>`. O checkout reaproveita a transação pendente
+ * quando o comprador tenta de novo (outro cartão depois de uma recusa, 3DS que
+ * expirou), e o novo token ia com a MESMA chave: a Whop respondia "This
+ * Idempotency-Key was already used with a different request", a transação virava
+ * falha com essa mensagem por cima do motivo real e o comprador não conseguia
+ * pagar de jeito nenhum.
+ */
+export function whopTokenIdempotencyKey(transactionId: string, confirmationToken: string): string {
+  const token = createHash('sha256').update(String(confirmationToken)).digest('hex').slice(0, 16);
+  return `koopfy_ctok_${transactionId}_${token}`;
+}
+
 export function whopDeclineCode(json: any): string | null {
   const candidates = [
     json?.decline_code,

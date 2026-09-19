@@ -1,6 +1,6 @@
 jest.mock('../../lib/supabase.client', () => ({ supabase: {} }));
 
-import { WhopProvider } from './whop.provider';
+import { WhopProvider, whopTokenIdempotencyKey } from './whop.provider';
 
 // Whop Elements: o navegador gera um `ctok_` com o método escolhido (Pix, cartão,
 // Apple/Google Pay) e o provider confirma com POST /api/v1/payments — sem
@@ -51,7 +51,7 @@ describe('WhopProvider confirmation token charge (Whop Elements)', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe('https://api.whop.test/api/v1/payments');
-    expect(init.headers['Idempotency-Key']).toBe('koopfy_ctok_tx-token-1');
+    expect(init.headers['Idempotency-Key']).toBe(whopTokenIdempotencyKey('tx-token-1', 'ctok_abc'));
     expect(JSON.parse(init.body)).toMatchObject({
       account_id: 'biz_123',
       confirmation_token: 'ctok_abc',
@@ -71,6 +71,22 @@ describe('WhopProvider confirmation token charge (Whop Elements)', () => {
       providerTransactionId: 'pay_1',
       clientSecret: 'pay_1_secret_v1_x',
     });
+  });
+
+  it('uses a new idempotency key when the buyer retries with another token', async () => {
+    // A mesma transação é reaproveitada na nova tentativa. Com a chave só da
+    // transação, a Whop recusava o 2º token ("Idempotency-Key was already used
+    // with a different request") e o comprador não conseguia pagar.
+    const fetchMock = mockFetch(200, { id: 'pay_2', status: 'open', substatus: 'pending', client_secret: 's' });
+    await new WhopProvider().charge(ctx({ confirmation_token: 'ctok_first' }));
+    await new WhopProvider().charge(ctx({ confirmation_token: 'ctok_second' }));
+    await new WhopProvider().charge(ctx({ confirmation_token: 'ctok_second' }));
+
+    const keys = fetchMock.mock.calls.map(([, init]) => init.headers['Idempotency-Key']);
+    expect(keys[0]).not.toBe(keys[1]);
+    // Retry de rede do mesmo token: mesma chave, a Whop não cobra duas vezes.
+    expect(keys[1]).toBe(keys[2]);
+    expect(keys[0]).toMatch(/^koopfy_ctok_tx-token-1_[0-9a-f]{16}$/);
   });
 
   it('keeps an already paid token payment pending until the webhook', async () => {

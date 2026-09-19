@@ -827,6 +827,14 @@ export class WebhookService {
       throw new Error(`Whop: transação não encontrada para o evento ${eventType} (${accountId})`)
     }
 
+    // Falha de uma tentativa ANTERIOR da mesma transação (o comprador já está
+    // tentando com outro cartão): o pagamento do evento não é mais o atual.
+    // Aplicar marcaria como falha uma transação que ainda pode ser paga — o
+    // comprador veria erro no meio do 3DS da nova tentativa.
+    if (mapped === 'FAILED' && await this.isStaleWhopAttempt(tx.id, body?.data)) {
+      return { ignored: true, reason: 'falha de tentativa anterior' }
+    }
+
     // Confere o valor. Divergência aqui significa associação errada (metadata
     // reaproveitado, sessão reusada) — não bloqueia, mas tem que ser visível:
     // aprovar a transação errada é pior do que aprovar tarde.
@@ -1138,6 +1146,16 @@ export class WebhookService {
   //
   // Ordem importa: o metadata é o fio PRIMÁRIO (posto em WhopProvider.charge e
   // propagado pela Whop até o payment). Os demais são rede de segurança.
+  /** O pagamento do evento é de uma tentativa que já foi substituída por outra? */
+  private async isStaleWhopAttempt(transactionId: string, data: any): Promise<boolean> {
+    const eventPaymentId = whopPaymentId(data)
+    if (!eventPaymentId) return false
+    const { data: row } = await supabase
+      .from('transactions').select('provider_transaction_id').eq('id', transactionId).maybeSingle()
+    const current = row?.provider_transaction_id
+    return typeof current === 'string' && current.startsWith('pay_') && current !== eventPaymentId
+  }
+
   private async resolveWhopTx(body: any): Promise<{ id: string } | null> {
     const data = body?.data ?? {}
     const metadata = data?.metadata ?? body?.metadata ?? {}
