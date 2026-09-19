@@ -19,6 +19,14 @@
 import * as sgMail from '@sendgrid/mail';
 import { supabase } from '../lib/supabase.client';
 
+/**
+ * Logo da Koopfy no cabeçalho escuro (texto branco + carrinho amarelo). PNG
+ * porque Gmail e Outlook não mostram SVG. Com imagens bloqueadas, o alt
+ * aparece em branco no lugar — o e-mail continua identificado.
+ */
+const KOOPFY_EMAIL_LOGO_URL = process.env.EMAIL_LOGO_URL || 'https://app.koopfy.com/assets/images/logo-koopfy.png';
+const KOOPFY_EMAIL_LOGO_TAG = `<img src="${KOOPFY_EMAIL_LOGO_URL}" alt="Koopfy" width="115" height="28" style="display:block;border:0;outline:none;text-decoration:none;height:28px;width:115px;color:#ffffff;font-size:18px;font-weight:800">`;
+
 export type PayoutEmailEvent = 'requested' | 'approved' | 'rejected' | 'completed' | 'failed';
 
 export interface PayoutEmailInfo {
@@ -316,7 +324,7 @@ function renderEmail(o: {
 <tr><td align="center">
 <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="width:100%;max-width:600px;background:#ffffff;border:1px solid ${LINE};border-radius:16px;overflow:hidden">
 <tr><td style="background:#0b0b12;padding:18px 32px">
-<span style="font-size:18px;font-weight:800;letter-spacing:-.02em;color:#ffffff">Koopfy</span><span style="display:inline-block;width:7px;height:7px;margin-left:3px;border-radius:50%;background:#8b5cf6"></span>
+${KOOPFY_EMAIL_LOGO_TAG}
 </td></tr>
 <tr><td style="padding:28px 32px 8px">
 <span style="display:inline-block;padding:4px 10px;border-radius:999px;background:${t.bg};border:1px solid ${t.border};color:${t.fg};font-size:12px;font-weight:700">${escapeHtml(o.badge)}</span>

@@ -6,6 +6,8 @@ import * as sgMail from '@sendgrid/mail';
 // =========================================
 const BRAND = {
     name: 'Koopfy',
+    // PNG (Gmail/Outlook não mostram SVG): texto branco + carrinho amarelo.
+    logoUrl: process.env.EMAIL_LOGO_URL || 'https://app.koopfy.com/assets/images/logo-koopfy.png',
     purple: '#8B5CF6',
     purpleDark: '#6D28D9',
     gradient: 'linear-gradient(135deg, #8B5CF6, #6D28D9)',
@@ -232,7 +234,7 @@ export class MailService {
                 <div style="background:rgba(255,255,255,0.2);border-radius:10px;padding:8px;display:inline-block;">
                   <span style="color:#fff;font-size:20px;">${icon}</span>
                 </div>
-                <span style="color:#fff;font-size:22px;font-weight:700;letter-spacing:-0.5px;">${BRAND.name}</span>
+                <img src="${BRAND.logoUrl}" alt="${BRAND.name}" width="131" height="32" style="display:inline-block;vertical-align:middle;border:0;outline:none;height:32px;width:131px;color:#fff;font-size:22px;font-weight:700;">
               </div>
             </td>
           </tr>
