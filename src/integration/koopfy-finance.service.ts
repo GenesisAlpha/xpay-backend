@@ -317,6 +317,7 @@ export class KoopfyFinanceService {
       netAmount: Number(transfer.netAmount ?? 0),
       status: transfer.status,
       releaseDate: transfer.releaseDate,
+      releaseAt: transfer.releaseAt ?? null,
       createdAt: transfer.createdAt,
       paidAt: transfer.paidAt ?? null,
       failReason: transfer.failReason ?? null,

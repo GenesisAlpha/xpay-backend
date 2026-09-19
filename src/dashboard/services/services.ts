@@ -1060,6 +1060,8 @@ export class TransfersService {
         releaseDate: entry.available_at
           ? formatBusinessDate(entry.available_at)
           : '-',
+        // Momento exato (ISO) para o painel mostrar data E hora no fuso de quem vê.
+        releaseAt: entry.available_at ?? null,
         createdAt: formatBusinessDate(entry.created_at),
         paidAt: entry.status === 'completed'
           ? formatBusinessDate(entry.created_at)
