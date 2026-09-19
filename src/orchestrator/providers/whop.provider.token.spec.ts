@@ -89,6 +89,22 @@ describe('WhopProvider confirmation token charge (Whop Elements)', () => {
     expect(result).toMatchObject({ success: false, failureMessage: 'Card declined', providerTransactionId: 'pay_3' });
   });
 
+  it('keeps the decline code so the checkout can explain it', async () => {
+    mockFetch(200, { id: 'pay_4', status: 'open', substatus: 'failed', failure_message: 'Insufficient funds', decline_code: 'insufficient_funds' });
+
+    const result = await new WhopProvider().charge(ctx({ method: 'card' }));
+
+    expect(result).toMatchObject({ success: false, failureCode: 'insufficient_funds' });
+  });
+
+  it('keeps the decline code of an API error', async () => {
+    mockFetch(402, { error: { message: 'Your card has expired.', code: 'card_declined', decline_code: 'expired_card' } });
+
+    const result = await new WhopProvider().charge(ctx());
+
+    expect(result).toMatchObject({ success: false, failureMessage: 'Your card has expired.', failureCode: 'expired_card' });
+  });
+
   it('surfaces the API error message', async () => {
     mockFetch(404, { error: { message: 'Confirmation token not found' } });
 
