@@ -176,7 +176,7 @@ export class WebhookService {
     // ── Pagamento aprovado ────────────────────────────────────────────────
     if (status === 'PAID' && type === 'TRANSACTION') {
 
-      const { error: updateError } = await supabase
+      const { data: approvedRows, error: updateError } = await supabase
         .from('transactions')
         .update({
           status: 'approved',
@@ -195,6 +195,12 @@ export class WebhookService {
         console.error('[WebhookService] update approved error:', updateError)
         throw updateError
       }
+
+      // Duas entregas do mesmo evento (a Whop reenvia) passam juntas pelo
+      // `tx.status === 'approved'` lá em cima. Só quem trocou o status segue:
+      // sem isso, a carteira era creditada e o postback saía duas vezes, e o
+      // checkout criava dois pedidos na Shopify.
+      if (!approvedRows?.length) return { alreadyProcessed: true }
 
       // ── Side effects ─────────────────────────────────────────────────
 
