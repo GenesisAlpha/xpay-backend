@@ -289,3 +289,24 @@ describe('WhopProvider confirmation token charge (Whop Elements)', () => {
     expect(fetchMock.mock.calls[0][0]).toBe('https://api.whop.test/api/v1/checkout_configurations');
   });
 });
+
+describe('produto por loja na cobrança', () => {
+  const originalFetch = (global as any).fetch;
+  afterEach(() => { (global as any).fetch = originalFetch; });
+
+  it('manda o produto da loja do pedido, com o nome da loja', async () => {
+    const fetchMock = mockFetch(200, { id: 'pay_2', status: 'open', client_secret: 'pay_2_secret_v1_x' });
+    await new WhopProvider().charge(ctx({
+      metadata: { ...ctx().metadata, workspace_id: 'ws-77', store_name: 'Loja do Iago' },
+    }));
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.plan.product).toEqual({ external_identifier: 'koopfy_ws-77', title: 'Loja do Iago' });
+  });
+
+  it('pedido sem loja continua no produto antigo', async () => {
+    const fetchMock = mockFetch(200, { id: 'pay_3', status: 'open', client_secret: 'pay_3_secret_v1_x' });
+    await new WhopProvider().charge(ctx());
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.plan.product.external_identifier).toBe('koopfy');
+  });
+});

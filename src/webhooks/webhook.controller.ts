@@ -71,7 +71,12 @@ export class WebhookController {
             return this.whopConnectedWebhook.handle(parsed, raw, headers);
         }
 
-        return this.webhookService.handleSharedWhopWebhook(parsed, raw, headers);
+        const shared = await this.webhookService.handleSharedWhopWebhook(parsed, raw, headers);
+        // Venda da master: garante o descritor no produto da loja (um por loja).
+        if (parsed?.type === 'payment.succeeded') {
+            await this.whopConnectedWebhook.ensureMasterCheckoutProduct(parsed);
+        }
+        return shared;
     }
 
     // WHOP — contas conectadas (webhook da master com child_resource_events).
@@ -121,7 +126,11 @@ export class WebhookController {
             return this.whopConnectedWebhook.handle(parsed, raw, headers);
         }
 
-        return this.webhookService.handleWhopWebhook(accountId, parsed, raw, headers);
+        const result = await this.webhookService.handleWhopWebhook(accountId, parsed, raw, headers);
+        if (parsed?.type === 'payment.succeeded') {
+            await this.whopConnectedWebhook.ensureMasterCheckoutProduct(parsed);
+        }
+        return result;
     }
 
     // STRIPE — a conta vai no PATH, pela mesma razão da Whop.

@@ -393,6 +393,36 @@ export function connectedAccountSettings(env: NodeJS.ProcessEnv = process.env): 
 // O prefixo entra no valor: a Whop guarda como mandado (testado).
 
 export const KOOPFY_PRODUCT_EXTERNAL_ID = 'koopfy';
+
+/**
+ * Identificador do produto da cobrança, UM POR LOJA (decisão do dono,
+ * 2026-09-20). Antes era `koopfy` para tudo: na master, as vendas de todas as
+ * lojas caíam no mesmo produto, e relatório, reembolso e disputa vinham
+ * misturados. Sem loja no pedido, cai no identificador antigo — o produto que
+ * já existe — em vez de inventar um.
+ *
+ * Isto NÃO isola risco: a conta continua sendo uma só. Risco separado é conta
+ * conectada.
+ */
+export function koopfyProductExternalId(workspaceId?: string | null): string {
+  const id = String(workspaceId ?? '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '');
+  return id ? `${KOOPFY_PRODUCT_EXTERNAL_ID}_${id.slice(0, 60)}` : KOOPFY_PRODUCT_EXTERNAL_ID;
+}
+
+/** Produto criado pelo checkout da Koopfy (o antigo, único, e os por loja). */
+export function isKoopfyProduct(externalIdentifier?: string | null): boolean {
+  const value = String(externalIdentifier ?? '');
+  return value === KOOPFY_PRODUCT_EXTERNAL_ID || value.startsWith(`${KOOPFY_PRODUCT_EXTERNAL_ID}_`);
+}
+
+/**
+ * Nome do produto na Whop: a LOJA, o mesmo que o comprador lê no título do
+ * plano. Nunca o que ela vende (ver whop-plan-title.ts).
+ */
+export function koopfyProductTitle(storeName?: string | null): string {
+  const name = String(storeName ?? '').trim().replace(/\s+/g, ' ');
+  return name ? name.slice(0, 30) : KOOPFY_PRODUCT_TITLE;
+}
 export const KOOPFY_PRODUCT_TITLE = 'Koopfy';
 export const CONNECTED_STATEMENT_DESCRIPTOR_DEFAULT = 'WHOP*KOOPFY';
 

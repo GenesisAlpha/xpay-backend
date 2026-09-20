@@ -190,4 +190,26 @@ export class WhopConnectedWebhookService {
     const value = Number(amount)
     return Number.isFinite(value) ? Math.round(value * 100) : null
   }
+
+  /**
+   * Mesmo cuidado da conta conectada, para as vendas da MASTER: cada loja tem
+   * o produto dela (koopfyProductExternalId), e o produto nasce sem descritor
+   * de fatura. O id do produto vem no evento; sem ele, varre os da conta.
+   * Nunca lança: o pagamento já foi processado.
+   */
+  async ensureMasterCheckoutProduct(body: any): Promise<void> {
+    try {
+      const data = body?.data ?? {}
+      const productId = String(data?.product?.id ?? data?.product_id ?? '')
+      const accountId = String(body?.account_id ?? data?.account_id ?? data?.company_id ?? '')
+      if (!productId.startsWith('prod_') && !accountId.startsWith('biz_')) return
+      const result = await this.connect.ensureCheckoutProduct(
+        accountId.startsWith('biz_') ? accountId : null,
+        productId.startsWith('prod_') ? productId : null,
+      )
+      if (result?.warning) console.error(`[WhopConnectedWebhook] descritor da master: ${result.warning}`)
+    } catch (err: any) {
+      console.error('[WhopConnectedWebhook] descritor da master:', err?.message)
+    }
+  }
 }

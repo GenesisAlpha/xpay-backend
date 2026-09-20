@@ -28,7 +28,7 @@ import {
   accountSettingsPatch,
   connectedAccountSettings,
   connectedStatementDescriptor,
-  KOOPFY_PRODUCT_EXTERNAL_ID,
+  isKoopfyProduct,
   KOOPFY_PRODUCT_TITLE,
   isOwnerEmailRejection,
   isAddressRejection,
@@ -101,6 +101,8 @@ export type ConnectedRouting =
 
 @Injectable()
 export class WhopConnectService implements OnModuleInit {
+  /** Produtos já conferidos neste processo (descritor/imposto). */
+  private readonly productsConfigured = new Set<string>();
   private readonly routingCache = new Map<string, { at: number; routing: ConnectedRouting }>();
   private readonly answering = new Set<string>();
   private masterAccount: Promise<string> | null = null;
@@ -1540,21 +1542,49 @@ export class WhopConnectService implements OnModuleInit {
    * criaria outro. Quem cria o produto é a primeira venda; o webhook dela chama
    * este passo e a partir daí toda venda sai com o descritor.
    */
-  async ensureCheckoutProduct(accountId: string): Promise<{ done?: string; warning?: string }> {
+  async ensureCheckoutProduct(
+    accountId: string | null,
+    productId?: string | null,
+  ): Promise<{ done?: string; warning?: string }> {
     const descriptor = connectedStatementDescriptor();
     const taxCode = connectedAccountSettings().product_tax_code_id;
     try {
-      const list = await this.whop.listProducts(accountId);
-      const existing = (list?.data ?? []).find((item: any) => item?.external_identifier === KOOPFY_PRODUCT_EXTERNAL_ID);
-      if (!existing) return {}; // ainda sem venda: a primeira cria o produto
-      const current = await this.whop.getProduct(existing.id);
-      const taxOk = !taxCode || (current?.product_tax_code?.id ?? current?.product_tax_code_id) === taxCode;
-      if (current?.custom_statement_descriptor === descriptor && taxOk) return {};
-      await this.whop.updateProduct(existing.id, {
-        custom_statement_descriptor: descriptor,
-        ...(taxCode ? { product_tax_code_id: taxCode } : {}),
-      });
-      return { done: `descritor da fatura: ${descriptor}` };
+      // Com o produto da venda em mãos (webhook), nem precisa listar.
+      let ids: string[];
+      if (productId) {
+        ids = [String(productId)];
+      } else {
+        if (!accountId) return {};
+        const list = await this.whop.listProducts(accountId);
+        // Um produto por loja: todos os da Koopfy precisam do descritor.
+        ids = (list?.data ?? []).filter((item: any) => isKoopfyProduct(item?.external_identifier)).map((item: any) => String(item.id));
+        if (ids.length === 0) return {}; // ainda sem venda: a primeira cria o produto
+      }
+
+      const done: string[] = [];
+      for (const id of ids) {
+        if (this.productsConfigured.has(id)) continue;
+        const current = await this.whop.getProduct(id);
+        // Produto de outra origem (criado à mão na Whop): não é nosso para mexer.
+        if (productId && !isKoopfyProduct(current?.external_identifier)) {
+          this.productsConfigured.add(id);
+          continue;
+        }
+        const taxOk = !taxCode || (current?.product_tax_code?.id ?? current?.product_tax_code_id) === taxCode;
+        if (current?.custom_statement_descriptor === descriptor && taxOk) {
+          this.productsConfigured.add(id);
+          continue;
+        }
+        await this.whop.updateProduct(id, {
+          custom_statement_descriptor: descriptor,
+          ...(taxCode ? { product_tax_code_id: taxCode } : {}),
+        });
+        this.productsConfigured.add(id);
+        done.push(id);
+      }
+      // Cache só evita reler o mesmo produto neste processo; reiniciar relê.
+      if (this.productsConfigured.size > 5000) this.productsConfigured.clear();
+      return done.length ? { done: `descritor da fatura em ${done.length} produto(s): ${descriptor}` } : {};
     } catch (err: any) {
       return { warning: `a Whop recusou o descritor da fatura: ${this.errorMessage(err)}` };
     }

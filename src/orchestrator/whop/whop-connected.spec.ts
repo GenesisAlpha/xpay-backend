@@ -682,3 +682,28 @@ describe('verificationEmailDecision', () => {
     expect(verificationEmailDecision({ ...base, status: 'suspended', businessStatus: 'pending' }).send).toBeNull();
   });
 });
+
+describe('produto por loja', () => {
+  const { koopfyProductExternalId, isKoopfyProduct, koopfyProductTitle } = require('./whop-connected');
+
+  it('cada loja tem seu identificador; sem loja fica o antigo', () => {
+    expect(koopfyProductExternalId('ws-ABC_123')).toBe('koopfy_ws-abc_123');
+    expect(koopfyProductExternalId(null)).toBe('koopfy');
+    expect(koopfyProductExternalId('  ')).toBe('koopfy');
+    // Caracteres fora de [a-z0-9_-] caem fora: o identificador vai na URL da API.
+    expect(koopfyProductExternalId('loja da ré!')).toBe('koopfy_lojadar');
+  });
+
+  it('reconhece os produtos da Koopfy (antigo e por loja)', () => {
+    expect(isKoopfyProduct('koopfy')).toBe(true);
+    expect(isKoopfyProduct('koopfy_ws-1')).toBe(true);
+    expect(isKoopfyProduct('outra-coisa')).toBe(false);
+    expect(isKoopfyProduct(null)).toBe(false);
+  });
+
+  it('título do produto é o nome da loja, limitado a 30', () => {
+    expect(koopfyProductTitle('Loja do Iago')).toBe('Loja do Iago');
+    expect(koopfyProductTitle(null)).toBe('Koopfy');
+    expect(koopfyProductTitle('L'.repeat(40))).toHaveLength(30);
+  });
+});

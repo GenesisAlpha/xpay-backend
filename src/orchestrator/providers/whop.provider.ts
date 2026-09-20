@@ -2,7 +2,7 @@ import { createHash } from 'crypto';
 import { ChargeResponse } from './provider.types';
 import { whopRenewalTerms } from './whop-subscription-terms';
 import { supabase } from '../../lib/supabase.client';
-import { KOOPFY_PRODUCT_EXTERNAL_ID, connectedApplicationFee } from '../whop/whop-connected';
+import { koopfyProductExternalId, koopfyProductTitle, connectedApplicationFee } from '../whop/whop-connected';
 import { maskedPlanTitle } from './whop-plan-title';
 
 /** Membership da Whop reduzida ao que a área do cliente usa. */
@@ -74,6 +74,9 @@ const RECURRING_PAYMENT_TYPES = new Set(['assinatura-recorrente', 'subscription'
 // funcionando; o default é external_identifier porque ele NÃO exige que alguém
 // tenha criado o produto antes (e dedupa sozinho).
 type ProductLinkMode = 'product_id' | 'external_identifier' | 'none';
+
+/** Loja do pedido (workspace do checkout): o produto da Whop é um por loja. */
+type StoreRef = { workspaceId?: string | null; storeName?: string | null };
 
 // ─── Métodos de pagamento ────────────────────────────────────────────────────
 //
@@ -248,6 +251,8 @@ export class WhopProvider {
       ?? config?.label
       ?? null;
     const title = maskedPlanTitle(storeName, String(orderRef));
+    // Produto da Whop = loja do pedido (um por loja).
+    const storeRef = { workspaceId: metadata?.workspace_id ?? metadata?.workspaceId ?? null, storeName };
 
     // País do comprador — só usado pra decidir se o embed abre num método
     // específico. NÃO trocamos a moeda do plano por país: o `amount` está na
@@ -290,6 +295,7 @@ export class WhopProvider {
         productId: metadata?.product_id ?? metadata?.productId ?? null,
         returnUrl: redirectUrl,
         config,
+        store: storeRef,
       });
     }
 
@@ -407,6 +413,7 @@ export class WhopProvider {
     if (typeof ctx?.confirmation_token === 'string' && ctx.confirmation_token.startsWith('ctok_')) {
       return this.chargeConfirmationToken({
         applicationFee,
+        store: storeRef,
         accountId: id,
         apiUrl,
         apiKey,
@@ -472,7 +479,7 @@ export class WhopProvider {
         // forçar challenge onde não é exigido custa conversão, e forçar
         // frictionless onde a SCA é obrigatória vira recusa do emissor.
         ...(config?.three_ds_level ? { three_ds_level: config.three_ds_level } : {}),
-        ...this.buildProductLink(config),
+        ...this.buildProductLink(config, storeRef),
       },
       payment_method_configuration: this.buildPaymentMethods(method, config, cur),
       metadata: koopfyMetadata,
@@ -638,6 +645,8 @@ export class WhopProvider {
     metadata: Record<string, any>;
     returnUrl: string;
     config: any;
+    /** Loja do pedido: define o produto da Whop (um por loja). */
+    store: StoreRef;
     // Só em conta conectada; null na master.
     applicationFee: number | null;
   }): Promise<ChargeResponse> {
@@ -662,7 +671,7 @@ export class WhopProvider {
         trial_period_days: subscriptionTerms.whopTrialDays || null,
       } : {}),
       ...(args.applicationFee != null ? { application_fee_amount: args.applicationFee } : {}),
-      ...this.buildProductLink(args.config),
+      ...this.buildProductLink(args.config, args.store),
     };
 
     const body = {
@@ -752,6 +761,8 @@ export class WhopProvider {
     productId: string | null;
     returnUrl: string;
     config: any;
+    /** Loja do pedido: define o produto da Whop (um por loja). */
+    store: StoreRef;
     // Só em conta conectada; null na master.
     applicationFee: number | null;
   }): Promise<ChargeResponse> {
@@ -766,7 +777,7 @@ export class WhopProvider {
         initial_price: args.initialPrice,
         plan_type: 'one_time',
         ...(args.applicationFee != null ? { application_fee_amount: args.applicationFee } : {}),
-        ...this.buildProductLink(args.config),
+        ...this.buildProductLink(args.config, args.store),
       },
       metadata: {
         koopfy_transaction_id: transactionId,
@@ -1128,7 +1139,12 @@ export class WhopProvider {
     }
   }
 
-  private buildProductLink(config: any) {
+  /**
+   * `store` = loja do pedido (metadata). Um produto por loja: ver
+   * koopfyProductExternalId. `config.product_external_id` continua mandando
+   * quando a conta foi configurada à mão.
+   */
+  private buildProductLink(config: any, store?: StoreRef) {
     const mode: ProductLinkMode = config?.product_link_mode
       ?? (config?.product_id ? 'product_id' : 'external_identifier');
 
@@ -1141,9 +1157,9 @@ export class WhopProvider {
     return {
       product: {
         // O mesmo produto em que o sync grava o descritor da fatura (ver
-        // KOOPFY_PRODUCT_EXTERNAL_ID em whop-connected.ts).
-        external_identifier: String(config?.product_external_id ?? KOOPFY_PRODUCT_EXTERNAL_ID),
-        title: String(config?.product_title ?? 'Koopfy').slice(0, WHOP_PLAN_TITLE_MAX),
+        // koopfyProductExternalId em whop-connected.ts).
+        external_identifier: String(config?.product_external_id ?? koopfyProductExternalId(store?.workspaceId)),
+        title: String(config?.product_title ?? koopfyProductTitle(store?.storeName)).slice(0, WHOP_PLAN_TITLE_MAX),
       },
     };
   }
