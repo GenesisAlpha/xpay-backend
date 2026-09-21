@@ -75,6 +75,48 @@ import { syncInstagram } from './profile-sync';
 const fromCents = (v: number | null | undefined): number =>
   Number((Number(v ?? 0) / 100).toFixed(2))
 
+export function mapUnifiedPayoutHistory(
+  ledger: any,
+  execution?: any,
+  method?: any,
+) {
+  const methodKey = execution?.method_key ?? 'bank'
+  const maskedReference = method?.masked_reference ?? null
+  return {
+    id: execution?.id ?? ledger.id,
+    method: methodKey,
+    bankAccount: methodKey === 'crypto' ? null : maskedReference,
+    cryptoAddress: methodKey === 'crypto' ? maskedReference : null,
+    cryptoNetwork: method?.network ?? null,
+    amount: fromCents(execution?.gross_minor ?? ledger.amount),
+    fee:
+      execution == null
+        ? null
+        : fromCents(
+            Number(execution.koopfy_fee_minor ?? 0) +
+              Number(execution.provider_fee_minor ?? 0),
+          ),
+    netAmount:
+      execution == null ? null : fromCents(execution.net_minor),
+    destinationCurrency: execution?.destination_currency ?? null,
+    destinationAmountMinor:
+      execution == null ? null : Number(execution.destination_amount_minor),
+    estimatedArrival: execution?.estimated_arrival ?? null,
+    status:
+      execution?.local_state ??
+      (ledger.status === 'completed'
+        ? 'completed'
+        : ledger.status === 'pending'
+          ? 'pending_review'
+          : 'failed'),
+    requiresReconfirmation: execution?.local_state === 'requote_required',
+    date: new Date(ledger.created_at).toLocaleDateString('pt-BR'),
+    processedAt: (ledger.processed_at ?? ledger.available_at)
+      ? new Date(ledger.processed_at ?? ledger.available_at).toLocaleDateString('pt-BR')
+      : null,
+  }
+}
+
 function paginate(page = 1, pageSize = 20) {
   const from = (page - 1) * pageSize
   const to = from + pageSize - 1
@@ -377,18 +419,75 @@ export class WalletService {
 
     if (error) throw new BadRequestException(error.message)
 
-    const mapped = (data ?? []).map(p => ({
-      id: p.id,
-      method: p.metadata?.method ?? 'bank',
-      bankAccount: describePayoutAccount(p.metadata),
-      cryptoAddress: p.metadata?.destination?.cryptoAddress ?? null,
-      cryptoNetwork: p.metadata?.destination?.cryptoNetwork ?? null,
-      // 🔥 amount em centavos → USD
-      amount: fromCents(p.amount),
-      status: payoutStatusForSeller(p.status),
-      date: formatBusinessDate(p.created_at),
-      processedAt: p.available_at ? formatBusinessDate(p.available_at) : null,
-    }))
+    const ledgerRows = data ?? []
+    const ledgerIds = ledgerRows.map(p => p.id)
+    let executions: any[] = []
+    if (ledgerIds.length > 0) {
+      const { data: executionRows, error: executionError } = await supabase
+        .from('payout_executions')
+        .select(
+          'id, ledger_entry_id, seller_payout_method_id, method_key, gross_minor, koopfy_fee_minor, provider_fee_minor, net_minor, destination_currency, destination_amount_minor, estimated_arrival, local_state',
+        )
+        .eq('seller_id', sellerId)
+        .in('ledger_entry_id', ledgerIds)
+      if (
+        executionError &&
+        !['PGRST205', '42P01'].includes(executionError.code ?? '')
+      ) {
+        throw new BadRequestException('Não foi possível consultar os saques.')
+      }
+      executions = executionRows ?? []
+    }
+
+    const methodIds = [
+      ...new Set(
+        executions
+          .map(execution => execution.seller_payout_method_id)
+          .filter(Boolean),
+      ),
+    ]
+    let methods: any[] = []
+    if (methodIds.length > 0) {
+      const { data: methodRows, error: methodError } = await supabase
+        .from('seller_payout_methods')
+        .select('id, masked_reference, network')
+        .eq('seller_id', sellerId)
+        .in('id', methodIds)
+      if (methodError) {
+        throw new BadRequestException('Não foi possível consultar os métodos de saque.')
+      }
+      methods = methodRows ?? []
+    }
+
+    const executionByLedger = new Map(
+      executions.map(execution => [execution.ledger_entry_id, execution]),
+    )
+    const methodById = new Map(methods.map(method => [method.id, method]))
+    // Saque sem execução do fluxo pela master (fluxo de conta conectada ou
+    // manual) mantém o formato de sempre.
+    const legacyRow = (p: any) => ({
+          id: p.id,
+          method: p.metadata?.method ?? 'bank',
+          bankAccount: describePayoutAccount(p.metadata),
+          cryptoAddress: p.metadata?.destination?.cryptoAddress ?? null,
+          cryptoNetwork: p.metadata?.destination?.cryptoNetwork ?? null,
+          // 🔥 amount em centavos → USD
+          amount: fromCents(p.amount),
+          status: payoutStatusForSeller(p.status),
+          date: formatBusinessDate(p.created_at),
+          processedAt: p.available_at ? formatBusinessDate(p.available_at) : null,
+        })
+    const mapped = ledgerRows.map(ledger => {
+      const execution = executionByLedger.get(ledger.id)
+      if (!execution) return legacyRow(ledger)
+      return mapUnifiedPayoutHistory(
+        ledger,
+        execution,
+        execution
+          ? methodById.get(execution.seller_payout_method_id)
+          : undefined,
+      )
+    })
 
     return paginatedResponse(mapped, count ?? 0, page, pageSize)
   }

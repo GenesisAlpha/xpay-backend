@@ -133,6 +133,19 @@ export class KoopfyFinanceController {
     return this.finance.removePayoutMethod(req.sellerCtx, id);
   }
 
+  @Post('payout-preview')
+  previewPayout(
+    @Req() req: any,
+    @Body()
+    body: { methodId?: unknown; speed?: unknown; grossMinor?: unknown },
+  ) {
+    return this.finance.previewPayout(req.sellerCtx, {
+      methodId: body?.methodId,
+      speed: body?.speed,
+      grossMinor: body?.grossMinor,
+    });
+  }
+
   // O seller vem do token verificado; um sellerId no corpo é descartado.
   @Post('payouts')
   requestPayout(
@@ -141,6 +154,21 @@ export class KoopfyFinanceController {
     @Body() body: Record<string, unknown>,
   ) {
     return this.finance.requestPayout(req.sellerCtx, body ?? {}, idempotencyKey);
+  }
+
+  @Post('payouts/:id/reconfirm')
+  reconfirmPayout(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Headers('idempotency-key') idempotencyKey: string,
+    @Body() body: { confirmedMinimumNetMinor?: unknown },
+  ) {
+    return this.finance.reconfirmPayout(
+      req.sellerCtx,
+      id,
+      body?.confirmedMinimumNetMinor,
+      idempotencyKey,
+    );
   }
 
   @Get('transfers/totals')

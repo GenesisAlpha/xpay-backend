@@ -72,4 +72,43 @@ describe('KoopfyFinanceController', () => {
       fields: { fld_bank_routing_number: '021000021' },
     });
   });
+
+  it('allowlists preview and requote confirmation bodies', async () => {
+    const finance = {
+      previewPayout: jest.fn(),
+      reconfirmPayout: jest.fn(),
+    };
+    const controller = new KoopfyFinanceController(finance as never);
+    const sellerCtx = { seller: { id: 'verified-seller' } };
+    const req = { sellerCtx };
+
+    await controller.previewPayout(req, {
+      methodId: 'local-method-1',
+      speed: 'standard',
+      grossMinor: 11_990,
+      sellerId: 'attacker',
+      quoteToken: 'secret',
+    } as never);
+    await controller.reconfirmPayout(
+      req,
+      'payout-1',
+      'reconfirm_key_12345678',
+      {
+        confirmedMinimumNetMinor: 10_810,
+        providerMethodId: 'potk_attacker',
+      } as never,
+    );
+
+    expect(finance.previewPayout).toHaveBeenCalledWith(sellerCtx, {
+      methodId: 'local-method-1',
+      speed: 'standard',
+      grossMinor: 11_990,
+    });
+    expect(finance.reconfirmPayout).toHaveBeenCalledWith(
+      sellerCtx,
+      'payout-1',
+      10_810,
+      'reconfirm_key_12345678',
+    );
+  });
 });

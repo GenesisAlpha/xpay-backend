@@ -183,6 +183,46 @@ describe("WhopPayoutClient", () => {
     ]);
   });
 
+  it("keeps only masked saved-method data and delivery estimates", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        data: [
+          {
+            id: "potk_1",
+            account_reference: "••••0472",
+            destination_currency: "usd",
+            institution_name: "Example Bank",
+            estimated_arrival: {
+              standard: "2026-09-23T12:00:00.000Z",
+              instant: null,
+            },
+            nickname: "Principal",
+            is_default: true,
+            status: "active",
+            supported_payout_method: {
+              name: "ACH Bank Deposit",
+              delivery_type: "bank_deposit",
+              supports_standard_delivery: true,
+              supports_instant_delivery: false,
+            },
+          },
+        ],
+      }),
+    );
+
+    await expect(client.listSavedPayoutMethods("biz_seller")).resolves.toEqual([
+      expect.objectContaining({
+        id: "potk_1",
+        accountReference: "••••0472",
+        institutionName: "Example Bank",
+        estimatedArrival: {
+          standard: "2026-09-23T12:00:00.000Z",
+          instant: null,
+        },
+      }),
+    ]);
+  });
+
   it.each([
     [401, "authentication_failed", false],
     [403, "permission_denied", false],

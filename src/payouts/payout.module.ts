@@ -5,6 +5,10 @@ import {
   SellerPayoutRepository,
 } from './seller-payout-account.service';
 import { WhopPayoutClient } from './whop-payout.client';
+import {
+  PayoutExecutionRepository,
+  PayoutOrchestratorService,
+} from './payout-orchestrator.service';
 
 @Module({
   imports: [OrchestratorModule],
@@ -12,7 +16,13 @@ import { WhopPayoutClient } from './whop-payout.client';
     WhopPayoutClient,
     SellerPayoutRepository,
     SellerPayoutAccountService,
+    PayoutExecutionRepository,
+    PayoutOrchestratorService,
   ],
-  exports: [WhopPayoutClient, SellerPayoutAccountService],
+  exports: [
+    WhopPayoutClient,
+    SellerPayoutAccountService,
+    PayoutOrchestratorService,
+  ],
 })
 export class PayoutModule {}

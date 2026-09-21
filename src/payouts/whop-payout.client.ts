@@ -35,6 +35,7 @@ export interface WhopPayoutQuote {
   netAmount: WhopMoney;
   destinationAmount: WhopMoney;
   exchangeRate: string;
+  estimatedArrival: string | null;
   expiresAt: string;
   quoteToken: string;
 }
@@ -64,6 +65,10 @@ export interface WhopSavedPayoutMethod {
   accountReference: string | null;
   destinationCurrency: string | null;
   institutionName: string | null;
+  estimatedArrival: {
+    standard: string | null;
+    instant: string | null;
+  } | null;
   nickname: string | null;
   isDefault: boolean;
   status: string;
@@ -406,6 +411,7 @@ function parseQuote(value: unknown): WhopPayoutQuote {
       netAmount: parseMoney(record.net_amount),
       destinationAmount: parseMoney(record.destination_amount),
       exchangeRate: expectFiniteNumber(record.exchange_rate).toString(),
+      estimatedArrival: nullableDateString(record.estimated_arrival),
       expiresAt: expectDateString(record.expires_at),
       quoteToken: expectString(record.quote_token),
     };
@@ -520,6 +526,7 @@ function parseSavedMethod(value: unknown): WhopSavedPayoutMethod {
       accountReference: optionalString(record.account_reference),
       destinationCurrency: nullableCurrency(record.destination_currency),
       institutionName: optionalString(record.institution_name),
+      estimatedArrival: parseEstimatedArrival(record.estimated_arrival),
       nickname: optionalString(record.nickname),
       isDefault: expectBoolean(record.is_default),
       status: expectString(record.status),
@@ -540,6 +547,15 @@ function parseSupportedMethodSummary(value: unknown) {
     deliveryType: expectString(record.delivery_type),
     supportsStandardDelivery: expectBoolean(record.supports_standard_delivery),
     supportsInstantDelivery: expectBoolean(record.supports_instant_delivery),
+  };
+}
+
+function parseEstimatedArrival(value: unknown) {
+  if (value === null || value === undefined) return null;
+  const record = expectRecord(value);
+  return {
+    standard: nullableDateString(record.standard),
+    instant: nullableDateString(record.instant),
   };
 }
 

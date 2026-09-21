@@ -23,6 +23,7 @@ jest.mock('../lib/supabase.client', () => ({
 
 import { supabase } from '../lib/supabase.client';
 import {
+  mapUnifiedPayoutHistory,
   payoutRequestHash,
   WalletService,
 } from '../dashboard/services/services';
@@ -203,12 +204,69 @@ describe('payoutRequestHash', () => {
   });
 });
 
+describe('mapUnifiedPayoutHistory', () => {
+  it('returns the reviewed payout state without provider identifiers', () => {
+    const result = mapUnifiedPayoutHistory(
+      {
+        id: 'ledger-1',
+        amount: 11_990,
+        status: 'pending_review',
+        created_at: '2026-09-21T12:00:00.000Z',
+        processed_at: null,
+      },
+      {
+        id: 'payout-1',
+        ledger_entry_id: 'ledger-1',
+        seller_payout_method_id: 'local-method-1',
+        provider_account_id: 'biz_secret',
+        provider_payout_id: 'wdrl_secret',
+        method_key: 'pix',
+        gross_minor: 11_990,
+        koopfy_fee_minor: 540,
+        provider_fee_minor: 640,
+        net_minor: 10_810,
+        destination_currency: 'BRL',
+        destination_amount_minor: 62_115,
+        local_state: 'requote_required',
+      },
+      {
+        id: 'local-method-1',
+        provider_method_id: 'potk_secret',
+        masked_reference: '•••1234',
+        network: null,
+      },
+    );
+
+    expect(result).toMatchObject({
+      id: 'payout-1',
+      method: 'pix',
+      bankAccount: '•••1234',
+      amount: 119.9,
+      fee: 11.8,
+      netAmount: 108.1,
+      destinationCurrency: 'BRL',
+      destinationAmountMinor: 62_115,
+      status: 'requote_required',
+      requiresReconfirmation: true,
+    });
+    expect(JSON.stringify(result)).not.toContain('biz_secret');
+    expect(JSON.stringify(result)).not.toContain('potk_secret');
+    expect(JSON.stringify(result)).not.toContain('wdrl_secret');
+  });
+});
+
 describe('KoopfyFinanceService.requestPayout', () => {
   const previousFlag = process.env.KOOPFY_UNIFIED_PAYOUTS_ENABLED;
+  const previousMasterFlag = process.env.KOOPFY_WHOP_MASTER_PAYOUTS_ENABLED;
 
   afterEach(() => {
     if (previousFlag === undefined) delete process.env.KOOPFY_UNIFIED_PAYOUTS_ENABLED;
     else process.env.KOOPFY_UNIFIED_PAYOUTS_ENABLED = previousFlag;
+    if (previousMasterFlag === undefined) {
+      delete process.env.KOOPFY_WHOP_MASTER_PAYOUTS_ENABLED;
+    } else {
+      process.env.KOOPFY_WHOP_MASTER_PAYOUTS_ENABLED = previousMasterFlag;
+    }
   });
 
   function createService() {
@@ -270,6 +328,51 @@ describe('KoopfyFinanceService.requestPayout', () => {
       service.requestPayout(pending, achPayout, KEY),
     ).rejects.toBeInstanceOf(ConflictException);
     expect(wallet.requestPayoutIdempotent).not.toHaveBeenCalled();
+  });
+
+  it('uses the reviewed confirmation contract when master payouts are enabled', async () => {
+    process.env.KOOPFY_UNIFIED_PAYOUTS_ENABLED = 'true';
+    process.env.KOOPFY_WHOP_MASTER_PAYOUTS_ENABLED = 'true';
+    const orchestrator = { confirm: jest.fn().mockResolvedValue({ payoutId: 'payout-1' }) };
+    const none = {} as never;
+    const service = new KoopfyFinanceService(
+      none,
+      none,
+      none,
+      none,
+      none,
+      none,
+      none,
+      none,
+      undefined,
+      orchestrator as never,
+    );
+    const body = {
+      methodId: 'local-method-1',
+      speed: 'standard',
+      grossMinor: 11_990,
+      confirmedMinimumNetMinor: 10_810,
+      previewExpiresAt: '2026-09-21T15:00:00.000Z',
+      confirmationToken: 'signed-preview-token',
+      sellerId: 'attacker',
+      accountId: 'biz_attacker',
+      routingNumber: '021000021',
+    };
+
+    await service.requestPayout(activeContext, body, KEY);
+
+    expect(orchestrator.confirm).toHaveBeenCalledWith(
+      'seller-1',
+      {
+        methodId: 'local-method-1',
+        speed: 'standard',
+        grossMinor: 11_990,
+        confirmedMinimumNetMinor: 10_810,
+        previewExpiresAt: '2026-09-21T15:00:00.000Z',
+        confirmationToken: 'signed-preview-token',
+      },
+      KEY,
+    );
   });
 });
 

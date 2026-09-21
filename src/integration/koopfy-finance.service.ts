@@ -19,6 +19,7 @@ import { SellerCtx } from './cross-service-jwt.guard';
 import { AnticipationService } from '../wallets/anticipation.service';
 import { normalizeFinanceListQuery } from './koopfy-finance-query';
 import { SellerPayoutAccountService } from '../payouts/seller-payout-account.service';
+import { PayoutOrchestratorService } from '../payouts/payout-orchestrator.service';
 
 const TRANSACTION_STATUSES = [
   'pending',
@@ -143,6 +144,7 @@ export class KoopfyFinanceService {
     private readonly apiKeys: ApiKeysService,
     private readonly anticipation?: AnticipationService,
     @Optional() private readonly payoutAccounts?: SellerPayoutAccountService,
+    @Optional() private readonly payoutOrchestrator?: PayoutOrchestratorService,
   ) {}
 
   private seller(ctx: SellerCtx) {
@@ -157,6 +159,24 @@ export class KoopfyFinanceService {
       throw new ConflictException('Configuração de saques indisponível.');
     }
     return this.payoutAccounts;
+  }
+
+  private requirePayoutOrchestrator(): PayoutOrchestratorService {
+    if (!this.payoutOrchestrator) {
+      throw new ConflictException('Solicitação de saque temporariamente indisponível.');
+    }
+    return this.payoutOrchestrator;
+  }
+
+  private requireMasterPayoutRollout() {
+    if (
+      process.env.KOOPFY_UNIFIED_PAYOUTS_ENABLED !== 'true' ||
+      process.env.KOOPFY_WHOP_MASTER_PAYOUTS_ENABLED !== 'true'
+    ) {
+      throw new ConflictException(
+        'Solicitação de saque temporariamente indisponível nesta experiência.',
+      );
+    }
   }
 
   async getOverview(ctx: SellerCtx, requestedPeriod: unknown) {
@@ -271,7 +291,17 @@ export class KoopfyFinanceService {
       cryptoAddress: payout.cryptoAddress ?? null,
       cryptoNetwork: payout.cryptoNetwork ?? null,
       amount: Number(payout.amount ?? 0),
+      fee: payout.fee == null ? null : Number(payout.fee),
+      netAmount:
+        payout.netAmount == null ? null : Number(payout.netAmount),
+      destinationCurrency: payout.destinationCurrency ?? null,
+      destinationAmountMinor:
+        payout.destinationAmountMinor == null
+          ? null
+          : Number(payout.destinationAmountMinor),
+      estimatedArrival: payout.estimatedArrival ?? null,
       status: payout.status,
+      requiresReconfirmation: Boolean(payout.requiresReconfirmation),
       date: payout.date,
       processedAt: payout.processedAt ?? null,
     }));
@@ -349,11 +379,65 @@ export class KoopfyFinanceService {
     return { removed: true };
   }
 
+  async previewPayout(
+    ctx: SellerCtx,
+    body: { methodId?: unknown; speed?: unknown; grossMinor?: unknown },
+  ) {
+    this.requireMasterPayoutRollout();
+    return this.requirePayoutOrchestrator().preview(this.seller(ctx).id, {
+      methodId: typeof body.methodId === 'string' ? body.methodId : '',
+      speed: typeof body.speed === 'string' ? body.speed : null,
+      grossMinor: typeof body.grossMinor === 'number' ? body.grossMinor : NaN,
+    });
+  }
+
+  async reconfirmPayout(
+    ctx: SellerCtx,
+    payoutId: string,
+    confirmedMinimumNetMinor: unknown,
+    idempotencyKey: unknown,
+  ) {
+    this.requireMasterPayoutRollout();
+    return this.requirePayoutOrchestrator().reconfirm(
+      this.seller(ctx).id,
+      payoutId,
+      typeof confirmedMinimumNetMinor === 'number'
+        ? confirmedMinimumNetMinor
+        : NaN,
+      typeof idempotencyKey === 'string' ? idempotencyKey : '',
+    );
+  }
+
   async requestPayout(
     ctx: SellerCtx,
     body: Record<string, unknown>,
     idempotencyKey: unknown,
   ) {
+    if (process.env.KOOPFY_WHOP_MASTER_PAYOUTS_ENABLED === 'true') {
+      this.requireMasterPayoutRollout();
+      const confirmation = {
+        methodId: typeof body.methodId === 'string' ? body.methodId : '',
+        speed: typeof body.speed === 'string' ? body.speed : null,
+        grossMinor: typeof body.grossMinor === 'number' ? body.grossMinor : NaN,
+        confirmedMinimumNetMinor:
+          typeof body.confirmedMinimumNetMinor === 'number'
+            ? body.confirmedMinimumNetMinor
+            : NaN,
+        previewExpiresAt:
+          typeof body.previewExpiresAt === 'string'
+            ? body.previewExpiresAt
+            : '',
+        confirmationToken:
+          typeof body.confirmationToken === 'string'
+            ? body.confirmationToken
+            : '',
+      };
+      return this.requirePayoutOrchestrator().confirm(
+        this.seller(ctx).id,
+        confirmation,
+        typeof idempotencyKey === 'string' ? idempotencyKey : '',
+      );
+    }
     // Fail-closed: sem a flag, esta rota não cria saque — nem pelo fluxo legado.
     if (process.env.KOOPFY_UNIFIED_PAYOUTS_ENABLED !== 'true') {
       throw new ConflictException(
