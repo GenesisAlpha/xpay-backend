@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-21
 
-**Status:** Approved in conversation; awaiting written-spec review
+**Status:** Approved
 
 **Owners:** Koopfy Pay / CRM
 
@@ -193,6 +193,7 @@ The Whop quote and payout use `platform_covers_fees: false`, because the provide
 2. Require an active Koopfy seller, ready connected account, approved verification, and active saved method owned by that seller.
 3. Fetch a quote and compute the Koopfy fee snapshot.
 4. Present gross, consolidated fee, net/destination amount, exchange rate, and estimated arrival.
+   The preview includes an expiring opaque HMAC confirmation proof, bound to the authenticated seller, method, speed, gross amount, minimum net, and expiry. It contains no provider quote token and prevents the browser from lowering or replacing the reviewed values.
 5. On confirmation, call a new transactional and idempotent Supabase RPC that:
    - verifies the quote snapshot and seller ownership inputs;
    - moves gross funds from `available` to `withdrawing`;
