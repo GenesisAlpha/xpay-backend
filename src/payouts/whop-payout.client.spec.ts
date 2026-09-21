@@ -55,6 +55,11 @@ describe("WhopPayoutClient", () => {
           fee_amount: "4.20",
           markup_fee: "0.00",
           net_amount: "110.30",
+          metadata: {
+            koopfy_payout_id: "payout-1",
+            koopfy_seller_id: "seller-1",
+            koopfy_account_id: "biz_seller",
+          },
           estimated_arrival: "2026-09-22T12:00:00.000Z",
           created_at: "2026-09-21T12:00:00.000Z",
         },
@@ -62,7 +67,7 @@ describe("WhopPayoutClient", () => {
       ),
     );
 
-    await client.createPayout(
+    const payout = await client.createPayout(
       {
         accountId: "biz_seller",
         amount: 114.5,
@@ -96,6 +101,11 @@ describe("WhopPayoutClient", () => {
         quote_token: "quote_secret",
       }),
     );
+    expect(payout.metadata).toEqual({
+      koopfy_payout_id: "payout-1",
+      koopfy_seller_id: "seller-1",
+      koopfy_account_id: "biz_seller",
+    });
   });
 
   it("uses the Current API contract for a provider-backed quote", async () => {
@@ -261,6 +271,38 @@ describe("WhopPayoutClient", () => {
     },
   );
 
+  it('keeps only a safe payout id from an idempotency conflict', async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse(
+        {
+          error: {
+            code: 'idempotency_conflict',
+            payout_id: 'wdrl_original',
+            message: 'raw provider detail',
+          },
+        },
+        409,
+      ),
+    );
+
+    await expect(
+      client.createPayout(
+        {
+          accountId: 'biz_seller',
+          amount: 114.5,
+          currency: 'usd',
+          payoutMethodId: 'potk_1',
+        },
+        'koopfy_payout_abc',
+      ),
+    ).rejects.toMatchObject({
+      code: 'idempotency_conflict',
+      idempotencyReplay: true,
+      providerPayoutId: 'wdrl_original',
+      requestMayHaveSucceeded: true,
+    });
+  });
+
   it("marks HTTP 409 as an idempotency replay signal", async () => {
     fetchMock.mockResolvedValue(
       jsonResponse({ error: { type: "conflict", message: "duplicate" } }, 409),
@@ -315,6 +357,7 @@ describe("WhopPayoutClient", () => {
       code: "master_account_not_configured",
       status: 500,
       retryable: false,
+      requestMayHaveSucceeded: false,
     });
     expect(fetchMock).not.toHaveBeenCalled();
   });

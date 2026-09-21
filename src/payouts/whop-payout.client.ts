@@ -53,6 +53,7 @@ export interface WhopPayout {
   exchangeRate: string | null;
   estimatedArrival: string | null;
   createdAt: string;
+  metadata: Record<string, string> | null;
   failure: {
     code: string | null;
     message: string | null;
@@ -135,6 +136,8 @@ export class WhopPayoutApiError extends Error {
     readonly code: string,
     readonly retryable: boolean,
     readonly idempotencyReplay = false,
+    readonly providerPayoutId: string | null = null,
+    readonly requestMayHaveSucceeded = false,
   ) {
     super(publicErrorMessage(code));
     Object.setPrototypeOf(this, new.target.prototype);
@@ -295,7 +298,7 @@ export class WhopPayoutClient {
         notes: input.notes,
       }),
     });
-    return parsePayout(value);
+    return parsePayout(value, true);
   }
 
   async retrievePayout(id: string, accountId: string): Promise<WhopPayout> {
@@ -337,13 +340,30 @@ export class WhopPayoutClient {
         },
       });
     } catch {
-      throw new WhopPayoutApiError(0, "provider_unavailable", true);
+      throw new WhopPayoutApiError(
+        0,
+        "provider_unavailable",
+        true,
+        false,
+        null,
+        init.method === "POST",
+      );
     }
 
     const json = await response.json().catch(() => null);
-    if (!response.ok) throw mapHttpError(response.status);
+    const requestMayHaveSucceeded = init.method === "POST";
+    if (!response.ok) {
+      throw mapHttpError(response.status, json, requestMayHaveSucceeded);
+    }
     if (json === null) {
-      throw new WhopPayoutApiError(502, "invalid_provider_response", true);
+      throw new WhopPayoutApiError(
+        502,
+        "invalid_provider_response",
+        true,
+        false,
+        null,
+        requestMayHaveSucceeded,
+      );
     }
     return json;
   }
@@ -369,20 +389,79 @@ function parseTimeout(value: string | undefined): number {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_TIMEOUT_MS;
 }
 
-function mapHttpError(status: number): WhopPayoutApiError {
+function mapHttpError(
+  status: number,
+  body: unknown,
+  requestMayHaveSucceeded: boolean,
+): WhopPayoutApiError {
   if (status === 401) {
-    return new WhopPayoutApiError(status, "authentication_failed", false);
+    return new WhopPayoutApiError(
+      status,
+      "authentication_failed",
+      false,
+      false,
+      null,
+      requestMayHaveSucceeded,
+    );
   }
   if (status === 403) {
-    return new WhopPayoutApiError(status, "permission_denied", false);
+    return new WhopPayoutApiError(
+      status,
+      "permission_denied",
+      false,
+      false,
+      null,
+      requestMayHaveSucceeded,
+    );
   }
   if (status === 409) {
-    return new WhopPayoutApiError(status, "idempotency_conflict", false, true);
+    return new WhopPayoutApiError(
+      status,
+      "idempotency_conflict",
+      false,
+      true,
+      safePayoutId(body),
+      requestMayHaveSucceeded,
+    );
   }
   if (status === 400 || status === 404 || status === 422) {
-    return new WhopPayoutApiError(status, "provider_validation_failed", false);
+    return new WhopPayoutApiError(
+      status,
+      "provider_validation_failed",
+      false,
+      false,
+      null,
+      requestMayHaveSucceeded,
+    );
   }
-  return new WhopPayoutApiError(status, "provider_unavailable", status >= 500);
+  return new WhopPayoutApiError(
+    status,
+    "provider_unavailable",
+    status >= 500,
+    false,
+    null,
+    requestMayHaveSucceeded,
+  );
+}
+
+function safePayoutId(value: unknown): string | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as JsonRecord;
+  const nested =
+    record.error && typeof record.error === "object" && !Array.isArray(record.error)
+      ? (record.error as JsonRecord)
+      : null;
+  const candidates = [
+    record.payout_id,
+    record.id,
+    nested?.payout_id,
+    nested?.id,
+  ];
+  const payoutId = candidates.find(
+    (candidate): candidate is string =>
+      typeof candidate === "string" && /^wdrl_[A-Za-z0-9_]+$/.test(candidate),
+  );
+  return payoutId ?? null;
 }
 
 function publicErrorMessage(code: string): string {
@@ -420,7 +499,10 @@ function parseQuote(value: unknown): WhopPayoutQuote {
   }
 }
 
-function parsePayout(value: unknown): WhopPayout {
+function parsePayout(
+  value: unknown,
+  requestMayHaveSucceeded = false,
+): WhopPayout {
   try {
     const record = expectRecord(value);
     const status = expectString(record.status) as WhopPayoutStatus;
@@ -441,12 +523,28 @@ function parsePayout(value: unknown): WhopPayout {
           : expectFiniteNumber(record.exchange_rate).toString(),
       estimatedArrival: nullableDateString(record.estimated_arrival),
       createdAt: expectDateString(record.created_at),
+      metadata: optionalStringMetadata(record.metadata),
       failure: parseFailure(record.failure),
     };
   } catch (error) {
     if (error instanceof WhopPayoutApiError) throw error;
-    throw new WhopPayoutApiError(502, "invalid_provider_response", true);
+    throw new WhopPayoutApiError(
+      502,
+      "invalid_provider_response",
+      true,
+      false,
+      null,
+      requestMayHaveSucceeded,
+    );
   }
+}
+
+function optionalStringMetadata(value: unknown): Record<string, string> | null {
+  if (value === null || value === undefined) return null;
+  const record = expectRecord(value);
+  return Object.fromEntries(
+    Object.entries(record).map(([key, item]) => [key, expectString(item)]),
+  );
 }
 
 function parseVerification(value: unknown): WhopVerification {

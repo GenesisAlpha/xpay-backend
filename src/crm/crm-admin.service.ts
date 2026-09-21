@@ -1,5 +1,6 @@
 import {
   Injectable, NotFoundException, BadRequestException, ForbiddenException,
+  ServiceUnavailableException,
 } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
 import { getEffectiveSellerFees } from '../shared/fee.calculator'
@@ -40,6 +41,7 @@ interface RevenueBreakdown {
   negative_margin_sales: number
   sales_count: number
 }
+import { PayoutOrchestratorService } from '../payouts/payout-orchestrator.service'
 
 interface AdminContext {
   managerId: string
@@ -100,7 +102,10 @@ function normalizeDestination(metadata: any) {
 
 @Injectable()
 export class CrmAdminService {
-  constructor(private readonly connectedPayouts: WhopConnectedPayoutService) { }
+  constructor(
+    private readonly connectedPayouts: WhopConnectedPayoutService,
+    private readonly payouts: PayoutOrchestratorService,
+  ) { }
 
   // ─── Guard: admin (rw) ou supervisor (ro) ────────────────────────────
   private assertAdmin(role: string, writeOp = false) {
@@ -639,10 +644,13 @@ export class CrmAdminService {
 
     if (error || !data) throw new NotFoundException('Saque não encontrado')
     const ledger = await this.fetchLedgerPayout(id)
+    // Saque pela master (payout_executions): detalhe da execução na Whop.
+    const execution = await this.payouts.findByReference(id)
     return {
       ...this.formatWithdrawalRow(data),
       // Seller com conta conectada: em que perna o envio está.
       whop_payout: this.connectedPayouts.describe(ledger),
+      ...(execution ? { payout_execution: await this.payouts.getCrmDetail(execution.id) } : {}),
     }
   }
 
@@ -699,6 +707,26 @@ export class CrmAdminService {
   // Ao aprovar, debitamos withdrawing de vez (dinheiro sai do sistema).
   async approveWithdrawal(ctx: AdminContext, id: string, dto: { notes?: string }) {
     this.assertAdmin(ctx.role, true)
+    const providerExecution = await this.payouts.findByReference(id)
+    if (providerExecution) {
+      await this.audit(ctx, 'withdrawal.approval_requested', 'withdrawal', id, {
+        payout_id: providerExecution.id,
+        notes: dto.notes,
+      })
+      const result = await this.payouts.approveAndDispatch(providerExecution.id, {
+        managerId: ctx.managerId,
+        role: ctx.role,
+      })
+      const auditAction = result.state === 'already_claimed'
+        ? 'withdrawal.approval_noop'
+        : 'withdrawal.approved_and_dispatched'
+      await this.audit(ctx, auditAction, 'withdrawal', id, {
+        payout_id: providerExecution.id,
+        state: result.state,
+        notes: dto.notes,
+      })
+      return result
+    }
     const w = await this.fetchLedgerPayout(id)
 
     if (w.status !== 'pending') {
@@ -771,6 +799,24 @@ export class CrmAdminService {
     this.assertAdmin(ctx.role, true)
     if (!dto.reason?.trim()) throw new BadRequestException('Motivo é obrigatório')
 
+    const providerExecution = await this.payouts.findByReference(id)
+    if (providerExecution) {
+      await this.audit(ctx, 'withdrawal.rejection_requested', 'withdrawal', id, {
+        payout_id: providerExecution.id,
+        reason: dto.reason,
+      })
+      const result = await this.payouts.reject(
+        providerExecution.id,
+        { managerId: ctx.managerId, role: ctx.role },
+        dto.reason,
+      )
+      await this.audit(ctx, 'withdrawal.rejected', 'withdrawal', id, {
+        payout_id: providerExecution.id,
+        reason: dto.reason,
+      })
+      return result
+    }
+
     const w = await this.fetchLedgerPayout(id)
 
     if (w.status !== 'pending') {
@@ -815,6 +861,115 @@ export class CrmAdminService {
     return { message: 'Saque rejeitado e saldo devolvido' }
   }
 
+  async listPayoutFees(ctx: AdminContext) {
+    this.assertAdmin(ctx.role)
+    return this.payouts.listFeeRules()
+  }
+
+  async updatePayoutFee(ctx: AdminContext, methodKey: string, dto: {
+    percentage_bps: number
+    fixed_fee_usd_cents: number
+    enabled: boolean
+    effective_at: string
+  }) {
+    this.assertAdmin(ctx.role, true)
+    await this.audit(ctx, 'payout_fee.update_requested', 'withdrawal', methodKey, {
+      method_key: methodKey,
+      percentage_bps: dto.percentage_bps,
+      fixed_fee_usd_cents: dto.fixed_fee_usd_cents,
+      enabled: dto.enabled,
+      effective_at: dto.effective_at,
+    })
+    const result = await this.payouts.updateFeeRule(methodKey, {
+      percentageBps: dto.percentage_bps,
+      fixedUsdCents: dto.fixed_fee_usd_cents,
+      enabled: dto.enabled,
+      effectiveAt: dto.effective_at,
+    }, ctx.managerId)
+    await this.audit(ctx, 'payout_fee.updated', 'withdrawal', methodKey, {
+      method_key: methodKey,
+      percentage_bps: dto.percentage_bps,
+      fixed_fee_usd_cents: dto.fixed_fee_usd_cents,
+      enabled: dto.enabled,
+      effective_at: dto.effective_at,
+    })
+    return result
+  }
+
+  async retryWithdrawal(ctx: AdminContext, id: string) {
+    this.assertAdmin(ctx.role, true)
+    await this.audit(ctx, 'withdrawal.dispatch_retry_requested', 'withdrawal', id, {})
+    const result = await this.payouts.retryDispatch(id, {
+      managerId: ctx.managerId,
+      role: ctx.role,
+    })
+    await this.audit(ctx, 'withdrawal.dispatch_retried', 'withdrawal', id, {
+      state: result.state,
+    })
+    return result
+  }
+
+  async reconcileWithdrawal(ctx: AdminContext, id: string) {
+    this.assertAdmin(ctx.role, true)
+    await this.audit(ctx, 'withdrawal.reconcile_requested', 'withdrawal', id, {})
+    const result = await this.payouts.reconcileOne(id, {
+      managerId: ctx.managerId,
+      role: ctx.role,
+    })
+    await this.audit(ctx, 'withdrawal.reconciled', 'withdrawal', id, {
+      state: result.state,
+    })
+    return result
+  }
+
+  async manualOverrideWithdrawal(ctx: AdminContext, id: string, dto: {
+    action: string
+    reason: string
+  }) {
+    this.assertAdmin(ctx.role, true)
+    if (!dto.reason?.trim()) throw new BadRequestException('Motivo é obrigatório')
+    await this.audit(ctx, 'withdrawal.manual_override_requested', 'withdrawal', id, {
+      action: dto.action,
+      reason: dto.reason.trim(),
+    })
+    const result = await this.payouts.manualOverride(
+      id,
+      { managerId: ctx.managerId, role: ctx.role },
+      dto.action,
+      dto.reason.trim(),
+    )
+    await this.audit(ctx, 'withdrawal.manual_override', 'withdrawal', id, {
+      action: dto.action,
+      reason: dto.reason.trim(),
+      state: result.state,
+    })
+    return result
+  }
+
+  async attachProviderPayout(ctx: AdminContext, id: string, dto: {
+    provider_payout_id: string
+    reason: string
+  }) {
+    this.assertAdmin(ctx.role, true)
+    if (!dto.reason?.trim()) throw new BadRequestException('Motivo é obrigatório')
+    await this.audit(ctx, 'withdrawal.provider_attach_requested', 'withdrawal', id, {
+      provider_payout_id: dto.provider_payout_id,
+      reason: dto.reason.trim(),
+    })
+    const result = await this.payouts.attachProviderPayout(
+      id,
+      dto.provider_payout_id,
+      { managerId: ctx.managerId, role: ctx.role },
+      dto.reason.trim(),
+    )
+    await this.audit(ctx, 'withdrawal.provider_attached', 'withdrawal', id, {
+      provider_payout_id: dto.provider_payout_id,
+      reason: dto.reason.trim(),
+      state: result.state,
+    })
+    return result
+  }
+
   // ─── Mark Completed: approved|processing → completed ─────────────────
   // No Modelo A o saldo JÁ foi debitado na aprovação. Aqui só confirmamos
   // que o dinheiro saiu efetivamente no provider — NÃO mexe em saldo.
@@ -825,6 +980,14 @@ export class CrmAdminService {
     this.assertAdmin(ctx.role, true)
     if (!dto.provider_tx_id?.trim()) {
       throw new BadRequestException('provider_tx_id é obrigatório')
+    }
+
+    const providerExecution = await this.payouts.findByReference(id)
+    if (providerExecution) {
+      return this.manualOverrideWithdrawal(ctx, providerExecution.id, {
+        action: 'completed',
+        reason: dto.notes?.trim() || 'Conclusão confirmada pelo administrador',
+      })
     }
 
     const w = await this.fetchLedgerPayout(id)
@@ -872,6 +1035,14 @@ export class CrmAdminService {
   async markWithdrawalFailed(ctx: AdminContext, id: string, dto: { reason: string }) {
     this.assertAdmin(ctx.role, true)
     if (!dto.reason?.trim()) throw new BadRequestException('Motivo é obrigatório')
+
+    const providerExecution = await this.payouts.findByReference(id)
+    if (providerExecution) {
+      return this.manualOverrideWithdrawal(ctx, providerExecution.id, {
+        action: 'failed',
+        reason: dto.reason,
+      })
+    }
 
     const w = await this.fetchLedgerPayout(id)
 
@@ -1568,7 +1739,7 @@ export class CrmAdminService {
     resourceId: string,
     payload: Record<string, any>,
   ) {
-    await supabase.from('crm_action_log').insert({
+    const { error } = await supabase.from('crm_action_log').insert({
       seller_id: payload.seller_id ?? null,
       manager_id: ctx.managerId,
       action,
@@ -1578,6 +1749,9 @@ export class CrmAdminService {
       ip_address: ctx.ip ?? null,
       user_agent: ctx.userAgent ?? null,
       created_at: new Date(),
-    }).then(() => { })
+    })
+    if (error) {
+      throw new ServiceUnavailableException('Não foi possível registrar a auditoria')
+    }
   }
 }

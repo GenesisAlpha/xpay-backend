@@ -5,6 +5,7 @@ jest.mock('../lib/supabase.client', () => ({
 import { ConflictException } from '@nestjs/common';
 import { signPreviewConfirmation } from './payout-domain';
 import { PayoutOrchestratorService } from './payout-orchestrator.service';
+import { WhopPayoutApiError } from './whop-payout.client';
 
 describe('PayoutOrchestratorService', () => {
   const originalEnv = { ...process.env };
@@ -63,8 +64,49 @@ describe('PayoutOrchestratorService', () => {
     quoteToken: 'quote_secret',
   });
 
+  const execution = (overrides: Record<string, unknown> = {}) => ({
+    id: 'payout-1',
+    ledgerEntryId: 'ledger-1',
+    sellerId: 'seller-1',
+    localMethodId: 'local-method-1',
+    providerAccountId: 'biz_secret',
+    providerPayoutId: null,
+    providerIdempotencyKey: 'koopfy_payout_abc',
+    methodKey: 'pix',
+    speed: 'standard',
+    sourceCurrency: 'USD',
+    providerPayoutMinor: 11_450,
+    confirmedMinimumNetMinor: 10_800,
+    localState: 'dispatching',
+    acceptedAt: null,
+    claimedAt: '2026-09-21T15:00:00.000Z',
+    attemptToken: '00000000-0000-4000-8000-000000000111',
+    providerCreateStartedAt: null,
+    providerCreateResolvedAt: null,
+    ...overrides,
+  });
+
+  const providerFailure = (status: number | 'timeout') =>
+    new WhopPayoutApiError(
+      status === 'timeout' ? 0 : status,
+      status === 409
+        ? 'idempotency_conflict'
+        : status === 401
+          ? 'authentication_failed'
+          : status === 403
+            ? 'permission_denied'
+            : status === 422
+              ? 'provider_validation_failed'
+              : 'provider_unavailable',
+      status === 'timeout' || status === 500,
+      status === 409,
+      null,
+      true,
+    );
+
   beforeEach(() => {
     process.env.PAYOUT_PREVIEW_HMAC_SECRET = secret;
+    process.env.KOOPFY_WHOP_MASTER_PAYOUTS_ENABLED = 'true';
     accounts = {
       getReadiness: jest.fn().mockResolvedValue({
         status: 'ready',
@@ -91,6 +133,7 @@ describe('PayoutOrchestratorService', () => {
         },
       ]),
       createPayout: jest.fn(),
+      retrievePayout: jest.fn(),
     };
     repository = {
       getFeeRule: jest.fn().mockResolvedValue({
@@ -105,6 +148,29 @@ describe('PayoutOrchestratorService', () => {
       }),
       getRequoteExecution: jest.fn(),
       requeueRequoted: jest.fn(),
+      claimDispatch: jest.fn().mockResolvedValue(execution()),
+      markRequoteRequired: jest.fn().mockResolvedValue({
+        state: 'requote_required',
+      }),
+      updateDispatchState: jest.fn().mockResolvedValue(true),
+      recordProviderPayoutId: jest.fn().mockResolvedValue(undefined),
+      persistApprovalQuote: jest.fn().mockResolvedValue(undefined),
+      markProviderCreateStarted: jest.fn().mockResolvedValue(true),
+      resolveProviderCreateFailure: jest.fn().mockResolvedValue({
+        state: 'dispatch_failed',
+      }),
+      recordUncertainCreate: jest.fn().mockResolvedValue(true),
+      attachRecoveredProviderPayout: jest.fn().mockResolvedValue({
+        state: 'processing',
+      }),
+      finalizeAccepted: jest.fn().mockResolvedValue({
+        state: 'processing',
+      }),
+      releaseReservation: jest.fn(),
+      findByReference: jest.fn(),
+      claimReconciliation: jest.fn(),
+      applyProviderState: jest.fn().mockResolvedValue({ state: 'processing' }),
+      restoreProviderFunds: jest.fn(),
     };
     service = new PayoutOrchestratorService(
       accounts as never,
@@ -323,5 +389,364 @@ describe('PayoutOrchestratorService', () => {
       }),
     );
     expect(whop.createPayout).not.toHaveBeenCalled();
+  });
+
+  it('lets only one concurrent admin dispatch a payout', async () => {
+    repository.claimDispatch
+      .mockResolvedValueOnce(execution())
+      .mockResolvedValueOnce(null);
+    whop.createPayout.mockResolvedValue({ id: 'wdrl_1', status: 'processing' });
+
+    const results = await Promise.allSettled([
+      service.approveAndDispatch('payout-1', {
+        managerId: 'admin-a',
+        role: 'admin',
+      }),
+      service.approveAndDispatch('payout-1', {
+        managerId: 'admin-b',
+        role: 'admin',
+      }),
+    ]);
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(2);
+    expect(whop.createPayout).toHaveBeenCalledTimes(1);
+    expect(repository.finalizeAccepted).toHaveBeenCalledTimes(1);
+  });
+
+  it('requires seller reconfirmation when the approval quote deteriorates', async () => {
+    whop.createQuote.mockResolvedValue(quote('107.99', '6.51'));
+
+    await expect(
+      service.approveAndDispatch('payout-1', {
+        managerId: 'admin-a',
+        role: 'admin',
+      }),
+    ).resolves.toMatchObject({ state: 'requote_required' });
+
+    expect(repository.markRequoteRequired).toHaveBeenCalledWith(
+      'payout-1',
+      expect.objectContaining({ netMinor: 10_799 }),
+      '00000000-0000-4000-8000-000000000111',
+    );
+    expect(whop.createPayout).not.toHaveBeenCalled();
+    expect(repository.releaseReservation).not.toHaveBeenCalled();
+  });
+
+  it('persists an acceptable refreshed quote before creating the payout', async () => {
+    whop.createQuote.mockResolvedValue(quote('108.20', '6.30'));
+    whop.createPayout.mockResolvedValue({ id: 'wdrl_1', status: 'processing' });
+
+    await service.approveAndDispatch('payout-1', {
+      managerId: 'admin-a',
+      role: 'admin',
+    });
+
+    expect(repository.persistApprovalQuote).toHaveBeenCalledWith(
+      'payout-1',
+      expect.objectContaining({ providerFeeMinor: 630, netMinor: 10_820 }),
+      '00000000-0000-4000-8000-000000000111',
+    );
+    expect(
+      repository.persistApprovalQuote.mock.invocationCallOrder[0],
+    ).toBeLessThan(whop.createPayout.mock.invocationCallOrder[0]);
+  });
+
+  it.each([
+    [422, 'dispatch_failed', false],
+    [401, 'dispatch_failed', false],
+    [403, 'dispatch_failed', false],
+    [500, 'dispatching', false],
+    ['timeout', 'dispatching', false],
+  ] as const)(
+    'maps provider failure %s to %s without releasing funds',
+    async (failure, expectedState, retryable) => {
+      whop.createPayout.mockRejectedValue(providerFailure(failure));
+
+      await expect(
+        service.approveAndDispatch('payout-1', {
+          managerId: 'admin-a',
+          role: 'admin',
+        }),
+      ).resolves.toMatchObject({ state: expectedState, retryable });
+
+      if (expectedState === 'dispatch_failed') {
+        expect(repository.resolveProviderCreateFailure).toHaveBeenCalledWith(
+          'payout-1',
+          '00000000-0000-4000-8000-000000000111',
+          expect.objectContaining({ retryable: false }),
+        );
+      } else {
+        expect(repository.recordUncertainCreate).toHaveBeenCalledWith(
+          'payout-1',
+          '00000000-0000-4000-8000-000000000111',
+          expect.objectContaining({ retryable: true }),
+        );
+      }
+      expect(repository.releaseReservation).not.toHaveBeenCalled();
+    },
+  );
+
+  it('resolves a known pre-request configuration failure without quarantining funds', async () => {
+    whop.createPayout.mockRejectedValue(
+      new WhopPayoutApiError(
+        500,
+        'master_account_not_configured',
+        false,
+        false,
+        null,
+        false,
+      ),
+    );
+
+    await expect(
+      service.approveAndDispatch('payout-1', {
+        managerId: 'admin-a',
+        role: 'admin',
+      }),
+    ).resolves.toMatchObject({ state: 'dispatch_failed', retryable: false });
+
+    expect(repository.resolveProviderCreateFailure).toHaveBeenCalled();
+    expect(repository.recordUncertainCreate).not.toHaveBeenCalled();
+  });
+
+  it('retrieves the original payout after an idempotency conflict', async () => {
+    whop.createPayout.mockRejectedValue(
+      new WhopPayoutApiError(
+        409,
+        'idempotency_conflict',
+        false,
+        true,
+        'wdrl_original',
+        true,
+      ),
+    );
+    whop.retrievePayout.mockResolvedValue({
+      id: 'wdrl_original',
+      status: 'processing',
+    });
+
+    await expect(
+      service.approveAndDispatch('payout-1', {
+        managerId: 'admin-a',
+        role: 'admin',
+      }),
+    ).resolves.toMatchObject({ state: 'processing' });
+
+    expect(whop.retrievePayout).toHaveBeenCalledWith(
+      'wdrl_original',
+      'biz_secret',
+    );
+    expect(repository.finalizeAccepted).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not let a stale worker create after losing its dispatch lease', async () => {
+    repository.persistApprovalQuote.mockRejectedValueOnce(
+      new ConflictException('lease replaced'),
+    );
+    repository.updateDispatchState.mockResolvedValueOnce(false);
+
+    await expect(
+      service.approveAndDispatch('payout-1', {
+        managerId: 'admin-a',
+        role: 'admin',
+      }),
+    ).resolves.toMatchObject({
+      state: 'dispatching',
+      retryable: false,
+      superseded: true,
+    });
+
+    expect(repository.markProviderCreateStarted).not.toHaveBeenCalled();
+    expect(whop.createPayout).not.toHaveBeenCalled();
+  });
+
+  it('keeps an unresolved idempotency conflict uncertain and non-cancelable', async () => {
+    whop.createPayout.mockRejectedValue(providerFailure(409));
+
+    await expect(
+      service.approveAndDispatch('payout-1', {
+        managerId: 'admin-a',
+        role: 'admin',
+      }),
+    ).resolves.toMatchObject({
+      state: 'dispatching',
+      retryable: false,
+      manualReconciliationRequired: true,
+    });
+    expect(repository.recordUncertainCreate).toHaveBeenCalledWith(
+      'payout-1',
+      '00000000-0000-4000-8000-000000000111',
+      expect.objectContaining({ retryable: true }),
+    );
+
+    repository.findByReference.mockResolvedValue(
+      execution({ providerPayoutId: null, localState: 'dispatching' }),
+    );
+    await expect(
+      service.reject(
+        'payout-1',
+        { managerId: 'admin-a', role: 'admin' },
+        'cancel',
+      ),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(repository.releaseReservation).not.toHaveBeenCalled();
+  });
+
+  it('persists provider acceptance before finalizing the local outflow', async () => {
+    whop.createPayout.mockResolvedValue({ id: 'wdrl_1', status: 'processing' });
+    repository.finalizeAccepted.mockRejectedValue(
+      new Error('database unavailable'),
+    );
+
+    await expect(
+      service.approveAndDispatch('payout-1', {
+        managerId: 'admin-a',
+        role: 'admin',
+      }),
+    ).rejects.toThrow('database unavailable');
+
+    expect(repository.recordProviderPayoutId).toHaveBeenCalledWith(
+      'payout-1',
+      'wdrl_1',
+      'processing',
+      '00000000-0000-4000-8000-000000000111',
+    );
+  });
+
+  it('keeps a lost provider id non-refundable until externally resolved', async () => {
+    whop.createPayout.mockResolvedValueOnce({
+      id: 'wdrl_original',
+      status: 'processing',
+    });
+    repository.recordProviderPayoutId.mockRejectedValueOnce(
+      new Error('database unavailable'),
+    );
+
+    await expect(
+      service.approveAndDispatch('payout-1', {
+        managerId: 'admin-a',
+        role: 'admin',
+      }),
+    ).rejects.toThrow('database unavailable');
+
+    const stale = execution({
+      providerPayoutId: null,
+      claimedAt: '2026-09-21T14:00:00.000Z',
+      providerCreateStartedAt: '2026-09-21T14:00:01.000Z',
+      providerCreateResolvedAt: null,
+    });
+    repository.findByReference.mockResolvedValue(stale);
+
+    await expect(
+      service.reconcileOne('payout-1', {
+        managerId: 'admin-a',
+        role: 'admin',
+      }),
+    ).resolves.toMatchObject({
+      state: 'dispatching',
+      manualReconciliationRequired: true,
+    });
+
+    expect(whop.createQuote).toHaveBeenCalledTimes(1);
+    expect(whop.createPayout).toHaveBeenCalledTimes(1);
+    await expect(
+      service.reject(
+        'payout-1',
+        { managerId: 'admin-a', role: 'admin' },
+        'cancel',
+      ),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(repository.releaseReservation).not.toHaveBeenCalled();
+  });
+
+  it('attaches a provider payout only after verifying its immutable ownership metadata', async () => {
+    repository.findByReference.mockResolvedValue(
+      execution({
+        providerCreateStartedAt: '2026-09-21T14:00:01.000Z',
+      }),
+    );
+    whop.retrievePayout.mockResolvedValue({
+      id: 'wdrl_recovered',
+      status: 'processing',
+      amount: '114.50',
+      currency: 'usd',
+      metadata: {
+        koopfy_payout_id: 'payout-1',
+        koopfy_seller_id: 'seller-1',
+        koopfy_account_id: 'biz_secret',
+      },
+    });
+
+    await expect(
+      service.attachProviderPayout(
+        'payout-1',
+        'wdrl_recovered',
+        { managerId: 'admin-a', role: 'admin' },
+        'Confirmed in Whop dashboard',
+      ),
+    ).resolves.toMatchObject({ state: 'processing' });
+
+    expect(whop.retrievePayout).toHaveBeenCalledWith(
+      'wdrl_recovered',
+      'biz_secret',
+    );
+    expect(repository.attachRecoveredProviderPayout).toHaveBeenCalledWith(
+      'payout-1',
+      'wdrl_recovered',
+      'processing',
+      '00000000-0000-4000-8000-000000000111',
+    );
+  });
+
+  it('refuses to attach a provider payout whose metadata belongs to another request', async () => {
+    repository.findByReference.mockResolvedValue(
+      execution({
+        providerCreateStartedAt: '2026-09-21T14:00:01.000Z',
+      }),
+    );
+    whop.retrievePayout.mockResolvedValue({
+      id: 'wdrl_wrong',
+      status: 'processing',
+      amount: '114.50',
+      currency: 'usd',
+      metadata: {
+        koopfy_payout_id: 'payout-other',
+        koopfy_seller_id: 'seller-1',
+        koopfy_account_id: 'biz_secret',
+      },
+    });
+
+    await expect(
+      service.attachProviderPayout(
+        'payout-1',
+        'wdrl_wrong',
+        { managerId: 'admin-a', role: 'admin' },
+        'Confirmed in Whop dashboard',
+      ),
+    ).rejects.toBeInstanceOf(ConflictException);
+
+    expect(repository.attachRecoveredProviderPayout).not.toHaveBeenCalled();
+  });
+
+  it('leases a stale dispatch so concurrent reconciliation creates once', async () => {
+    const stale = execution({ claimedAt: '2026-09-21T14:00:00.000Z' });
+    repository.findByReference.mockResolvedValue(stale);
+    repository.claimReconciliation
+      .mockResolvedValueOnce(stale)
+      .mockResolvedValueOnce(null);
+    whop.createPayout.mockResolvedValue({ id: 'wdrl_1', status: 'processing' });
+
+    await Promise.allSettled([
+      service.reconcileOne('payout-1', {
+        managerId: 'admin-a',
+        role: 'admin',
+      }),
+      service.reconcileOne('payout-1', {
+        managerId: 'admin-b',
+        role: 'admin',
+      }),
+    ]);
+
+    expect(whop.createPayout).toHaveBeenCalledTimes(1);
   });
 });

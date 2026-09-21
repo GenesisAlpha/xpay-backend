@@ -5,7 +5,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import {
-  Controller, Get, Post, Body, Param, Query, Req, UseGuards,
+  Controller, Get, Post, Patch, Body, Param, Query, Req, UseGuards,
 } from '@nestjs/common'
 import { CrmAdminService } from './crm-admin.service'
 import { CrmAuthGuard, Roles } from './crm.module'
@@ -40,6 +40,26 @@ export class CrmAdminController {
   @Get('overview')
   getOverview(@Req() req: any, @Query('range') range: string) {
     return this.admin.getOverview(ctxFromReq(req), range ?? '30d')
+  }
+
+  @Get('payout-fees')
+  listPayoutFees(@Req() req: any) {
+    return this.admin.listPayoutFees(ctxFromReq(req))
+  }
+
+  @Patch('payout-fees/:methodKey')
+  @Roles('admin')
+  updatePayoutFee(
+    @Req() req: any,
+    @Param('methodKey') methodKey: string,
+    @Body() body: {
+      percentage_bps: number
+      fixed_fee_usd_cents: number
+      enabled: boolean
+      effective_at: string
+    },
+  ) {
+    return this.admin.updatePayoutFee(ctxFromReq(req), methodKey, body)
   }
 
   // ── Withdrawals ──────────────────────────────────────────────────────
@@ -80,6 +100,38 @@ export class CrmAdminController {
     @Body() body: { reason: string },
   ) {
     return this.admin.rejectWithdrawal(ctxFromReq(req), id, body)
+  }
+
+  @Post('withdrawals/:id/retry')
+  @Roles('admin')
+  retryWithdrawal(@Req() req: any, @Param('id') id: string) {
+    return this.admin.retryWithdrawal(ctxFromReq(req), id)
+  }
+
+  @Post('withdrawals/:id/reconcile')
+  @Roles('admin')
+  reconcileWithdrawal(@Req() req: any, @Param('id') id: string) {
+    return this.admin.reconcileWithdrawal(ctxFromReq(req), id)
+  }
+
+  @Post('withdrawals/:id/manual-override')
+  @Roles('admin')
+  manualOverrideWithdrawal(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Body() body: { action: string; reason: string },
+  ) {
+    return this.admin.manualOverrideWithdrawal(ctxFromReq(req), id, body)
+  }
+
+  @Post('withdrawals/:id/attach-provider-payout')
+  @Roles('admin')
+  attachProviderPayout(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Body() body: { provider_payout_id: string; reason: string },
+  ) {
+    return this.admin.attachProviderPayout(ctxFromReq(req), id, body)
   }
 
   @Post('withdrawals/:id/mark-completed')

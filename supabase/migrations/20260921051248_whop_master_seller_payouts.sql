@@ -162,6 +162,9 @@ create table public.payout_executions (
   provider_payout_id text unique,
   provider_status text,
   provider_status_detail text,
+  dispatch_attempt_token uuid,
+  provider_create_started_at timestamptz,
+  provider_create_resolved_at timestamptz,
   local_state text not null default 'pending_review' check (
     local_state in (
       'pending_review',
@@ -474,6 +477,7 @@ begin
 
   update public.payout_executions execution
      set local_state = 'dispatching',
+         dispatch_attempt_token = gen_random_uuid(),
          claimed_by = p_manager_id,
          claimed_at = now(),
          reviewed_by = p_manager_id,
@@ -495,7 +499,9 @@ begin
     return jsonb_build_object(
       'claimed', true,
       'payoutId', claimed.id,
-      'state', 'dispatching'
+      'state', 'dispatching',
+      'claimedAt', claimed.claimed_at,
+      'attemptToken', claimed.dispatch_attempt_token
     );
   end if;
 
@@ -511,6 +517,212 @@ begin
     'payoutId', p_payout_id,
     'state', current_state
   );
+end;
+$$;
+
+create or replace function public.claim_payout_reconciliation(
+  p_payout_id uuid,
+  p_manager_id text,
+  p_stale_before timestamptz
+)
+returns jsonb
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  claimed public.payout_executions;
+  current_state text;
+begin
+  if p_manager_id is null or btrim(p_manager_id) = '' then
+    raise exception 'manager_id obrigatório.' using errcode = '22023';
+  end if;
+
+  update public.payout_executions execution
+     set claimed_by = p_manager_id,
+         claimed_at = now(),
+         dispatch_attempt_token = gen_random_uuid(),
+         updated_at = now()
+   where execution.id = p_payout_id
+     and execution.local_state = 'dispatching'
+     and execution.provider_payout_id is null
+     and execution.provider_create_started_at is null
+     and coalesce(execution.claimed_at, execution.updated_at) <= p_stale_before
+  returning execution.* into claimed;
+
+  if found then
+    return jsonb_build_object(
+      'claimed', true,
+      'payoutId', claimed.id,
+      'state', 'dispatching',
+      'claimedAt', claimed.claimed_at,
+      'attemptToken', claimed.dispatch_attempt_token
+    );
+  end if;
+
+  select execution.local_state
+    into current_state
+    from public.payout_executions execution
+   where execution.id = p_payout_id;
+  if not found then
+    raise exception 'Payout não encontrado.' using errcode = 'KP404';
+  end if;
+  return jsonb_build_object(
+    'claimed', false,
+    'payoutId', p_payout_id,
+    'state', current_state
+  );
+end;
+$$;
+
+create or replace function public.mark_payout_requote_required(
+  p_payout_id uuid,
+  p_provider_fee_minor bigint,
+  p_net_minor bigint,
+  p_destination_currency text,
+  p_destination_amount_minor bigint,
+  p_quote_id text,
+  p_quote_expires_at timestamptz,
+  p_exchange_rate numeric,
+  p_estimated_arrival timestamptz,
+  p_attempt_token uuid
+)
+returns jsonb
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  execution public.payout_executions;
+begin
+  select item.*
+    into execution
+    from public.payout_executions item
+   where item.id = p_payout_id
+   for update;
+
+  if not found then
+    raise exception 'Payout não encontrado.' using errcode = 'KP404';
+  end if;
+  if execution.local_state <> 'dispatching'
+     or execution.accepted_at is not null
+     or execution.provider_payout_id is not null
+     or execution.provider_create_started_at is not null
+     or execution.dispatch_attempt_token is distinct from p_attempt_token then
+    raise exception 'Payout não pode aguardar nova cotação neste estado.'
+      using errcode = 'KP409';
+  end if;
+  if p_provider_fee_minor < 0
+     or p_net_minor < 0
+     or p_net_minor >= execution.confirmed_minimum_net_minor
+     or p_destination_amount_minor < 0
+     or p_destination_currency !~ '^[A-Z]{3}$' then
+    raise exception 'Snapshot de recotação inválido.' using errcode = '22023';
+  end if;
+
+  update public.payout_executions
+     set provider_fee_minor = p_provider_fee_minor,
+         net_minor = p_net_minor,
+         destination_currency = p_destination_currency,
+         destination_amount_minor = p_destination_amount_minor,
+         quote_id = p_quote_id,
+         quote_expires_at = p_quote_expires_at,
+         exchange_rate = p_exchange_rate,
+         estimated_arrival = p_estimated_arrival,
+         local_state = 'requote_required',
+         updated_at = now()
+   where id = p_payout_id;
+
+  update public.wallet_ledger
+     set status = 'requote_required',
+         updated_at = now()
+   where id = execution.ledger_entry_id;
+
+  return jsonb_build_object(
+    'payoutId', p_payout_id,
+    'state', 'requote_required'
+  );
+end;
+$$;
+
+create or replace function public.mark_payout_create_started(
+  p_payout_id uuid,
+  p_attempt_token uuid
+)
+returns jsonb
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  execution public.payout_executions;
+begin
+  select item.*
+    into execution
+    from public.payout_executions item
+   where item.id = p_payout_id
+   for update;
+  if not found then
+    raise exception 'Payout não encontrado.' using errcode = 'KP404';
+  end if;
+  if execution.local_state <> 'dispatching'
+     or execution.dispatch_attempt_token is distinct from p_attempt_token
+     or execution.provider_create_started_at is not null then
+    raise exception 'Tentativa de payout não pode iniciar neste estado.'
+      using errcode = 'KP409';
+  end if;
+
+  update public.payout_executions
+     set provider_create_started_at = now(),
+         provider_create_resolved_at = null,
+         updated_at = now()
+   where id = p_payout_id;
+
+  return jsonb_build_object('started', true, 'state', 'dispatching');
+end;
+$$;
+
+create or replace function public.resolve_payout_create_failure(
+  p_payout_id uuid,
+  p_attempt_token uuid,
+  p_error_code text,
+  p_error_message text
+)
+returns jsonb
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  execution public.payout_executions;
+begin
+  select item.*
+    into execution
+    from public.payout_executions item
+   where item.id = p_payout_id
+   for update;
+  if not found then
+    raise exception 'Payout não encontrado.' using errcode = 'KP404';
+  end if;
+  if execution.local_state <> 'dispatching'
+     or execution.dispatch_attempt_token is distinct from p_attempt_token
+     or execution.provider_create_started_at is null
+     or execution.provider_create_resolved_at is not null
+     or execution.provider_payout_id is not null
+     or execution.accepted_at is not null then
+    raise exception 'Falha de payout não pode ser resolvida neste estado.'
+      using errcode = 'KP409';
+  end if;
+
+  update public.payout_executions
+     set local_state = 'dispatch_failed',
+         provider_create_resolved_at = now(),
+         error_code = nullif(btrim(p_error_code), ''),
+         error_message = nullif(btrim(p_error_message), ''),
+         updated_at = now()
+   where id = p_payout_id;
+
+  return jsonb_build_object('resolved', true, 'state', 'dispatch_failed');
 end;
 $$;
 
@@ -542,6 +754,11 @@ begin
   end if;
   if execution.accepted_at is not null or execution.provider_payout_id is not null then
     raise exception 'Payout já aceito pelo provider; a reserva não pode ser liberada.'
+      using errcode = 'KP409';
+  end if;
+  if execution.provider_create_started_at is not null
+     and execution.provider_create_resolved_at is null then
+    raise exception 'Resultado do envio ao provider ainda é incerto.'
       using errcode = 'KP409';
   end if;
   if execution.local_state not in (
@@ -622,7 +839,7 @@ begin
     end if;
     return jsonb_build_object('finalized', false, 'state', execution.local_state);
   end if;
-  if execution.local_state not in ('dispatching', 'processing') then
+  if execution.local_state not in ('dispatching', 'dispatch_failed', 'processing') then
     raise exception 'Estado do payout não permite finalizar a saída.' using errcode = 'KP409';
   end if;
 
@@ -660,6 +877,122 @@ begin
 end;
 $$;
 
+create or replace function public.attach_recovered_provider_payout(
+  p_payout_id uuid,
+  p_provider_payout_id text,
+  p_provider_status text,
+  p_attempt_token uuid
+)
+returns jsonb
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  execution public.payout_executions;
+  result jsonb;
+begin
+  if p_provider_payout_id is null
+     or p_provider_payout_id !~ '^wdrl_[A-Za-z0-9_]+$' then
+    raise exception 'ID do payout do provider inválido.' using errcode = '22023';
+  end if;
+
+  select item.*
+    into execution
+    from public.payout_executions item
+   where item.id = p_payout_id
+   for update;
+  if not found then
+    raise exception 'Payout não encontrado.' using errcode = 'KP404';
+  end if;
+  if execution.local_state <> 'dispatching'
+     or execution.dispatch_attempt_token is distinct from p_attempt_token
+     or execution.provider_create_started_at is null
+     or execution.provider_create_resolved_at is not null
+     or execution.provider_payout_id is not null
+     or execution.accepted_at is not null then
+    raise exception 'Payout recuperado não pode ser vinculado neste estado.'
+      using errcode = 'KP409';
+  end if;
+
+  update public.payout_executions
+     set provider_payout_id = p_provider_payout_id,
+         provider_status = p_provider_status,
+         provider_create_resolved_at = now(),
+         dispatched_at = coalesce(dispatched_at, now()),
+         updated_at = now()
+   where id = p_payout_id;
+
+  result := public.finalize_payout_outflow(
+    p_payout_id,
+    p_provider_payout_id,
+    p_provider_status
+  );
+  return result || jsonb_build_object('recovered', true);
+end;
+$$;
+
+create or replace function public.apply_provider_payout_state(
+  p_payout_id uuid,
+  p_provider_payout_id text,
+  p_provider_status text,
+  p_local_state text
+)
+returns jsonb
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  execution public.payout_executions;
+begin
+  if p_local_state not in ('processing', 'completed') then
+    raise exception 'Estado do payout inválido.' using errcode = '22023';
+  end if;
+
+  select item.*
+    into execution
+    from public.payout_executions item
+   where item.id = p_payout_id
+   for update;
+  if not found then
+    raise exception 'Payout não encontrado.' using errcode = 'KP404';
+  end if;
+  if execution.provider_payout_id <> p_provider_payout_id
+     or execution.accepted_at is null then
+    raise exception 'Payout do provider ainda não foi finalizado.' using errcode = 'KP409';
+  end if;
+
+  if execution.local_state = 'completed' then
+    return jsonb_build_object('applied', false, 'state', 'completed');
+  end if;
+  if execution.local_state <> 'processing' then
+    raise exception 'Transição de payout não permitida.' using errcode = 'KP409';
+  end if;
+
+  update public.payout_executions
+     set provider_status = p_provider_status,
+         local_state = p_local_state,
+         completed_at = case
+           when p_local_state = 'completed' then coalesce(completed_at, now())
+           else completed_at
+         end,
+         updated_at = now()
+   where id = p_payout_id;
+
+  update public.wallet_ledger
+     set status = p_local_state,
+         completed_at = case
+           when p_local_state = 'completed' then coalesce(completed_at, now())
+           else completed_at
+         end,
+         updated_at = now()
+   where id = execution.ledger_entry_id;
+
+  return jsonb_build_object('applied', true, 'state', p_local_state);
+end;
+$$;
+
 create or replace function public.restore_provider_payout_funds(
   p_payout_id uuid,
   p_terminal_state text,
@@ -689,6 +1022,24 @@ begin
 
   if execution.wallet_restored_at is not null then
     return jsonb_build_object('restored', false, 'state', execution.local_state);
+  end if;
+  if execution.local_state = 'completed' and p_terminal_state <> 'reversed' then
+    raise exception 'Payout concluído só pode avançar para reversão.'
+      using errcode = 'KP409';
+  end if;
+  if execution.local_state not in (
+    'processing',
+    'completed',
+    'failed',
+    'canceled',
+    'denied',
+    'reversed'
+  ) or (
+    execution.local_state in ('failed', 'canceled', 'denied', 'reversed')
+    and execution.local_state <> p_terminal_state
+  ) then
+    raise exception 'Transição terminal de payout não permitida.'
+      using errcode = 'KP409';
   end if;
 
   update public.payout_executions
@@ -795,6 +1146,9 @@ begin
          estimated_arrival = p_estimated_arrival,
          confirmed_minimum_net_minor = p_confirmed_minimum_net_minor,
          local_state = 'pending_review',
+         dispatch_attempt_token = null,
+         provider_create_started_at = null,
+         provider_create_resolved_at = null,
          claimed_by = null,
          claimed_at = null,
          error_code = null,
@@ -817,9 +1171,23 @@ revoke all on function public.request_provider_payout_idempotent(
 ) from public, anon, authenticated;
 revoke all on function public.claim_payout_dispatch(uuid, text)
   from public, anon, authenticated;
+revoke all on function public.claim_payout_reconciliation(uuid, text, timestamptz)
+  from public, anon, authenticated;
+revoke all on function public.mark_payout_requote_required(
+  uuid, bigint, bigint, text, bigint, text, timestamptz, numeric, timestamptz,
+  uuid
+) from public, anon, authenticated;
+revoke all on function public.mark_payout_create_started(uuid, uuid)
+  from public, anon, authenticated;
+revoke all on function public.resolve_payout_create_failure(uuid, uuid, text, text)
+  from public, anon, authenticated;
+revoke all on function public.attach_recovered_provider_payout(uuid, text, text, uuid)
+  from public, anon, authenticated;
 revoke all on function public.release_payout_reservation(uuid, text, text)
   from public, anon, authenticated;
 revoke all on function public.finalize_payout_outflow(uuid, text, text)
+  from public, anon, authenticated;
+revoke all on function public.apply_provider_payout_state(uuid, text, text, text)
   from public, anon, authenticated;
 revoke all on function public.restore_provider_payout_funds(uuid, text, timestamptz, text)
   from public, anon, authenticated;
@@ -833,9 +1201,23 @@ grant execute on function public.request_provider_payout_idempotent(
 ) to service_role;
 grant execute on function public.claim_payout_dispatch(uuid, text)
   to service_role;
+grant execute on function public.claim_payout_reconciliation(uuid, text, timestamptz)
+  to service_role;
+grant execute on function public.mark_payout_requote_required(
+  uuid, bigint, bigint, text, bigint, text, timestamptz, numeric, timestamptz,
+  uuid
+) to service_role;
+grant execute on function public.mark_payout_create_started(uuid, uuid)
+  to service_role;
+grant execute on function public.resolve_payout_create_failure(uuid, uuid, text, text)
+  to service_role;
+grant execute on function public.attach_recovered_provider_payout(uuid, text, text, uuid)
+  to service_role;
 grant execute on function public.release_payout_reservation(uuid, text, text)
   to service_role;
 grant execute on function public.finalize_payout_outflow(uuid, text, text)
+  to service_role;
+grant execute on function public.apply_provider_payout_state(uuid, text, text, text)
   to service_role;
 grant execute on function public.restore_provider_payout_funds(uuid, text, timestamptz, text)
   to service_role;

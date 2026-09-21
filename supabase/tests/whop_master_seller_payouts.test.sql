@@ -1,7 +1,7 @@
 begin;
 
 create extension if not exists pgtap with schema extensions;
-select plan(30);
+select plan(40);
 
 select has_table('public', 'seller_payout_accounts', 'seller payout accounts table exists');
 select has_table('public', 'seller_payout_methods', 'seller payout methods table exists');
@@ -227,8 +227,61 @@ select is((select response->>'claimed' from first_claim), 'true', 'first admin c
 select is((select response->>'claimed' from second_claim), 'false', 'second admin cannot claim dispatch');
 
 update public.payout_executions
-set local_state = 'requote_required'
+set claimed_at = now() - interval '10 minutes'
 where id = (select (response->>'payoutId')::uuid from first_request);
+
+select is(
+  public.claim_payout_reconciliation(
+    (select (response->>'payoutId')::uuid from first_request),
+    'admin-reconcile-a',
+    now() - interval '5 minutes'
+  )->>'claimed',
+  'true',
+  'first reconciler leases a stale dispatch'
+);
+select is(
+  public.claim_payout_reconciliation(
+    (select (response->>'payoutId')::uuid from first_request),
+    'admin-reconcile-b',
+    now() - interval '5 minutes'
+  )->>'claimed',
+  'false',
+  'second reconciler cannot lease the same dispatch'
+);
+
+select is(
+  public.mark_payout_requote_required(
+    (select (response->>'payoutId')::uuid from first_request),
+    651,
+    10799,
+    'USD',
+    10799,
+    'quote_deteriorated',
+    now() + interval '10 minutes',
+    null,
+    now() + interval '2 days',
+    (
+      select dispatch_attempt_token
+        from public.payout_executions
+       where id = (select (response->>'payoutId')::uuid from first_request)
+    )
+  )->>'state',
+  'requote_required',
+  'deteriorated approval quote requires seller reconfirmation'
+);
+select is(
+  (
+    select status
+      from public.wallet_ledger
+     where id = (
+       select ledger_entry_id
+         from public.payout_executions
+        where id = (select (response->>'payoutId')::uuid from first_request)
+     )
+  ),
+  'requote_required',
+  'requote transition updates execution and ledger together'
+);
 
 select is(
   public.requeue_requoted_payout(
@@ -244,6 +297,66 @@ select is(
   )->>'state',
   'pending_review',
   'seller reconfirmation requeues the existing reserved execution'
+);
+
+select ok(
+  (
+    select dispatch_attempt_token is null
+       and provider_create_started_at is null
+       and provider_create_resolved_at is null
+      from public.payout_executions
+     where id = (select (response->>'payoutId')::uuid from first_request)
+  ),
+  'seller reconfirmation clears the previous dispatch lease'
+);
+
+select is(
+  public.claim_payout_dispatch(
+    (select (response->>'payoutId')::uuid from first_request),
+    'admin-c'
+  )->>'claimed',
+  'true',
+  'reconfirmed payout can be claimed with a fresh lease'
+);
+
+select is(
+  public.mark_payout_create_started(
+    (select (response->>'payoutId')::uuid from first_request),
+    (
+      select dispatch_attempt_token
+        from public.payout_executions
+       where id = (select (response->>'payoutId')::uuid from first_request)
+    )
+  )->>'started',
+  'true',
+  'provider create boundary is persisted before the external request'
+);
+
+select throws_ok(
+  format(
+    'select public.release_payout_reservation(%L::uuid, %L, %L)',
+    (select response->>'payoutId' from first_request),
+    'admin-c',
+    'must remain reserved'
+  ),
+  'KP409',
+  'Resultado do envio ao provider ainda é incerto.',
+  'an unresolved external create can never release reserved funds'
+);
+
+select is(
+  public.resolve_payout_create_failure(
+    (select (response->>'payoutId')::uuid from first_request),
+    (
+      select dispatch_attempt_token
+        from public.payout_executions
+       where id = (select (response->>'payoutId')::uuid from first_request)
+    ),
+    'provider_validation_failed',
+    'definitive rejection'
+  )->>'state',
+  'dispatch_failed',
+  'a definitive provider rejection resolves the external create boundary'
 );
 
 select is(
@@ -300,13 +413,31 @@ select public.claim_payout_dispatch(
 );
 
 select is(
-  public.finalize_payout_outflow(
+  public.mark_payout_create_started(
+    (select (response->>'payoutId')::uuid from accepted_request),
+    (
+      select dispatch_attempt_token
+        from public.payout_executions
+       where id = (select (response->>'payoutId')::uuid from accepted_request)
+    )
+  )->>'started',
+  'true',
+  'recovery fixture persists the external create boundary'
+);
+
+select is(
+  public.attach_recovered_provider_payout(
     (select (response->>'payoutId')::uuid from accepted_request),
     'wdrl_pgtap',
-    'processing'
+    'processing',
+    (
+      select dispatch_attempt_token
+        from public.payout_executions
+       where id = (select (response->>'payoutId')::uuid from accepted_request)
+    )
   )->>'finalized',
   'true',
-  'provider acceptance finalizes withdrawing outflow'
+  'verified provider recovery atomically finalizes withdrawing outflow'
 );
 select is(
   public.finalize_payout_outflow(
