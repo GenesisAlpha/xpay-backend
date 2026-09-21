@@ -15,6 +15,7 @@ import { WebhookService } from '../webhooks/webhook.service'
 import { notifySellerAccount } from '../utils/seller-mail'
 import { DEFAULT_FEE_SETTINGS, getSellerFees, sellerFeesRow, type FeeSettings } from '../shared/fee.calculator'
 import { FEE_FIELDS, FEE_TOGGLES, feeChanges, parseFeeSettings } from './fee-config'
+import { SellerPayoutAccountService } from '../payouts/seller-payout-account.service'
 import * as bcrypt from 'bcrypt'
 import { LoginAttemptLimiter } from './crm-login-limiter'
 import { currentCrmRequest } from './crm-request-context'
@@ -75,6 +76,7 @@ export class CrmService {
     private readonly whopAccounts: WhopAccountsService,
     private readonly clipAccounts: ClipAccountsService,
     private readonly webhookService: WebhookService,
+    private readonly payoutAccounts: SellerPayoutAccountService,
   ) { }
 
   // =========================================
@@ -563,6 +565,21 @@ export class CrmService {
 
     // Vendedor sabe que já pode vender: métodos, taxas e primeiros passos.
     void notifySellerAccount(sellerId, 'approved', { enabledMethods: dto.enabledMethods, fees: sellerFeesRow(fees) })
+
+    // Saque pela master (KOOPFY_WHOP_MASTER_PAYOUTS_ENABLED): prepara a conta de
+    // recebimento. Desligado, o saque segue o fluxo de conta conectada da main e
+    // nenhuma conta nova é criada na Whop.
+    if (process.env.KOOPFY_WHOP_MASTER_PAYOUTS_ENABLED === 'true') {
+      // A aprovação local não depende da disponibilidade momentânea da Whop.
+      try {
+        await this.payoutAccounts.ensureConnectedAccount(sellerId)
+      } catch (error: any) {
+        console.error(
+          '[CrmService.approveSeller] provisionamento de payout pendente:',
+          typeof error?.code === 'string' ? error.code : 'provider_provisioning_failed',
+        )
+      }
+    }
 
     return { message: 'Seller aprovado', fees: sellerFeesRow(fees), logisticsGroupUrl }
   }

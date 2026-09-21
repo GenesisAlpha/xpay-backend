@@ -161,6 +161,28 @@ describe("WhopPayoutClient", () => {
     );
   });
 
+  it("reads the hosted verification session URL from the documented field", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        data: [
+          {
+            id: "idpf_1",
+            status: "action_required",
+            session_url: "https://verify.whop.com/session/idpf_1",
+          },
+        ],
+      }),
+    );
+
+    await expect(client.listVerifications("biz_seller")).resolves.toEqual([
+      {
+        id: "idpf_1",
+        status: "action_required",
+        url: "https://verify.whop.com/session/idpf_1",
+      },
+    ]);
+  });
+
   it.each([
     [401, "authentication_failed", false],
     [403, "permission_denied", false],

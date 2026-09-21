@@ -77,6 +77,62 @@ export class KoopfyFinanceController {
     return this.finance.getPayoutDestinationFields(req.sellerCtx, query);
   }
 
+  @Get('payout-account')
+  payoutAccount(@Req() req: any) {
+    return this.finance.getPayoutAccount(req.sellerCtx);
+  }
+
+  @Post('payout-account/verification')
+  startPayoutVerification(
+    @Req() req: any,
+    @Body() body: { returnUrl?: unknown },
+  ) {
+    return this.finance.startPayoutVerification(req.sellerCtx, {
+      returnUrl: body?.returnUrl,
+    });
+  }
+
+  @Post('payout-account/sync')
+  syncPayoutAccount(@Req() req: any) {
+    return this.finance.syncPayoutAccount(req.sellerCtx);
+  }
+
+  @Get('payout-methods/supported')
+  supportedPayoutMethods(@Req() req: any) {
+    return this.finance.listSupportedPayoutMethods(req.sellerCtx);
+  }
+
+  @Get('payout-methods')
+  payoutMethods(@Req() req: any) {
+    return this.finance.listSavedPayoutMethods(req.sellerCtx);
+  }
+
+  @Post('payout-methods')
+  createPayoutMethod(
+    @Req() req: any,
+    @Body()
+    body: {
+      supportedMethodId?: unknown;
+      destinationCurrency?: unknown;
+      fields?: unknown;
+      nickname?: unknown;
+      isDefault?: unknown;
+    },
+  ) {
+    return this.finance.createPayoutMethod(req.sellerCtx, {
+      supportedMethodId: body?.supportedMethodId,
+      destinationCurrency: body?.destinationCurrency,
+      fields: body?.fields,
+      nickname: body?.nickname,
+      isDefault: body?.isDefault,
+    });
+  }
+
+  @Delete('payout-methods/:id')
+  removePayoutMethod(@Req() req: any, @Param('id') id: string) {
+    return this.finance.removePayoutMethod(req.sellerCtx, id);
+  }
+
   // O seller vem do token verificado; um sellerId no corpo é descartado.
   @Post('payouts')
   requestPayout(

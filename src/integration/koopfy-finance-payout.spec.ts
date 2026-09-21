@@ -286,3 +286,77 @@ describe('KoopfyFinanceController.requestPayout', () => {
     expect(finance.requestPayout).toHaveBeenCalledWith(activeContext, achPayout, KEY);
   });
 });
+
+describe('KoopfyFinanceService payout account onboarding', () => {
+  function createService() {
+    const payouts = {
+      getReadiness: jest.fn(),
+      startVerification: jest.fn(),
+      syncReadiness: jest.fn(),
+      listSupportedMethods: jest.fn(),
+      listSavedMethods: jest.fn(),
+      createSavedMethod: jest.fn(),
+      removeSavedMethod: jest.fn(),
+    };
+    const none = {} as never;
+    return {
+      payouts,
+      service: new KoopfyFinanceService(
+        none,
+        none,
+        none,
+        none,
+        none,
+        none,
+        none,
+        none,
+        payouts as never,
+      ),
+    };
+  }
+
+  it('uses the verified seller for readiness and verification', async () => {
+    const { service, payouts } = createService();
+    payouts.getReadiness.mockResolvedValue({ status: 'ready' });
+    payouts.startVerification.mockResolvedValue({ status: 'under_review' });
+
+    await expect(service.getPayoutAccount(activeContext)).resolves.toEqual({
+      status: 'ready',
+    });
+    await service.startPayoutVerification(activeContext, {
+      returnUrl: 'https://app.koopfy.com/finance',
+    });
+
+    expect(payouts.getReadiness).toHaveBeenCalledWith('seller-1');
+    expect(payouts.startVerification).toHaveBeenCalledWith(
+      'seller-1',
+      'https://app.koopfy.com/finance',
+    );
+  });
+
+  it('allowlists method creation fields before the payout service', async () => {
+    const { service, payouts } = createService();
+    payouts.createSavedMethod.mockResolvedValue({ id: 'local-method-1' });
+
+    await service.createPayoutMethod(activeContext, {
+      supportedMethodId: 'podst_1',
+      destinationCurrency: 'usd',
+      fields: {
+        fld_bank_account_number: '123456789',
+        injectedObject: { provider_account_id: 'biz_attacker' },
+      },
+      nickname: 'Principal',
+      isDefault: true,
+      sellerId: 'attacker',
+      providerMethodId: 'potk_attacker',
+    } as never);
+
+    expect(payouts.createSavedMethod).toHaveBeenCalledWith('seller-1', {
+      supportedMethodId: 'podst_1',
+      destinationCurrency: 'usd',
+      fields: { fld_bank_account_number: '123456789' },
+      nickname: 'Principal',
+      isDefault: true,
+    });
+  });
+});

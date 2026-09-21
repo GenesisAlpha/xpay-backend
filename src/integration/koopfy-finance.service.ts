@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  Optional,
 } from '@nestjs/common';
 import { DashboardService, Period } from '../dashboard/services/reports.service';
 import {
@@ -17,6 +18,7 @@ import { RequestPayoutDto } from '../dashboard/dto/request-payout.dto';
 import { SellerCtx } from './cross-service-jwt.guard';
 import { AnticipationService } from '../wallets/anticipation.service';
 import { normalizeFinanceListQuery } from './koopfy-finance-query';
+import { SellerPayoutAccountService } from '../payouts/seller-payout-account.service';
 
 const TRANSACTION_STATUSES = [
   'pending',
@@ -140,6 +142,7 @@ export class KoopfyFinanceService {
     private readonly settings: SettingsService,
     private readonly apiKeys: ApiKeysService,
     private readonly anticipation?: AnticipationService,
+    @Optional() private readonly payoutAccounts?: SellerPayoutAccountService,
   ) {}
 
   private seller(ctx: SellerCtx) {
@@ -147,6 +150,13 @@ export class KoopfyFinanceService {
       throw new ConflictException('Conta financeira ainda não está ativa.');
     }
     return ctx.seller;
+  }
+
+  private requirePayoutAccounts(): SellerPayoutAccountService {
+    if (!this.payoutAccounts) {
+      throw new ConflictException('Configuração de saques indisponível.');
+    }
+    return this.payoutAccounts;
   }
 
   async getOverview(ctx: SellerCtx, requestedPeriod: unknown) {
@@ -265,6 +275,78 @@ export class KoopfyFinanceService {
       date: payout.date,
       processedAt: payout.processedAt ?? null,
     }));
+  }
+
+  async getPayoutAccount(ctx: SellerCtx) {
+    return this.requirePayoutAccounts().getReadiness(this.seller(ctx).id);
+  }
+
+  async startPayoutVerification(
+    ctx: SellerCtx,
+    body: { returnUrl?: unknown },
+  ) {
+    const returnUrl =
+      typeof body.returnUrl === 'string' ? body.returnUrl.trim() : undefined;
+    return this.requirePayoutAccounts().startVerification(
+      this.seller(ctx).id,
+      returnUrl,
+    );
+  }
+
+  async syncPayoutAccount(ctx: SellerCtx) {
+    return this.requirePayoutAccounts().syncReadiness(this.seller(ctx).id);
+  }
+
+  async listSupportedPayoutMethods(ctx: SellerCtx) {
+    return this.requirePayoutAccounts().listSupportedMethods(this.seller(ctx).id);
+  }
+
+  async listSavedPayoutMethods(ctx: SellerCtx) {
+    return this.requirePayoutAccounts().listSavedMethods(this.seller(ctx).id);
+  }
+
+  async createPayoutMethod(
+    ctx: SellerCtx,
+    body: {
+      supportedMethodId?: unknown;
+      destinationCurrency?: unknown;
+      fields?: unknown;
+      nickname?: unknown;
+      isDefault?: unknown;
+    },
+  ) {
+    const fields =
+      body.fields && typeof body.fields === 'object' && !Array.isArray(body.fields)
+        ? Object.fromEntries(
+            Object.entries(body.fields).filter(
+              (entry): entry is [string, string] =>
+                typeof entry[1] === 'string',
+            ),
+          )
+        : {};
+    return this.requirePayoutAccounts().createSavedMethod(
+      this.seller(ctx).id,
+      {
+        supportedMethodId:
+          typeof body.supportedMethodId === 'string'
+            ? body.supportedMethodId
+            : '',
+        destinationCurrency:
+          typeof body.destinationCurrency === 'string'
+            ? body.destinationCurrency
+            : undefined,
+        fields,
+        nickname:
+          typeof body.nickname === 'string' ? body.nickname.trim() : undefined,
+        isDefault:
+          typeof body.isDefault === 'boolean' ? body.isDefault : undefined,
+      },
+    );
+  }
+
+  async removePayoutMethod(ctx: SellerCtx, id: string) {
+    await this.requirePayoutAccounts().removeSavedMethod(this.seller(ctx).id, id);
+    return { removed: true };
   }
 
   async requestPayout(

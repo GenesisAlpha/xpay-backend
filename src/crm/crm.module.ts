@@ -59,6 +59,7 @@ import { ActivationModule } from '../activation/activation.module'
 import { AffiliatesModule } from '../affiliates/affiliates.module'
 import { AffiliateCrmController } from '../affiliates/affiliate-crm.controller'
 import { crmRequestContext } from './crm-request-context'
+import { PayoutModule } from '../payouts/payout.module'
 
 @Module({
   imports: [
@@ -87,6 +88,7 @@ import { crmRequestContext } from './crm-request-context'
     // AffiliatesModule: o AffiliateCrmService vem de lá; o controller fica aqui
     // porque o CrmAuthGuard precisa do JwtModule registrado neste módulo.
     AffiliatesModule,
+    PayoutModule,
   ],
   // WhopConnectController: conta conectada da Whop por seller (serviço vem do
   // OrchestratorModule).

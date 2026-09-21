@@ -63,6 +63,7 @@ export interface WhopSavedPayoutMethod {
   id: string;
   accountReference: string | null;
   destinationCurrency: string | null;
+  institutionName: string | null;
   nickname: string | null;
   isDefault: boolean;
   status: string;
@@ -89,6 +90,8 @@ export interface WhopSupportedPayoutMethod {
     required: boolean;
     sensitive: boolean;
     options: string[] | null;
+    validation: string | null;
+    placeholder: string | null;
   }> | null;
 }
 
@@ -443,10 +446,26 @@ function parsePayout(value: unknown): WhopPayout {
 function parseVerification(value: unknown): WhopVerification {
   try {
     const record = expectRecord(value);
+    const status = expectString(record.status);
+    if (
+      ![
+        'not_started',
+        'pending',
+        'processing',
+        'manual_review',
+        'approved',
+        'rejected',
+        'action_required',
+      ].includes(status)
+    ) {
+      throw new Error('status');
+    }
     return {
       id: expectString(record.id),
-      status: expectString(record.status),
-      url: optionalString(record.url ?? record.verification_url),
+      status,
+      url: optionalString(
+        record.session_url ?? record.url ?? record.verification_url,
+      ),
     };
   } catch {
     throw new WhopPayoutApiError(502, "invalid_provider_response", true);
@@ -482,6 +501,8 @@ function parseSupportedMethod(value: unknown): WhopSupportedPayoutMethod {
                   item.options === null || item.options === undefined
                     ? null
                     : expectArray(item.options).map(expectString),
+                validation: optionalString(item.validation),
+                placeholder: optionalString(item.placeholder),
               };
             }),
     };
@@ -498,6 +519,7 @@ function parseSavedMethod(value: unknown): WhopSavedPayoutMethod {
       id: expectPrefixedString(record.id, "potk_"),
       accountReference: optionalString(record.account_reference),
       destinationCurrency: nullableCurrency(record.destination_currency),
+      institutionName: optionalString(record.institution_name),
       nickname: optionalString(record.nickname),
       isDefault: expectBoolean(record.is_default),
       status: expectString(record.status),
@@ -584,16 +606,26 @@ function optionalString(value: unknown): string | null {
 
 function expectPrefixedString(value: unknown, prefix: string): string {
   const result = expectString(value);
-  if (!result.startsWith(prefix)) throw new Error("prefix");
+  if (!new RegExp(`^${escapeRegex(prefix)}[A-Za-z0-9_]+$`).test(result)) {
+    throw new Error("prefix");
+  }
   return result;
 }
 
 function expectOneOfPrefixes(value: unknown, prefixes: string[]): string {
   const result = expectString(value);
-  if (!prefixes.some((prefix) => result.startsWith(prefix))) {
+  if (
+    !prefixes.some((prefix) =>
+      new RegExp(`^${escapeRegex(prefix)}[A-Za-z0-9_]+$`).test(result),
+    )
+  ) {
     throw new Error("prefix");
   }
   return result;
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function expectBoolean(value: unknown): boolean {

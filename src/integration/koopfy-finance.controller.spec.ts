@@ -46,4 +46,30 @@ describe('KoopfyFinanceController', () => {
       evidenceUrls: ['https://merchant.example/evidence.pdf'],
     });
   });
+
+  it('drops browser-supplied seller and provider identity fields from payout methods', async () => {
+    const finance = {
+      createPayoutMethod: jest.fn().mockResolvedValue({ id: 'local-method-1' }),
+    };
+    const controller = new KoopfyFinanceController(finance as never);
+    const sellerCtx = { seller: { id: 'verified-seller' } };
+
+    await controller.createPayoutMethod(
+      { sellerCtx } as never,
+      {
+        supportedMethodId: 'podst_1',
+        destinationCurrency: 'usd',
+        fields: { fld_bank_routing_number: '021000021' },
+        sellerId: 'attacker',
+        account_id: 'biz_attacker',
+        provider_method_id: 'potk_attacker',
+      } as never,
+    );
+
+    expect(finance.createPayoutMethod).toHaveBeenCalledWith(sellerCtx, {
+      supportedMethodId: 'podst_1',
+      destinationCurrency: 'usd',
+      fields: { fld_bank_routing_number: '021000021' },
+    });
+  });
 });
