@@ -288,7 +288,7 @@ The withdrawal dialog becomes:
 
 Provider identifiers and internal fee composition are never returned to the seller client.
 
-### 9.2 CRM API and UI
+### 9.2 CRM API
 
 The CRM adds:
 
@@ -299,9 +299,11 @@ The CRM adds:
 - retry/reconcile actions for `dispatch_failed` and stale processing states;
 - a controlled manual fallback with mandatory reason and audit entry.
 
-The approval button is disabled when verification, payout capability, saved-method status, or master configuration is invalid, and displays the actionable reason.
+The CRM API reports whether approval is allowed and returns an actionable blocking reason when verification, payout capability, saved-method status, or master configuration is invalid.
 
 The current manual `mark-completed` and `mark-failed` actions no longer serve as the normal workflow. They remain privileged recovery tools and must first retrieve the provider payout when a provider ID exists.
+
+The CRM frontend repository is outside this implementation by explicit scope decision on 2026-09-21. The backend contracts remain ready for the active administrative client without modifying `dash-pay`.
 
 ## 10. Failure Handling
 
@@ -379,7 +381,6 @@ Logs include local payout ID, seller ID, provider payout ID when available, stat
 - dynamic method and speed selection;
 - gross, consolidated fee, net, FX, and ETA summary;
 - `pending_review`, `requote_required`, processing, terminal, and retry states;
-- CRM approval disabled reasons and fee breakdown;
 - mobile completion of the entire withdrawal flow.
 
 ### Release verification

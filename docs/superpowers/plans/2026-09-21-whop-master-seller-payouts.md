@@ -4,9 +4,9 @@
 
 **Goal:** Build a Koopfy-owned withdrawal flow in which seller funds are reserved at request time and a single, idempotent Whop payout from the master account to the seller's connected account is created only after CRM approval.
 
-**Architecture:** `backend/apps/pay` owns payout state, fee snapshots, connected-account references, provider calls, ledger transitions, webhooks, and reconciliation. `backend-embed/apps/checkout` remains a narrow authenticated facade; `dash-checkout` renders the seller setup/quote/confirmation flow; `dash-pay` renders CRM review, fee configuration, dispatch, and recovery controls. Supabase RPCs make every balance mutation and state claim atomic, while Whop quote tokens remain in memory and provider identifiers never reach the seller client.
+**Architecture:** `backend/apps/pay` owns payout state, fee snapshots, connected-account references, CRM operations, provider calls, ledger transitions, webhooks, and reconciliation. `backend-embed/apps/checkout` remains a narrow authenticated facade, and `dash-checkout` renders the seller setup/quote/confirmation flow. Supabase RPCs make every balance mutation and state claim atomic, while Whop quote tokens remain in memory and provider identifiers never reach the seller client.
 
-**Tech Stack:** NestJS 11/10, TypeScript 5.x, Jest 29, PostgreSQL/Supabase with pgTAP, Next.js 16, React 18/19, Node test runner, Whop Current REST API.
+**Tech Stack:** NestJS 11/10, TypeScript 5.x, Jest 29, PostgreSQL/Supabase with pgTAP, Next.js 16, React 19, Node test runner, Whop Current REST API.
 
 **Spec:** `docs/superpowers/specs/2026-09-21-whop-master-seller-payouts-design.md`
 
@@ -26,7 +26,7 @@
 - Newly approved sellers are provisioned after local approval; existing sellers are provisioned lazily when they open payout setup. External provisioning failure never rolls back local approval.
 - Legacy pending withdrawals stay on the existing manual workflow unless explicitly migrated; this release performs no bulk migration or bulk connected-account provisioning.
 - Legally required provider/compliance disclosures on hosted verification surfaces remain visible even though Koopfy-owned screens use Koopfy terminology.
-- Existing dirty files in `dash-checkout` (`next-env.d.ts`, `tsconfig.tsbuildinfo`) and `dash-pay` (`.env.development`, `.env.production`, `next.config.ts`) belong to the user and must not be staged or overwritten.
+- Existing dirty files in `dash-checkout` (`next-env.d.ts`, `tsconfig.tsbuildinfo`) belong to the user and must not be staged or overwritten.
 - Rollout stays fail-closed behind `KOOPFY_WHOP_MASTER_PAYOUTS_ENABLED`; the existing `KOOPFY_UNIFIED_PAYOUTS_ENABLED` flag alone must not enable provider dispatch.
 - Preview confirmation fields are bound to the authenticated seller with `HMAC-SHA-256` using the server-only `PAYOUT_PREVIEW_HMAC_SECRET`; the signed proof contains no provider quote token and expires with the preview.
 - `KOOPFY_SUPABASE_TEST_DB_URL` must point to a disposable non-production database before database tests or migration pushes run.
@@ -75,11 +75,9 @@
 - Modify `app/finance/wallet/page.tsx` and `hooks/use-finance.ts`: readiness/history refresh and reconfirm actions.
 - Modify `lib/koopfy-payments-state.ts` and its test: enable only when both Koopfy rollout flags/readiness permit.
 
-### `dash-pay` — CRM experience
+### CRM frontend scope
 
-- Create `src/lib/payout-admin.ts` and `src/lib/payout-admin.test.mjs`: status/readiness/action/fee presentation helpers.
-- Modify `src/components/admin-panel.tsx`: fee rule editor, fee breakdown, readiness blocker, approve/send, retry/reconcile, privileged fallback.
-- Modify `package.json`: add a narrow Node test script for the new pure helper without changing runtime dependencies.
+- `dash-pay` is explicitly excluded by the user. This plan delivers the CRM fee/approval/recovery API in `backend/apps/pay`; no CRM frontend repository is modified.
 
 ## Public Contracts Used Across Tasks
 
@@ -933,96 +931,15 @@ git add lib/finance/payout-request.ts lib/finance/payout-request.test.mjs compon
 git commit -m "feat(checkout): add seller payout setup and preview"
 ```
 
-### Task 10: CRM Fee Configuration, Approval, and Recovery UI
+### Task 10: End-to-End Rollout, Observability, and Release Gate
 
-**Repository:** `/Users/lucas/koopfy/dash-pay`
-
-**Files:**
-- Create: `src/lib/payout-admin.ts`
-- Create: `src/lib/payout-admin.test.mjs`
-- Modify: `src/components/admin-panel.tsx`
-- Modify: `package.json`
-
-**Interfaces:**
-- Consumes: fee-rule CRUD, withdrawal detail readiness/fee split, approve, reject, retry, reconcile, and manual-override CRM endpoints.
-- Produces: admin-only fee editor and safe operational controls with disabled reasons.
-
-- [ ] **Step 1: Write failing presentation tests**
-
-```js
-test('approval is disabled with an actionable readiness reason', () => {
-  assert.deepEqual(approvalAvailability({ payouts_enabled: false, blocker_message: 'Verificação pendente.' }), {
-    enabled: false,
-    reason: 'Verificação pendente.',
-  });
-});
-
-test('completed payouts do not offer normal manual completion', () => {
-  assert.deepEqual(normalActionsFor('completed'), []);
-});
-```
-
-Add the remaining state/fee assertions:
-
-```js
-test('recovery actions follow backend state', () => {
-  assert.deepEqual(normalActionsFor('dispatch_failed'), ['retry', 'reconcile']);
-  assert.deepEqual(normalActionsFor('processing', { stale: true }), ['reconcile']);
-  assert.deepEqual(normalActionsFor('requote_required'), []);
-});
-
-test('fee editor converts percentages to integer basis points', () => {
-  assert.deepEqual(toFeeRulePatch({ percentage: '1.50', fixedUsd: '3.00', enabled: true }), {
-    percentage_bps: 150, fixed_fee_usd_cents: 300, enabled: true,
-  });
-});
-```
-
-- [ ] **Step 2: Add the narrow test command and verify failure**
-
-Add to `package.json`:
-
-```json
-"test:payout-admin": "node --test src/lib/payout-admin.test.mjs"
-```
-
-Run: `pnpm test:payout-admin`
-
-Expected: FAIL because `payout-admin.ts` is absent.
-
-- [ ] **Step 3: Implement helpers and CRM views**
-
-In the withdrawal detail, replace raw destination display with the saved method label/masked reference, show gross, Koopfy fee, provider fee, consolidated fee, provider payout amount, destination net, FX, ETA, connected-account readiness, and last sync. Rename the primary action to `Aprovar e enviar`; disable it with the backend reason. Show retry/reconcile only for eligible states. Put manual override behind a secondary danger dialog requiring a typed reason. Add fee-rule rows with percent, fixed USD, enabled, effective timestamp, and updater; submit integers only.
-
-- [ ] **Step 4: Run test, lint, build, and inspect dirty files**
-
-Run:
-
-```bash
-pnpm test:payout-admin
-pnpm lint
-pnpm build
-git status --short
-```
-
-Expected: PASS; `.env.development`, `.env.production`, and `next.config.ts` remain unstaged user changes.
-
-- [ ] **Step 5: Commit selected CRM files**
-
-```bash
-git add src/lib/payout-admin.ts src/lib/payout-admin.test.mjs src/components/admin-panel.tsx package.json
-git commit -m "feat(crm): manage and dispatch seller payouts"
-```
-
-### Task 11: End-to-End Rollout, Observability, and Release Gate
-
-**Repositories:** all four repositories above.
+**Repositories:** the three repositories above; `dash-pay` remains untouched.
 
 **Files:**
 - Create: `docs/runbooks/whop-master-seller-payouts.md` in `backend/apps/pay`
 
 **Interfaces:**
-- Consumes: completed backend, facade, seller UI, CRM UI, Whop sandbox, and non-production Supabase.
+- Consumes: completed backend, facade, seller UI, CRM API, Whop sandbox, and non-production Supabase.
 - Produces: operational runbook, rollout sequence, evidence bundle, and rollback procedure.
 
 - [ ] **Step 1: Write the release checklist before enabling flags**
@@ -1032,7 +949,7 @@ The runbook must name exact settings and order:
 ```text
 1. Apply and verify the Supabase migration in non-production.
 2. Configure WHOP_API_VERSION_DATE=2026-09-15, PAYOUT_PREVIEW_HMAC_SECRET, and master account credentials server-side.
-3. Keep KOOPFY_WHOP_MASTER_PAYOUTS_ENABLED=false while deploying Pay, checkout facade, CRM, and seller UI.
+3. Keep KOOPFY_WHOP_MASTER_PAYOUTS_ENABLED=false while deploying Pay, checkout facade, and seller UI.
 4. Run one sandbox seller through verification and save a payout method.
 5. Confirm seller request reserves funds and produces zero POST /api/v1/payouts calls.
 6. Approve in CRM and confirm one provider payout under forced retries.
@@ -1050,7 +967,6 @@ Run:
 cd /Users/lucas/koopfy/backend/apps/pay && pnpm test -- --runInBand && pnpm build
 cd /Users/lucas/koopfy/backend-embed && pnpm --dir apps/checkout test -- --runInBand && pnpm --dir apps/checkout build
 cd /Users/lucas/koopfy/dash-checkout && node --test lib/finance/payout-request.test.mjs lib/koopfy-payments-state.test.mjs lib/finance-api.test.mjs && pnpm build
-cd /Users/lucas/koopfy/dash-pay && pnpm test:payout-admin && pnpm build
 ```
 
 Expected: every command exits 0.
@@ -1076,7 +992,7 @@ git commit -m "docs(pay): add Whop payout rollout runbook"
 ## Final Review Gate
 
 - [ ] Confirm every spec section maps to a completed task and test.
-- [ ] Search all four diffs for `apiKey`, `quote_token`, routing/account/Pix/wallet fixtures, `biz_`, and `potk_`; distinguish intentional server-side identifiers/tests from leaks.
+- [ ] Search all three diffs for `apiKey`, `quote_token`, routing/account/Pix/wallet fixtures, `biz_`, and `potk_`; distinguish intentional server-side identifiers/tests from leaks.
 - [ ] Confirm seller JSON and browser network payloads contain only public saved-method IDs and consolidated fees.
 - [ ] Confirm CRM approval is the first possible code path that calls `WhopPayoutClient.createPayout`.
 - [ ] Confirm every retry retains one execution and one deterministic provider idempotency key.
