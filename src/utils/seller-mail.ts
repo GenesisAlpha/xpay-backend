@@ -18,6 +18,7 @@
 
 import * as sgMail from '@sendgrid/mail';
 import { supabase } from '../lib/supabase.client';
+import { checkoutInternal } from '../crm/checkout-internal';
 
 /**
  * Logo da Koopfy no cabeçalho escuro (texto branco + carrinho amarelo). PNG
@@ -681,11 +682,36 @@ export async function notifySellerAccount(
   }
 }
 
+/**
+ * Mesma mudança de status no app do vendedor (push + lista de notificações).
+ * O checkout guarda os aparelhos e resolve as lojas da conta; aqui só avisa.
+ * Independe do SendGrid e nunca lança.
+ */
+async function pushPayoutToApp(sellerId: string, event: PayoutEmailEvent, info: PayoutEmailInfo): Promise<void> {
+  if (!info.payoutId) return;
+  try {
+    const { data: seller } = await supabase.from('seller_profiles').select('email').eq('id', sellerId).maybeSingle();
+    await checkoutInternal('mobile/payout-event', {
+      sellerId,
+      email: seller?.email ?? null,
+      event,
+      payoutId: String(info.payoutId),
+      amountCents: info.amountCents,
+      currency: info.currency ?? 'USD',
+      method: info.method ?? null,
+      reason: info.reason ?? null,
+    });
+  } catch (error: any) {
+    console.error(`[SellerMail] push do saque ${event} (seller ${sellerId}) falhou:`, error?.message ?? error);
+  }
+}
+
 export async function notifySellerPayout(
   sellerId: string | null | undefined,
   event: PayoutEmailEvent,
   info: PayoutEmailInfo,
 ): Promise<void> {
+  if (sellerId) void pushPayoutToApp(sellerId, event, info);
   try {
     const apiKey = process.env.SENDGRID_API_KEY;
     if (!apiKey || !sellerId) {
