@@ -20,6 +20,8 @@ import { ActivationModule } from '../activation/activation.module';
 import { OrchestratorModule } from '../orchestrator/orchestrator.module';
 import { AnticipationService } from '../wallets/anticipation.service';
 import { PayoutModule } from '../payouts/payout.module';
+import { KoopfyPaymentDomainsController } from './koopfy-payment-domains.controller';
+import { KoopfyPaymentDomainsService } from './koopfy-payment-domains.service';
 
 @Module({
   // WalletDashModule exporta o WalletService — o saldo do card da home do
@@ -40,7 +42,7 @@ import { PayoutModule } from '../payouts/payout.module';
     OrchestratorModule,
     PayoutModule,
   ],
-  controllers: [KoopfyIntegrationController, KoopfyFinanceController],
-  providers: [KoopfyIntegrationService, KoopfyFinanceService, StorageService, AnticipationService],
+  controllers: [KoopfyIntegrationController, KoopfyFinanceController, KoopfyPaymentDomainsController],
+  providers: [KoopfyIntegrationService, KoopfyFinanceService, StorageService, AnticipationService, KoopfyPaymentDomainsService],
 })
 export class KoopfyIntegrationModule {}

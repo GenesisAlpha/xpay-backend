@@ -66,6 +66,8 @@ import { CryptoModule } from '../crypto/crypto.module';
     // WhopLinkedAccountsService: o CRM e o painel conectam/desligam a conta
     // própria do seller, e o webhook precisa resolver os ids 'whopl_…'.
     WhopLinkedAccountsService,
+    // WhopPlatformClient: domínios de pagamento (Apple Pay) das contas da loja.
+    WhopPlatformClient,
     StripeAccountsService,
     StripeRiskService,
     StripeEfwService,

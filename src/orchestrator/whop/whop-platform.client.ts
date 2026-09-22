@@ -190,6 +190,31 @@ export class WhopPlatformClient {
     return this.payouts('GET', `/payouts/${encodeURIComponent(payoutId)}`);
   }
 
+  // ── Domínios de pagamento (Apple Pay no checkout incorporado) ─────────────
+  // Registra o hostname do site do seller na Apple pela Whop. Sem `account_id`
+  // vale para a própria master; com ele, para a conta conectada (a chave de
+  // plataforma age em nome da filha). A Whop tenta verificar na hora: devolve
+  // `verified` se achou o arquivo de associação, senão `pending`.
+
+  createPaymentMethodDomain(hostname: string, accountId: string | null, idempotencyKey: string) {
+    return this.payouts('POST', '/payment_method_domains', {
+      body: { hostname, ...(accountId ? { account_id: accountId } : {}) },
+      idempotencyKey,
+    });
+  }
+
+  /** Sem `account_id`: os da master e os de todas as contas conectadas. */
+  listPaymentMethodDomains(accountId: string | null) {
+    return this.payouts('GET', '/payment_method_domains', {
+      query: { first: '100', ...(accountId ? { account_id: accountId } : {}) },
+    });
+  }
+
+  /** Nova tentativa de verificação; `bad_request` explica o que falta. */
+  verifyPaymentMethodDomain(id: string) {
+    return this.payouts('POST', `/payment_method_domains/${encodeURIComponent(id)}/verify`, { body: {} });
+  }
+
   private payouts(
     method: 'GET' | 'POST',
     path: string,
