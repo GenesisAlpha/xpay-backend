@@ -322,6 +322,39 @@ describe('decideConnectedMode', () => {
     const expired = new Date(now - CONNECTED_FALLBACK_MAX_MS - 1).toISOString();
     expect(decideConnectedMode({ ...down, fallback_started_at: expired }, now).mode).toBe('blocked');
   });
+
+  // Caso real (biz_0Cv2…, 19/09): pedido de informação da Whop pausou o SAQUE
+  // e a conta seguia recebendo; as vendas foram para a master e seriam
+  // bloqueadas em 72h.
+  const payoutsPaused = {
+    ...row,
+    status: 'action_required' as const,
+    whop_status: 'active',
+    capabilities: { accept_card_payments: 'active', standard_payout: 'inactive', transfer: 'inactive' },
+  };
+
+  it('saque parado com recebimento ativo continua na conta conectada', () => {
+    expect(decideConnectedMode(payoutsPaused, now)).toEqual({ mode: 'connected' });
+    // Mesmo com uma janela de fallback já aberta (vencida ou não).
+    const expired = new Date(now - CONNECTED_FALLBACK_MAX_MS - 1).toISOString();
+    expect(decideConnectedMode({ ...payoutsPaused, fallback_started_at: expired }, now)).toEqual({ mode: 'connected' });
+  });
+
+  it('recebimento por cartão desligado cai na master', () => {
+    const payinOff = { ...payoutsPaused, status: 'active' as const, capabilities: { accept_card_payments: 'inactive' } };
+    expect(decideConnectedMode(payinOff, now)).toMatchObject({ mode: 'fallback', reason: 'conta conectada active sem recebimento por cartão' });
+  });
+
+  it('suspensa ou recusada cai na master mesmo com o cartão ativo', () => {
+    expect(decideConnectedMode({ ...payoutsPaused, status: 'suspended' }, now).mode).toBe('fallback');
+    expect(decideConnectedMode({ ...payoutsPaused, whop_status: 'suspended' }, now).mode).toBe('fallback');
+    expect(decideConnectedMode({ ...payoutsPaused, status: 'rejected' }, now).mode).toBe('fallback');
+  });
+
+  it('sem capabilities vale o status geral, como antes', () => {
+    expect(decideConnectedMode({ ...row, capabilities: {} }, now)).toEqual({ mode: 'connected' });
+    expect(decideConnectedMode({ ...row, status: 'action_required', capabilities: {} }, now).mode).toBe('fallback');
+  });
 });
 
 describe('planIndividualVerification', () => {

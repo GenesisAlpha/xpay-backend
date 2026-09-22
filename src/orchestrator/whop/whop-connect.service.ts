@@ -41,6 +41,7 @@ import {
   sellerRequirementItems,
   toConnectedProviderAccountId,
   whopAccountIdFromProviderAccountId,
+  payinActive,
 } from './whop-connected';
 import { availableCents } from './whop-connected-payout';
 import { notifySellerVerification } from '../../utils/seller-mail';
@@ -461,15 +462,18 @@ export class WhopConnectService implements OnModuleInit {
       individual_verification_status: individualStatus,
       requested_information: requested,
       status,
-      // Conta de volta: a próxima queda ganha uma janela de 72h nova.
-      ...(status === 'active' ? { fallback_started_at: null } : {}),
+      // Recebendo de novo: a próxima queda ganha uma janela de 72h nova. Vale o
+      // recebimento, não o status — saque parado não é queda.
+      ...(payinActive({ status, capabilities: account?.capabilities ?? {}, whop_status: account?.status ?? null })
+        ? { fallback_started_at: null }
+        : {}),
       last_synced_at: new Date().toISOString(),
       last_error: null,
     });
     this.routingCache.delete(sellerId);
 
     if (status !== row.status) {
-      const down = status !== 'active';
+      const down = !payinActive({ status, capabilities: account?.capabilities ?? {}, whop_status: account?.status ?? null });
       if (down || row.charges_enabled) {
         console[down ? 'error' : 'log'](
           `[WhopConnect] seller ${sellerId} (${row.whop_account_id}): ${row.status} → ${status}`

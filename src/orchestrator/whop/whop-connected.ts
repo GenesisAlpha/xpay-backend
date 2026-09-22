@@ -183,17 +183,37 @@ export type ConnectedModeDecision =
 // só se ele não tiver risco (reserva acionada = chargeback acima de 1%), dentro
 // da janela e sem o corte do CRM: se a Whop derrubou a conta POR fraude, é
 // isso que impede a fraude de ir para a conta de todos.
+/**
+ * A conta conectada RECEBE pagamento? É isso que decide onde a venda nasce.
+ * Saque parado (pedido de informação da Whop sobre payout: `status`
+ * action_required, `standard_payout` inativo) não tira a venda da conta — a
+ * própria Whop avisa "You can still accept payments during this time". Só
+ * suspensão, recusa ou o recebimento por cartão desligado mandam para a master.
+ */
+export function payinActive(
+  row: Pick<WhopConnectedAccountRow, 'status'> & Partial<Pick<WhopConnectedAccountRow, 'capabilities' | 'whop_status'>>,
+): boolean {
+  if (row.status === 'suspended' || row.status === 'rejected' || row.whop_status === 'suspended') return false;
+  const card = row.capabilities?.accept_card_payments;
+  // Sem `capabilities` (chave sem company:balance:read) não dá para separar
+  // recebimento de saque: vale o status geral, como antes.
+  if (card === undefined) return row.status === 'active';
+  return card === 'active';
+}
+
 export function decideConnectedMode(
   row: Pick<
     WhopConnectedAccountRow,
     'charges_enabled' | 'whop_account_id' | 'status' | 'risk_tier' | 'fallback_started_at' | 'fallback_disabled'
-  > | null | undefined,
+  > & Partial<Pick<WhopConnectedAccountRow, 'capabilities' | 'whop_status'>> | null | undefined,
   nowMs = Date.now(),
 ): ConnectedModeDecision {
   if (!row || !row.charges_enabled) return { mode: 'master' };
-  if (row.whop_account_id && row.status === 'active') return { mode: 'connected' };
+  if (row.whop_account_id && payinActive(row)) return { mode: 'connected' };
 
-  const down = row.whop_account_id ? `conta conectada ${row.status}` : 'conta conectada sem id da Whop';
+  const down = !row.whop_account_id
+    ? 'conta conectada sem id da Whop'
+    : `conta conectada ${row.status}${row.status === 'active' ? ' sem recebimento por cartão' : ''}`;
 
   if (row.fallback_disabled) return { mode: 'blocked', reason: `${down}; fallback na master cortado no CRM` };
   if (row.risk_tier === 'RESERVE') return { mode: 'blocked', reason: `${down}; seller com chargeback acima de 1% não usa a master` };
