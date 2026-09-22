@@ -97,7 +97,7 @@ export KOOPFY_SUPABASE_TEST_DB_URL='<URL não produtiva>'
 Gate de aprovação:
 
 - dry-run contém apenas a migration pretendida;
-- pgTAP conclui 42/42;
+- pgTAP conclui 43/43;
 - advisor não retorna erro de segurança;
 - `20260921051248_whop_master_seller_payouts.sql` aparece no histórico não produtivo;
 - browser roles não possuem acesso às tabelas/RPCs privadas de payout.
@@ -340,7 +340,7 @@ O rollback só termina quando Finance e Engenharia assinarem a lista de execuç�
 
 ## Checklist de liberação
 
-- [ ] Migration aplicada e 42/42 pgTAP aprovados em não produção.
+- [ ] Migration aplicada e 43/43 pgTAP aprovados em não produção.
 - [ ] Advisor sem erro de segurança.
 - [ ] Matriz automatizada verde nos três repositórios.
 - [ ] Request do seller produziu zero chamadas de create ao provedor.
