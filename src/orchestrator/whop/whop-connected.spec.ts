@@ -228,7 +228,7 @@ describe('pendências do seller', () => {
     ]);
     expect(item).toEqual({
       key: 'rfi:inrqi_9', label: 'Origem dos recursos', input: 'select', source: 'whop',
-      reason: null, rfiId: 'inrqi_9', options: ['Vendas', 'Investimento'], optional: true,
+      reason: null, rfiId: 'inrqi_9', options: ['Vendas', 'Investimento'], optional: true, review: null,
     });
   });
 

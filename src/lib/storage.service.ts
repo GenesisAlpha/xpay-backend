@@ -1,4 +1,5 @@
 import { Injectable, BadRequestException } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import { supabase } from '../lib/supabase.client';
 
 const ALLOWED_MIME = ['image/jpeg', 'image/png', 'image/webp'];
@@ -16,6 +17,13 @@ const DOC_EXT: Record<string, string> = {
   'application/pdf': 'pdf',
 };
 const SPEI_RECEIPT_BUCKET = 'spei-receipts';
+// Anexos de pedidos de informação da Whop (até 5 MB, limite da Whop).
+const RFI_MAX_SIZE_BYTES = 5 * 1024 * 1024;
+const RFI_EXT: Record<string, string> = {
+  ...DOC_EXT,
+  'video/mp4': 'mp4',
+  'video/quicktime': 'mov',
+};
 
 @Injectable()
 export class StorageService {
@@ -125,6 +133,28 @@ export class StorageService {
     }
 
     return path;
+  }
+
+  /**
+   * Anexo da resposta do seller a um pedido de informação da Whop (prova de
+   * entrega etc.). Fica no bucket privado até o CRM aprovar e mandar à Whop,
+   * que aceita até 5 MB por arquivo.
+   */
+  async uploadRfiFile({ sellerId, base64, mime, name }: {
+    sellerId: string; base64: string; mime: string; name?: string | null;
+  }): Promise<{ path: string; name: string; mime: string }> {
+    const ext = RFI_EXT[mime];
+    if (!ext) throw new BadRequestException('Formato não suportado. Use JPEG, PNG, WebP, PDF, MP4 ou MOV.');
+    const cleanBase64 = base64.includes(',') ? base64.split(',').pop()! : base64;
+    const buffer = Buffer.from(cleanBase64, 'base64');
+    if (!buffer.length || buffer.byteLength > RFI_MAX_SIZE_BYTES) {
+      throw new BadRequestException('Arquivo vazio ou maior que 5 MB.');
+    }
+    const path = `rfi/${sellerId}/${randomUUID()}.${ext}`;
+    const { error } = await supabase.storage.from(DOC_BUCKET).upload(path, buffer, { contentType: mime, upsert: false });
+    if (error) throw new BadRequestException('Erro ao salvar o arquivo: ' + error.message);
+    const safeName = String(name ?? '').replace(/[^\w.\- ]+/g, '').slice(0, 120) || `arquivo.${ext}`;
+    return { path, name: safeName, mime };
   }
 
   /**

@@ -42,6 +42,8 @@ import {
   toConnectedProviderAccountId,
   whopAccountIdFromProviderAccountId,
   payinActive,
+  rfiNeedsReview,
+  RFI_IN_REVIEW,
 } from './whop-connected';
 import { availableCents } from './whop-connected-payout';
 import { notifySellerVerification } from '../../utils/seller-mail';
@@ -82,6 +84,7 @@ const RISK_WINDOW_DAYS = 30;
 
 // Limite da Whop por arquivo, antes do base64.
 const WHOP_DOCUMENT_MAX_BYTES = 5 * 1024 * 1024;
+const RFI_SUBMISSIONS_TABLE = 'whop_rfi_submissions';
 
 // Ações do log que marcam uma correção já feita numa verificação (o
 // `verification_id` vai no payload): o sync não repete envio de arquivo.
@@ -559,6 +562,37 @@ export class WhopConnectService implements OnModuleInit {
         description: source.description,
       }, { retryRequirements: [...retry] });
 
+      // Descrição do negócio/produto tirada do cadastro também passa pelo CRM:
+      // vira submissão (uma por pedido) em vez de ir direto para a Whop.
+      const reviewed = answers.filter(answer => {
+        const item = pending.find((p: any) => String(p.id) === String(answer.id));
+        return rfiNeedsReview(item?.requirement);
+      });
+      for (const answer of reviewed) {
+        const item = pending.find((p: any) => String(p.id) === String(answer.id));
+        const value = 'value' in answer ? answer.value : null;
+        const filePath = 'filePaths' in answer ? answer.filePaths[0] : null;
+        if (!value && !filePath) continue;
+        if (await this.hasOpenRfiSubmission(sellerId, String(answer.id))) continue;
+        await this.queueRfiSubmission(sellerId, row, item, {
+          value,
+          file: filePath ? { path: filePath, name: filePath.split('/').pop() || 'documento', mime: 'application/octet-stream' } : null,
+        }, 'cadastro');
+        unanswered.push({
+          id: String(answer.id),
+          requirement: item?.requirement ?? '',
+          label: item?.label ?? null,
+          reason: RFI_IN_REVIEW,
+          type: item?.type ?? null,
+          options: [],
+          optional: item?.optional === true,
+        });
+      }
+      const reviewedIds = new Set(reviewed.map(answer => String(answer.id)));
+      const direct = answers.filter(answer => !reviewedIds.has(String(answer.id)));
+      answers.length = 0;
+      answers.push(...direct);
+
       if (answers.length > 0) {
         // Cada pedido volta para a verificação de onde veio (empresa ou pessoa).
         const byVerification = new Map<string, Record<string, any>[]>();
@@ -599,6 +633,219 @@ export class WhopConnectService implements OnModuleInit {
     } finally {
       this.answering.delete(sellerId);
     }
+  }
+
+  // ─────────────────────────────────────────────
+  // Pedidos sobre o negócio: revisão no CRM
+  // ─────────────────────────────────────────────
+
+  /** Verificações (empresa e/ou pessoa) que pediram cada item. */
+  private verificationIdsFor(row: WhopConnectedAccountRow, requestId: string): string[] {
+    const ids = (row.requested_information ?? [])
+      .filter((item: any) => String(item?.id) === String(requestId))
+      .map((item: any) => String(item?.verification_id ?? ''))
+      .filter(Boolean);
+    const fallback = [row.verification_id, row.individual_verification_id].filter(Boolean) as string[];
+    return [...new Set(ids.length ? ids : fallback.slice(0, 1))];
+  }
+
+  private groupByVerification(row: WhopConnectedAccountRow, payload: Record<string, any>[]) {
+    const grouped = new Map<string, Record<string, any>[]>();
+    for (const item of payload) {
+      for (const verificationId of this.verificationIdsFor(row, String(item.id))) {
+        grouped.set(verificationId, [...(grouped.get(verificationId) ?? []), item]);
+      }
+    }
+    return grouped;
+  }
+
+  private async hasOpenRfiSubmission(sellerId: string, requestId: string): Promise<boolean> {
+    const { data } = await supabase.from(RFI_SUBMISSIONS_TABLE).select('id')
+      .eq('seller_id', sellerId).eq('request_id', requestId).in('status', ['pending_review', 'send_failed', 'rejected'])
+      .limit(1);
+    return Boolean(data?.length);
+  }
+
+  /** Guarda a resposta para o CRM aprovar; substitui a que ainda aguardava. */
+  private async queueRfiSubmission(
+    sellerId: string,
+    row: WhopConnectedAccountRow,
+    item: any,
+    answer: { value: string | null; file: { path: string; name: string; mime: string } | null },
+    source: 'seller' | 'cadastro',
+  ) {
+    const requestId = String(item?.id);
+    await supabase.from(RFI_SUBMISSIONS_TABLE)
+      .update({ status: 'superseded', updated_at: new Date().toISOString() })
+      .eq('seller_id', sellerId).eq('request_id', requestId).in('status', ['pending_review', 'send_failed', 'rejected']);
+    const { error } = await supabase.from(RFI_SUBMISSIONS_TABLE).insert({
+      seller_id: sellerId,
+      whop_account_id: row.whop_account_id,
+      request_id: requestId,
+      verification_ids: this.verificationIdsFor(row, requestId),
+      requirement: String(item?.requirement ?? ''),
+      label: item?.label ?? null,
+      value: answer.value,
+      file_path: answer.file?.path ?? null,
+      file_name: answer.file?.name ?? null,
+      file_mime: answer.file?.mime ?? null,
+      source,
+      status: 'pending_review',
+    });
+    if (error) {
+      if (/relation .* does not exist|schema cache/i.test(error.message)) {
+        throw new BadRequestException('Revisão de pedidos da Whop indisponível: aplique a migration 20260922100000.');
+      }
+      throw new BadRequestException(`Não foi possível guardar a resposta: ${error.message}`);
+    }
+    await this.log(sellerId, null, 'whop_connect.rfi_review_queued', { requestId, requirement: item?.requirement, source });
+  }
+
+  /** Última submissão de cada pedido do seller (para o painel dele e o CRM). */
+  private async latestRfiSubmissions(sellerId: string): Promise<Map<string, any>> {
+    const { data, error } = await supabase.from(RFI_SUBMISSIONS_TABLE).select('*')
+      .eq('seller_id', sellerId).neq('status', 'superseded').order('created_at', { ascending: false });
+    if (error) return new Map();
+    const latest = new Map<string, any>();
+    for (const row of data ?? []) if (!latest.has(row.request_id)) latest.set(row.request_id, row);
+    return latest;
+  }
+
+  /**
+   * CRM: o que a Whop está pedindo (pendências da conta, funções bloqueadas,
+   * cada pedido com o motivo de recusa) e as respostas aguardando revisão.
+   */
+  async getRfiReview(sellerId: string) {
+    const row = await this.getRow(sellerId);
+    if (!row) return { requiredActions: [], requests: [], submissions: [] };
+    const answered = new Set((row.rfi_answered ?? []).map(String));
+    const byId = new Map<string, any>();
+    for (const item of row.requested_information ?? []) {
+      const id = String(item?.id ?? '');
+      if (!id) continue;
+      const current = byId.get(id);
+      const reasons = (item?.errors ?? []).map((e: any) => e?.reason ?? e?.code).filter(Boolean);
+      if (current) {
+        current.verificationIds = [...new Set([...current.verificationIds, String(item?.verification_id ?? '')].filter(Boolean))];
+        current.rejections = [...new Set([...current.rejections, ...reasons])];
+        continue;
+      }
+      byId.set(id, {
+        id,
+        requirement: item?.requirement ?? null,
+        label: item?.label ?? null,
+        type: item?.type ?? null,
+        verificationIds: [String(item?.verification_id ?? '')].filter(Boolean),
+        rejections: reasons,
+        answered: answered.has(id),
+        needsReview: rfiNeedsReview(item?.requirement),
+      });
+    }
+    const { data } = await supabase.from(RFI_SUBMISSIONS_TABLE).select('*')
+      .eq('seller_id', sellerId).neq('status', 'superseded').order('created_at', { ascending: false }).limit(50);
+    const submissions = [];
+    for (const sub of data ?? []) {
+      submissions.push({
+        id: sub.id,
+        requestId: sub.request_id,
+        requirement: sub.requirement,
+        label: sub.label,
+        value: sub.value,
+        file: sub.file_path
+          ? { name: sub.file_name, mime: sub.file_mime, url: await this.storage.getSignedDocumentUrl(sub.file_path, 600) }
+          : null,
+        source: sub.source,
+        status: sub.status,
+        reviewNote: sub.review_note,
+        whopError: sub.whop_error,
+        createdAt: sub.created_at,
+        reviewedAt: sub.reviewed_at,
+        sentAt: sub.sent_at,
+      });
+    }
+    return {
+      requiredActions: (row.required_actions ?? []).map((action: any) => ({
+        action: action?.action ?? null,
+        title: action?.title ?? null,
+        description: action?.description ?? null,
+        status: action?.status ?? null,
+        blockedCapabilities: action?.blocked_capabilities ?? [],
+        cta: action?.cta ?? null,
+      })),
+      requests: [...byId.values()],
+      submissions,
+    };
+  }
+
+  /** CRM aprova: a resposta vai para a Whop, em todas as verificações que a pediram. */
+  async approveRfiSubmission(sellerId: string, submissionId: string, managerId: string) {
+    const { data: sub } = await supabase.from(RFI_SUBMISSIONS_TABLE).select('*')
+      .eq('id', submissionId).eq('seller_id', sellerId).maybeSingle();
+    if (!sub) throw new NotFoundException('Resposta não encontrada.');
+    if (!['pending_review', 'send_failed'].includes(sub.status)) {
+      throw new BadRequestException('Esta resposta já foi revisada.');
+    }
+    const row = await this.getRow(sellerId);
+    if (!row) throw new NotFoundException('Conta conectada não encontrada.');
+    const stillRequested = (row.requested_information ?? []).some((item: any) => String(item?.id) === sub.request_id);
+    if (!stillRequested) {
+      await supabase.from(RFI_SUBMISSIONS_TABLE)
+        .update({ status: 'superseded', reviewed_by: managerId, reviewed_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+        .eq('id', sub.id);
+      throw new BadRequestException('A Whop não pede mais essa informação (sincronize a conta para ver os pedidos atuais).');
+    }
+
+    const now = new Date().toISOString();
+    try {
+      const payload = await this.toRfiPayload(sub.file_path
+        ? { id: sub.request_id, filePaths: [sub.file_path] }
+        : { id: sub.request_id, value: String(sub.value ?? '') });
+      // Texto e arquivo juntos: o texto segue como descrição do mesmo pedido.
+      if (sub.file_path && sub.value) (payload as any).value = String(sub.value);
+      for (const verificationId of this.verificationIdsFor(row, sub.request_id)) {
+        await this.whop.updateVerification(verificationId, { requested_information: [payload] });
+      }
+    } catch (err: any) {
+      const message = this.errorMessage(err);
+      await supabase.from(RFI_SUBMISSIONS_TABLE)
+        .update({ status: 'send_failed', whop_error: message.slice(0, 500), reviewed_by: managerId, reviewed_at: now, updated_at: now })
+        .eq('id', sub.id);
+      throw new BadRequestException(`A Whop recusou o envio: ${message}`);
+    }
+
+    await supabase.from(RFI_SUBMISSIONS_TABLE)
+      .update({ status: 'sent', whop_error: null, reviewed_by: managerId, reviewed_at: now, sent_at: now, updated_at: now })
+      .eq('id', sub.id);
+    await this.updateRow(sellerId, {
+      rfi_answered: [...new Set([...(row.rfi_answered ?? []), sub.request_id])],
+      rfi_unanswered: (row.rfi_unanswered ?? []).filter(item => item.id !== sub.request_id),
+    });
+    await this.log(sellerId, managerId, 'whop_connect.rfi_review_approved', { submissionId: sub.id, requestId: sub.request_id });
+    return this.getRfiReview(sellerId);
+  }
+
+  /** CRM recusa: o seller vê o motivo no painel e manda de novo. */
+  async rejectRfiSubmission(sellerId: string, submissionId: string, managerId: string, note: string) {
+    const reason = String(note ?? '').trim();
+    if (reason.length < 5) throw new BadRequestException('Explique ao seller o que corrigir.');
+    const now = new Date().toISOString();
+    const { data, error } = await supabase.from(RFI_SUBMISSIONS_TABLE)
+      .update({ status: 'rejected', review_note: reason.slice(0, 1000), reviewed_by: managerId, reviewed_at: now, updated_at: now })
+      .eq('id', submissionId).eq('seller_id', sellerId).in('status', ['pending_review', 'send_failed'])
+      .select('id, request_id');
+    if (error) throw new BadRequestException(error.message);
+    if (!data?.length) throw new BadRequestException('Esta resposta já foi revisada.');
+    await this.log(sellerId, managerId, 'whop_connect.rfi_review_rejected', { submissionId, requestId: data[0].request_id, reason });
+    return this.getRfiReview(sellerId);
+  }
+
+  /** Fila do CRM: respostas aguardando revisão de todos os sellers. */
+  async listPendingRfiReviews() {
+    const { data, error } = await supabase.from(RFI_SUBMISSIONS_TABLE)
+      .select('id, seller_id, requirement, label, source, status, created_at')
+      .in('status', ['pending_review', 'send_failed']).order('created_at', { ascending: true }).limit(200);
+    if (error) return [];
+    return data ?? [];
   }
 
   private async toRfiPayload(answer: RfiAnswer): Promise<Record<string, any>> {
@@ -663,7 +910,7 @@ export class WhopConnectService implements OnModuleInit {
           && !['approved', 'rejected'].includes(String(row?.verification_status ?? '')),
       },
       switchToLlc: false,
-      items: sellerRequirementItems(plan.gaps, row?.rfi_unanswered ?? []),
+      items: sellerRequirementItems(plan.gaps, row?.rfi_unanswered ?? [], await this.latestRfiSubmissions(sellerId)),
     };
   }
 
@@ -741,10 +988,26 @@ export class WhopConnectService implements OnModuleInit {
       (row.requested_information ?? []).map((item: any) => [String(item?.id), item] as [string, any]),
     );
     const payload: Record<string, any>[] = [];
+    const inReview: string[] = [];
 
     for (const answer of answers) {
       const item = requested.get(answer.id);
       if (!item) throw new BadRequestException('Pedido de informação não encontrado. Atualize a página e tente de novo.');
+
+      // Sobre o negócio (o que vende, como entrega…): vai para o CRM aprovar.
+      if (rfiNeedsReview(item.requirement)) {
+        let file: { path: string; name: string; mime: string } | null = null;
+        if (answer.file) {
+          file = await this.storage.uploadRfiFile({
+            sellerId, base64: answer.file.base64, mime: answer.file.mime, name: answer.file.name,
+          });
+        }
+        const value = answer.value?.trim() || null;
+        if (!file && !value) continue;
+        await this.queueRfiSubmission(sellerId, row, item, { value, file }, 'seller');
+        inReview.push(String(answer.id));
+        continue;
+      }
 
       if (answer.file) {
         const data = Buffer.from(answer.file.base64, 'base64');
@@ -762,10 +1025,13 @@ export class WhopConnectService implements OnModuleInit {
       }
     }
 
-    if (payload.length === 0) return { answered: 0 };
+    if (payload.length === 0) return { answered: 0, inReview: inReview.length };
 
     try {
-      await this.whop.updateVerification(row.verification_id, { requested_information: payload });
+      // Cada pedido volta para a(s) verificação(ões) que o pediram.
+      for (const [verificationId, items] of this.groupByVerification(row, payload)) {
+        await this.whop.updateVerification(verificationId, { requested_information: items });
+      }
     } catch (err: any) {
       throw new BadRequestException(`A Whop recusou a resposta: ${this.errorMessage(err)}`);
     }
@@ -775,9 +1041,9 @@ export class WhopConnectService implements OnModuleInit {
       rfi_answered: [...new Set([...(row.rfi_answered ?? []), ...answeredIds])],
       rfi_unanswered: (row.rfi_unanswered ?? []).filter(u => !answeredIds.includes(u.id)),
     });
-    await this.log(sellerId, null, 'whop_connect.rfi_answered_by_seller', { answered: answeredIds });
+    await this.log(sellerId, null, 'whop_connect.rfi_answered_by_seller', { answered: answeredIds, inReview });
 
-    return { answered: answeredIds.length };
+    return { answered: answeredIds.length, inReview: inReview.length };
   }
 
   // ─────────────────────────────────────────────

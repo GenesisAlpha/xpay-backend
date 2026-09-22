@@ -34,6 +34,34 @@ export class WhopConnectController {
     return this.connect.sync(sellerId)
   }
 
+  // O que a Whop pede (pendências, funções bloqueadas, cada pedido e o motivo
+  // de recusa) e as respostas sobre o negócio aguardando revisão.
+  @Get('rfi')
+  @Roles('admin', 'supervisor')
+  rfiReview(@Param('sellerId') sellerId: string) {
+    return this.connect.getRfiReview(sellerId)
+  }
+
+  // Aprovar manda a resposta à Whop; recusar devolve ao seller com o motivo.
+  @Post('rfi/submissions/:submissionId/approve')
+  @Roles('admin')
+  @HttpCode(HttpStatus.OK)
+  approveRfi(@Param('sellerId') sellerId: string, @Param('submissionId') submissionId: string, @Req() req: any) {
+    return this.connect.approveRfiSubmission(sellerId, submissionId, req.manager.sub)
+  }
+
+  @Post('rfi/submissions/:submissionId/reject')
+  @Roles('admin')
+  @HttpCode(HttpStatus.OK)
+  rejectRfi(
+    @Param('sellerId') sellerId: string,
+    @Param('submissionId') submissionId: string,
+    @Req() req: any,
+    @Body() body: { note?: string },
+  ) {
+    return this.connect.rejectRfiSubmission(sellerId, submissionId, req.manager.sub, String(body?.note ?? ''))
+  }
+
   @Post('rfi/answer')
   @Roles('admin')
   @HttpCode(HttpStatus.OK)
@@ -82,5 +110,18 @@ export class WhopConnectController {
   @HttpCode(HttpStatus.OK)
   release(@Param('sellerId') sellerId: string, @Req() req: any) {
     return this.connect.releaseToSeller(sellerId, req.manager.sub)
+  }
+}
+
+// Fila do CRM: respostas sobre o negócio aguardando revisão, de todos os sellers.
+@Controller('crm/admin/whop-rfi-reviews')
+@UseGuards(CrmAuthGuard)
+export class WhopRfiReviewsController {
+  constructor(private readonly connect: WhopConnectService) { }
+
+  @Get()
+  @Roles('admin', 'supervisor')
+  pending() {
+    return this.connect.listPendingRfiReviews()
   }
 }

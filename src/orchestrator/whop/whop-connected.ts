@@ -784,6 +784,32 @@ export type RfiAnswer =
 
 // Motivo interno de "não temos o dado": o seller vê só o pedido, sem este texto.
 export const RFI_NOT_COLLECTED = 'dado não coletado no onboarding';
+/** Resposta sobre o negócio guardada para o CRM aprovar (não foi à Whop). */
+export const RFI_IN_REVIEW = 'resposta em análise pela Koopfy';
+
+// ─── Pedidos sobre o negócio: passam pelo CRM ───────────────────────────────
+// O que o seller vende, como entrega, descrição do negócio/produto, site e
+// políticas: a resposta (dele ou do cadastro) vai para o CRM aprovar antes de
+// chegar à Whop. Dados pessoais e documentos da empresa seguem direto.
+const REVIEWED_RFI_REQUIREMENTS = new Set([
+  'proof_of_fulfillment',
+  'business_description',
+  'product_description',
+  'business_website',
+  'website',
+  'company_website',
+  'refund_policy',
+  'terms_of_service',
+  'customer_support',
+  'marketing_materials',
+  'sales_channels',
+]);
+const REVIEWED_RFI_PATTERN = /fulfil|product|website|business_description|refund|marketing|sales|customer|deliver|inventory|supplier|invoice|traffic/i;
+
+export function rfiNeedsReview(requirement: string | null | undefined): boolean {
+  const key = String(requirement ?? '');
+  return REVIEWED_RFI_REQUIREMENTS.has(key) || REVIEWED_RFI_PATTERN.test(key);
+}
 
 function optionValues(options: any[] | undefined): string[] {
   return (options ?? [])
@@ -904,6 +930,8 @@ export interface SellerRequirementItem {
   rfiId: string | null;
   options: string[];
   optional: boolean;
+  /** Pedido sobre o negócio respondido e ainda no CRM; `rejected` traz o motivo. */
+  review: { status: 'pending_review' | 'rejected'; note: string | null } | null;
 }
 
 // Requisito da Whop → campo do cadastro que responde a ele.
@@ -959,7 +987,11 @@ export function rfiRequirementsForKeys(keys: string[]): string[] {
     .map(([requirement]) => requirement);
 }
 
-export function sellerRequirementItems(gaps: RequirementGap[], unanswered: RfiUnanswered[]): SellerRequirementItem[] {
+export function sellerRequirementItems(
+  gaps: RequirementGap[],
+  unanswered: RfiUnanswered[],
+  reviews: Map<string, { status: string; review_note?: string | null }> = new Map(),
+): SellerRequirementItem[] {
   const items = new Map<string, SellerRequirementItem>();
 
   const base = (key: string, fallbackLabel: string): SellerRequirementItem => {
@@ -973,6 +1005,7 @@ export function sellerRequirementItems(gaps: RequirementGap[], unanswered: RfiUn
       rfiId: null,
       options: known?.options ?? [],
       optional: false,
+      review: null,
     };
   };
 
@@ -984,7 +1017,7 @@ export function sellerRequirementItems(gaps: RequirementGap[], unanswered: RfiUn
   }
 
   for (const request of unanswered ?? []) {
-    const reason = request.reason === RFI_NOT_COLLECTED ? null : request.reason;
+    const reason = request.reason === RFI_NOT_COLLECTED || request.reason === RFI_IN_REVIEW ? null : request.reason;
     const mapped = RFI_ONBOARDING_KEY[request.requirement];
 
     if (mapped) {
@@ -1010,6 +1043,7 @@ export function sellerRequirementItems(gaps: RequirementGap[], unanswered: RfiUn
       rfiId: request.id,
       options: request.options ?? [],
       optional: request.optional === true,
+      review: reviewFor(reviews.get(request.id)),
     });
   }
 
@@ -1226,4 +1260,12 @@ export function verifyWhopWebhookSignature(
   }
 
   return { valid: false, reason: 'signature mismatch' };
+}
+
+function reviewFor(sub: { status: string; review_note?: string | null } | undefined): SellerRequirementItem['review'] {
+  if (!sub) return null;
+  // Falha no envio é problema nosso: para o seller continua em análise.
+  if (sub.status === 'pending_review' || sub.status === 'send_failed') return { status: 'pending_review', note: null };
+  if (sub.status === 'rejected') return { status: 'rejected', note: sub.review_note ?? null };
+  return null;
 }

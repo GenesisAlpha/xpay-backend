@@ -52,7 +52,7 @@ import { StorageService } from '../lib/storage.service'
 import { CryptoModule } from '../crypto/crypto.module'
 import { OrchestratorModule } from '../orchestrator/orchestrator.module'
 import { WebhookModule } from '../webhooks/webhook.module'
-import { WhopConnectController } from './whop-connect.controller'
+import { WhopConnectController, WhopRfiReviewsController } from './whop-connect.controller'
 import { WhopLinkedController } from './whop-linked.controller'
 import { ActivationRequestsController } from './activation-requests.controller'
 import { ActivationModule } from '../activation/activation.module'
@@ -94,7 +94,7 @@ import { PayoutModule } from '../payouts/payout.module'
   // OrchestratorModule).
   // CrmCheckoutController: sellers e lojas do checkout (só leitura, via canal
   // interno).
-  controllers: [CrmController, CrmAdminController, CrmCheckoutController, WhopConnectController, WhopLinkedController, ActivationRequestsController, AffiliateCrmController],
+  controllers: [CrmController, CrmAdminController, CrmCheckoutController, WhopConnectController, WhopRfiReviewsController, WhopLinkedController, ActivationRequestsController, AffiliateCrmController],
   providers:   [CrmService, CrmAdminService, CrmCheckoutService, CrmAuthGuard, StorageService],
   exports:     [CrmService, CrmAdminService, CrmCheckoutService],
 })
