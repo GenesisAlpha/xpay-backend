@@ -9,6 +9,8 @@ import {
   PayoutExecutionRepository,
   PayoutOrchestratorService,
 } from './payout-orchestrator.service';
+import { WhopPayoutWebhookService } from './whop-payout-webhook.service';
+import { PayoutReconcilerService } from './payout-reconciler.service';
 
 @Module({
   imports: [OrchestratorModule],
@@ -18,11 +20,14 @@ import {
     SellerPayoutAccountService,
     PayoutExecutionRepository,
     PayoutOrchestratorService,
+    WhopPayoutWebhookService,
+    PayoutReconcilerService,
   ],
   exports: [
     WhopPayoutClient,
     SellerPayoutAccountService,
     PayoutOrchestratorService,
+    WhopPayoutWebhookService,
   ],
 })
 export class PayoutModule {}

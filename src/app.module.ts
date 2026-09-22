@@ -16,6 +16,7 @@ import { CrmModule } from './crm/crm.module';
 import { AffiliatesModule } from './affiliates/affiliates.module';
 import { KoopfyIntegrationModule } from './integration/koopfy-integration.module';
 import { AppController } from './app.controller';
+import { PayoutModule } from './payouts/payout.module';
 
 @Module({
   imports: [
@@ -50,7 +51,8 @@ import { AppController } from './app.controller';
     AffiliatesModule,
 
     // Integração com o serviço checkout (Koopfy Pay como gateway)
-    KoopfyIntegrationModule
+    KoopfyIntegrationModule,
+    PayoutModule,
   ],
   controllers: [AppController]
 })

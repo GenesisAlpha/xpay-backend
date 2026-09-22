@@ -1,7 +1,7 @@
 begin;
 
 create extension if not exists pgtap with schema extensions;
-select plan(40);
+select plan(42);
 
 select has_table('public', 'seller_payout_accounts', 'seller payout accounts table exists');
 select has_table('public', 'seller_payout_methods', 'seller payout methods table exists');
@@ -455,19 +455,40 @@ select is(
 );
 
 select is(
+  public.apply_provider_payout_state(
+    (select (response->>'payoutId')::uuid from accepted_request),
+    'wdrl_pgtap',
+    'completed',
+    'completed'
+  )->>'state',
+  'completed',
+  'provider completion advances execution and ledger atomically'
+);
+select is(
+  public.apply_provider_payout_state(
+    (select (response->>'payoutId')::uuid from accepted_request),
+    'wdrl_pgtap',
+    'processing',
+    'processing'
+  )->>'state',
+  'completed',
+  'out-of-order processing cannot regress a completed payout'
+);
+
+select is(
   public.restore_provider_payout_funds(
     (select (response->>'payoutId')::uuid from accepted_request),
-    'failed',
+    'reversed',
     null,
-    'provider failure without returned funds'
+    'provider reversal without returned funds'
   )->>'restored',
   'false',
-  'failure without returned funds does not credit the wallet'
+  'reversal without returned funds does not credit the wallet'
 );
 select is(
   public.restore_provider_payout_funds(
     (select (response->>'payoutId')::uuid from accepted_request),
-    'failed',
+    'reversed',
     now(),
     'provider returned funds'
   )->>'restored',
@@ -477,7 +498,7 @@ select is(
 select is(
   public.restore_provider_payout_funds(
     (select (response->>'payoutId')::uuid from accepted_request),
-    'failed',
+    'reversed',
     now(),
     'duplicate returned funds event'
   )->>'restored',

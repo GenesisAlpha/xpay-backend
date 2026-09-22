@@ -309,6 +309,47 @@ export class PayoutExecutionRepository {
     return byId.data ? mapDispatchExecution(byId.data) : null;
   }
 
+  async findByProviderPayoutId(
+    providerPayoutId: string,
+  ): Promise<DispatchExecution | null> {
+    const { data, error } = await supabase
+      .from('payout_executions')
+      .select(EXECUTION_COLUMNS)
+      .eq('provider_payout_id', providerPayoutId)
+      .maybeSingle();
+    if (error) throw storageUnavailable();
+    return data ? mapDispatchExecution(data) : null;
+  }
+
+  async listStaleExecutions(
+    staleBefore: string,
+    limit: number,
+  ): Promise<DispatchExecution[]> {
+    const { data, error } = await supabase
+      .from('payout_executions')
+      .select(EXECUTION_COLUMNS)
+      .in('local_state', ['dispatching', 'processing'])
+      .or('provider_payout_id.not.is.null,provider_create_started_at.is.null')
+      .lte('updated_at', staleBefore)
+      .order('updated_at', { ascending: true })
+      .limit(limit);
+    if (error) throw storageUnavailable();
+    return (data ?? []).map(mapDispatchExecution);
+  }
+
+  async countUnresolvedProviderCreates(staleBefore: string): Promise<number> {
+    const { count, error } = await supabase
+      .from('payout_executions')
+      .select('id', { count: 'exact', head: true })
+      .eq('local_state', 'dispatching')
+      .is('provider_payout_id', null)
+      .not('provider_create_started_at', 'is', null)
+      .is('provider_create_resolved_at', null)
+      .lte('updated_at', staleBefore);
+    if (error) throw storageUnavailable();
+    return count ?? 0;
+  }
+
   async claimDispatch(
     reference: string,
     managerId: string,
@@ -591,6 +632,8 @@ export class PayoutExecutionRepository {
       .maybeSingle();
     if (error) throw storageUnavailable();
     if (!data) {
+      const current = await this.findByReference(payoutId);
+      if (current?.providerPayoutId === providerPayoutId) return;
       throw new ConflictException(
         'A tentativa de despacho não pode mais registrar este payout.',
       );
@@ -1057,19 +1100,59 @@ export class PayoutOrchestratorService {
       providerPayoutId,
       execution.providerAccountId,
     );
-    assertRecoveredPayoutOwnership(execution, payout);
-    const attached = await this.repository.attachRecoveredProviderPayout(
+    return this.applyVerifiedProviderPayout(
       execution.id,
-      payout.id,
-      payout.status,
-      requiredAttemptToken(execution),
+      payout,
+      reason.trim(),
     );
+  }
+
+  async applyVerifiedProviderPayout(
+    reference: string,
+    payout: WhopPayout,
+    reason: string,
+  ) {
+    const execution = await this.requiredExecution(reference);
+    if (
+      execution.providerPayoutId &&
+      execution.providerPayoutId !== payout.id
+    ) {
+      throw new ConflictException(
+        'O payout do provider não corresponde à execução registrada.',
+      );
+    }
+    assertProviderPayoutFinancials(execution, payout);
+    let attached: { payoutId: string; state: string } | null = null;
+    if (!execution.providerPayoutId) {
+      if (
+        execution.localState !== 'dispatching' ||
+        !execution.providerCreateStartedAt ||
+        execution.providerCreateResolvedAt
+      ) {
+        throw new ConflictException(
+          'A execução não possui um envio incerto recuperável.',
+        );
+      }
+      assertRecoveredPayoutOwnership(execution, payout);
+      attached = await this.repository.attachRecoveredProviderPayout(
+        execution.id,
+        payout.id,
+        payout.status,
+        requiredAttemptToken(execution),
+      );
+    } else if (!execution.acceptedAt) {
+      await this.repository.finalizeAccepted(
+        execution.id,
+        payout.id,
+        payout.status,
+      );
+    }
     const state = mapWhopPayoutState(payout.status);
     if (['failed', 'canceled', 'denied', 'reversed'].includes(state)) {
       return this.repository.restoreProviderFunds(
         execution.id,
         payout,
-        reason.trim(),
+        reason,
       );
     }
     if (state === 'completed') {
@@ -1079,7 +1162,12 @@ export class PayoutOrchestratorService {
         payout,
       );
     }
-    return attached;
+    if (attached) return attached;
+    return this.repository.applyProviderState(
+      execution.id,
+      execution.ledgerEntryId,
+      payout,
+    );
   }
 
   listFeeRules() {
@@ -1212,6 +1300,7 @@ export class PayoutOrchestratorService {
             koopfy_payout_id: execution.id,
             koopfy_seller_id: execution.sellerId,
             koopfy_account_id: account.providerAccountId,
+            koopfy_master_account_id: this.whop.getMasterAccountId(),
           },
         },
         execution.providerIdempotencyKey,
@@ -1759,6 +1848,26 @@ function assertRecoveredPayoutOwnership(
   ) {
     throw new ConflictException(
       'O payout informado não pertence a esta tentativa de saque.',
+    );
+  }
+}
+
+function assertProviderPayoutFinancials(
+  execution: DispatchExecution,
+  payout: WhopPayout,
+) {
+  const amountMinor = moneyToMinor({
+    amount: payout.amount,
+    currency: payout.currency,
+    decimals: 2,
+    displayDecimals: 2,
+  });
+  if (
+    payout.currency.toUpperCase() !== execution.sourceCurrency ||
+    amountMinor !== execution.providerPayoutMinor
+  ) {
+    throw new ConflictException(
+      'O payout do provider possui valor ou moeda divergente.',
     );
   }
 }

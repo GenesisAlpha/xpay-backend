@@ -122,6 +122,7 @@ describe('PayoutOrchestratorService', () => {
       assertOwnedActiveMethod: jest.fn().mockResolvedValue(method),
     };
     whop = {
+      getMasterAccountId: jest.fn().mockReturnValue('biz_master'),
       createQuote: jest.fn().mockResolvedValue(quote()),
       listSavedPayoutMethods: jest.fn().mockResolvedValue([
         {
@@ -445,6 +446,15 @@ describe('PayoutOrchestratorService', () => {
       'payout-1',
       expect.objectContaining({ providerFeeMinor: 630, netMinor: 10_820 }),
       '00000000-0000-4000-8000-000000000111',
+    );
+    expect(whop.createPayout).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metadata: expect.objectContaining({
+          koopfy_account_id: 'biz_secret',
+          koopfy_master_account_id: 'biz_master',
+        }),
+      }),
+      'koopfy_payout_abc',
     );
     expect(
       repository.persistApprovalQuote.mock.invocationCallOrder[0],

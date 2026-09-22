@@ -5,9 +5,10 @@ import { WhopConnectedWebhookService } from './whop-connected-webhook.service';
 import { WalletModule } from '../wallets/wallet.module';
 import { OrchestratorModule } from '../orchestrator/orchestrator.module';
 import { CurrencyModule } from '../currency/currency.module';
+import { PayoutModule } from '../payouts/payout.module';
 
 @Module({
-  imports: [WalletModule, OrchestratorModule, CurrencyModule],
+  imports: [WalletModule, OrchestratorModule, CurrencyModule, PayoutModule],
   controllers: [WebhookController],
   providers: [WebhookService, WhopConnectedWebhookService],
   exports: [WebhookService],

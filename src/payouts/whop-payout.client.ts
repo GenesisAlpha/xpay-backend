@@ -148,6 +148,10 @@ export class WhopPayoutApiError extends Error {
 export class WhopPayoutClient {
   constructor(private readonly accounts: WhopAccountsService) {}
 
+  getMasterAccountId(): string {
+    return process.env.WHOP_MASTER_ACCOUNT_ID?.trim() || WHOP_ENV_ACCOUNT_ID;
+  }
+
   async createConnectedAccount(
     input: {
       email: string;
@@ -314,8 +318,7 @@ export class WhopPayoutClient {
     path: string,
     init: RequestInit & { idempotencyKey?: string },
   ): Promise<unknown> {
-    const accountId =
-      process.env.WHOP_MASTER_ACCOUNT_ID?.trim() || WHOP_ENV_ACCOUNT_ID;
+    const accountId = this.getMasterAccountId();
     const account = await this.accounts.getById(accountId);
     if (!account?.apiKey) {
       throw new WhopPayoutApiError(500, "master_account_not_configured", false);

@@ -23,6 +23,7 @@ import {
   whopPaymentId,
 } from './whop-renewal'
 import * as crypto from 'crypto'
+import { WhopPayoutWebhookService } from '../payouts/whop-payout-webhook.service'
 
 // Status do Sentinel Gate → status canônico do handleWebhookProvider.
 const SENTINEL_WEBHOOK_STATUS: Record<string, 'PAID' | 'PENDING' | 'FAILED' | 'PROCESSING'> = {
@@ -139,6 +140,7 @@ export class WebhookService {
     private readonly stripeEfw: StripeEfwService,
     private readonly affiliateRisk: AffiliateRiskService,
     private readonly currencyService: CurrencyService,
+    private readonly payoutHandler: WhopPayoutWebhookService,
   ) { }
 
   // opts.skipDispatch: pula o postback ao seller (usado na aprovação SÍNCRONA do
@@ -665,7 +667,12 @@ export class WebhookService {
       ?? data?.plan?.metadata
       ?? body?.metadata
       ?? {}
-    const accountId = String(metadata?.koopfy_account_id ?? '').trim()
+    const eventType = String(body?.type ?? body?.event ?? '')
+    const accountId = String(
+      this.payoutHandler.handles(eventType)
+        ? metadata?.koopfy_master_account_id ?? metadata?.koopfy_account_id
+        : metadata?.koopfy_account_id,
+    ).trim()
 
     if (!accountId) {
       // Não responder 2xx: eventos sem identificação devem ser reenviados pela
@@ -764,6 +771,9 @@ export class WebhookService {
     eventType: string,
     body: any,
   ) {
+    if (this.payoutHandler.handles(eventType)) {
+      return this.payoutHandler.handleVerifiedEvent(body, accountId)
+    }
     if (eventType.startsWith('membership.')) {
       return this.persistWhopMembership(accountId, eventType, body);
     }

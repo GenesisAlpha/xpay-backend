@@ -8,6 +8,7 @@ import {
   whopPaymentAmountMinor,
   whopPaymentId,
 } from './whop-renewal'
+import { WebhookService } from './webhook.service'
 
 // Renovação da Whop: transação própria, com taxa da Koopfy e crédito do seller.
 
@@ -137,5 +138,89 @@ describe('Whop renewal payload', () => {
       renewal_of_transaction_id: 'tx-parent',
       renewal_cycle: 2,
     })
+  })
+})
+
+describe('Whop payout event routing', () => {
+  it.each(['payout.created', 'payout.updated', 'payout.reversed'])(
+    'routes %s before payment mapping',
+    async (type) => {
+      const payoutHandler = {
+        handles: jest.fn().mockReturnValue(true),
+        handleVerifiedEvent: jest.fn().mockResolvedValue({ state: 'processing' }),
+      }
+      const service = new WebhookService(
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        payoutHandler as never,
+      )
+
+      await (service as any).processWhopEvent(
+        'biz_master',
+        {},
+        type,
+        {
+          id: `evt_${type}`,
+          type,
+          data: {
+            id: 'wdrl_1',
+            metadata: {
+              koopfy_payout_id: '00000000-0000-4000-8000-000000000123',
+              koopfy_account_id: 'biz_connected',
+              koopfy_master_account_id: 'biz_master',
+            },
+          },
+        },
+      )
+
+      expect(payoutHandler.handleVerifiedEvent).toHaveBeenCalledTimes(1)
+    },
+  )
+
+  it('selects the master signing account without confusing it with the connected seller account', async () => {
+    const payoutHandler = {
+      handles: jest.fn().mockReturnValue(true),
+      handleVerifiedEvent: jest.fn(),
+    }
+    const service = new WebhookService(
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      payoutHandler as never,
+    )
+    const delegated = jest
+      .spyOn(service, 'handleWhopWebhook')
+      .mockResolvedValue({ state: 'processing' } as never)
+    const body = {
+      id: 'evt_payout',
+      type: 'payout.updated',
+      data: {
+        id: 'wdrl_1',
+        metadata: {
+          koopfy_account_id: 'biz_connected',
+          koopfy_master_account_id: 'biz_master',
+        },
+      },
+    }
+
+    await service.handleSharedWhopWebhook(body, JSON.stringify(body), {})
+
+    expect(delegated).toHaveBeenCalledWith(
+      'biz_master',
+      body,
+      JSON.stringify(body),
+      {},
+    )
   })
 })
