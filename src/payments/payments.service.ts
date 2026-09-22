@@ -1740,9 +1740,16 @@ export class PaymentService {
 
     async getTransactionStatus(sellerId: string, transactionId: string) {
         const { data } = await supabase.from('transactions')
-            .select('id, status, provider_status, provider_transaction_id, failure_message, metadata, amount, currency')
+            .select('id, status, provider_status, provider_transaction_id, failure_message, metadata, amount, currency, payment_brand, payment_last4')
             .eq('id', transactionId).eq('seller_id', sellerId).single()
         if (!data) throw new BadRequestException('Transação não encontrada.')
+        // Bandeira informada pelo processador (webhook da Whop) — o checkout grava
+        // no pedido. 'unknown' é o que o checkout mandou sem saber: não serve.
+        const brand = String(data.metadata?.whop_card_brand ?? data.payment_brand ?? '').toLowerCase()
+        const last4 = String(data.metadata?.whop_card_last4 ?? data.payment_last4 ?? '').replace(/\D/g, '').slice(-4)
+        const card = brand && brand !== 'unknown'
+            ? { brand, last4: last4 || null, methodType: data.metadata?.whop_payment_method_type ?? null }
+            : null
         return {
             transactionId: data.id, status: data.status, providerStatus: data.provider_status,
             providerTransactionId: data.provider_transaction_id,
@@ -1760,6 +1767,7 @@ export class PaymentService {
             // Nome da cobrança (Whop). O checkout usa quando o pedido não tem nome
             // — produto digital só coleta e-mail no formulário da loja.
             customerName: data.metadata?.whop_billing_name ?? null,
+            card,
             // Renovação de assinatura: transação filha. O checkout só cria o pedido
             // de renovação se isto apontar para a compra do pedido original.
             renewalOf: data.metadata?.renewal_of_transaction_id ?? null,

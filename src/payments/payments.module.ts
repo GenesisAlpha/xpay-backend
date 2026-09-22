@@ -1,6 +1,8 @@
 import { Module } from '@nestjs/common';
 import { PaymentService } from './payments.service';
 import { PaymentController } from './payments.controller';
+import { WhopCardBackfillController } from './whop-card-backfill.controller';
+import { WhopCardBackfillService } from './whop-card-backfill.service';
 
 import { WalletModule } from '../wallets/wallet.module';
 import { CurrencyModule } from '../currency/currency.module';
@@ -29,8 +31,9 @@ import { AffiliatesModule } from '../affiliates/affiliates.module';
   providers: [
     PaymentService,
     StorageService,
+    WhopCardBackfillService,
   ],
   exports: [PaymentService],
-  controllers: [PaymentController],
+  controllers: [PaymentController, WhopCardBackfillController],
 })
 export class PaymentModule {}

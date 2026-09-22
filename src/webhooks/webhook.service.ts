@@ -1,6 +1,7 @@
 // nexor/src/webhooks/webhook.service.ts
 
 import { whopDeclineCode } from '../orchestrator/providers/whop.provider'
+import { whopCardOf } from './whop-card'
 import { Injectable } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
 import { WalletService } from '../wallets/wallet.service'
@@ -894,13 +895,25 @@ export class WebhookService {
     // checkout só pede e-mail: é daqui que o pedido tira o nome do cliente
     // (exposto em GET /payments/:id/status como customerName).
     put('whop_billing_name', data.billing_address?.name)
+    // Bandeira e final do cartão: o cartão é digitado no componente da Whop, então
+    // o checkout grava 'unknown'. Vão no postback (metadata) e em
+    // GET /payments/:id/status, de onde o checkout grava no pedido.
+    const card = whopCardOf(data)
+    put('whop_card_brand', card.brand)
+    put('whop_card_last4', card.last4)
+    put('whop_payment_method_type', card.methodType)
     if (!Object.keys(patch).length) return
 
     const { data: current } = await supabase
       .from('transactions').select('metadata').eq('id', transactionId).maybeSingle()
     const { error } = await supabase
       .from('transactions')
-      .update({ metadata: { ...(current?.metadata ?? {}), ...patch } })
+      .update({
+        metadata: { ...(current?.metadata ?? {}), ...patch },
+        // Colunas que o painel do pay lê (ícone e final do cartão da transação).
+        ...(card.brand ? { payment_brand: card.brand } : {}),
+        ...(card.last4 ? { payment_last4: card.last4 } : {}),
+      })
       .eq('id', transactionId)
     if (error) throw error
   }
