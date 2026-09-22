@@ -691,14 +691,13 @@ export class WebhookService {
     headers: Record<string, string> = {},
   ) {
     const eventType = String(body?.type ?? body?.event ?? '')
-    console.log('[Whop webhook]', accountId, eventType)
 
     // ── 1. Conta ──
     // getById NÃO filtra por status de propósito: webhook de conta pausada
     // continua chegando e é dinheiro que já entrou.
     const account = await this.whopAccounts.getById(accountId)
     if (!account) {
-      console.warn('[WebhookService] Whop: conta desconhecida no path:', accountId)
+      console.warn('[WebhookService] Whop: conta desconhecida para evento', eventType)
       return { ignored: true, reason: 'unknown account' }
     }
 
@@ -713,14 +712,14 @@ export class WebhookService {
       // provável. Responder 200 faria a Whop dar o evento por entregue e o
       // pagamento aprovado nunca confirmaria; com erro ela reentrega até o
       // segredo entrar no env.
-      console.error(`[WebhookService] Whop: conta ${accountId} sem webhook_secret — evento recusado`)
-      throw new Error(`Whop: conta ${accountId} sem webhook_secret (configure WHOP_WEBHOOK_SECRET)`)
+      console.error('[WebhookService] Whop: conta sem webhook_secret — evento recusado', eventType)
+      throw new Error('Whop: conta sem webhook_secret (configure WHOP_WEBHOOK_SECRET)')
     }
 
     const verification = this.verifyWhopSignature(rawBody, headers, secret)
     if (!verification.valid) {
       console.error(
-        `[WebhookService] Whop: ASSINATURA INVÁLIDA (${verification.reason}) em ${accountId}. `
+        `[WebhookService] Whop: ASSINATURA INVÁLIDA (${verification.reason}) para ${eventType}. `
         + 'Se isto aparecer pra TODO evento, a suspeita nº1 é a derivação da chave '
         + '(a Whop usa `ws_<hex>` e o HMAC é sobre a string crua, não base64 decodificado) '
         + 'ou o body ter sido re-serializado antes de chegar aqui (ver express.raw em main.ts).',
@@ -730,8 +729,11 @@ export class WebhookService {
       // Com 5xx ela reentrega por horas, o que dá janela pra corrigir o segredo
       // sem perder as primeiras vendas. Assinatura inválida de verdade (ataque)
       // só custa algumas retentativas ruidosas.
-      throw new Error(`Whop: assinatura inválida (${verification.reason}) em ${accountId}`)
+      throw new Error(`Whop: assinatura inválida (${verification.reason})`)
     }
+
+    const webhookCorrelation = sanitizedWebhookCorrelation(headers['webhook-id'])
+    console.log('[Whop webhook]', eventType, webhookCorrelation)
 
     // ── 3. Dedupe ──
     // A Whop entrega at-least-once. Sem isto, um redelivery de payment.succeeded
@@ -2273,4 +2275,9 @@ export class WebhookService {
     console.log(`[ReplayWebhooks] Done:`, summary);
     return summary;
   }
+}
+
+function sanitizedWebhookCorrelation(webhookId: string | undefined): string {
+  if (!webhookId) return 'event-without-id'
+  return `event-${crypto.createHash('sha256').update(webhookId).digest('hex').slice(0, 12)}`
 }

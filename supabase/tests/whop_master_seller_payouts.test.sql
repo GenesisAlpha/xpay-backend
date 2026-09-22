@@ -1,7 +1,7 @@
 begin;
 
 create extension if not exists pgtap with schema extensions;
-select plan(42);
+select plan(43);
 
 select has_table('public', 'seller_payout_accounts', 'seller payout accounts table exists');
 select has_table('public', 'seller_payout_methods', 'seller payout methods table exists');
@@ -130,6 +130,34 @@ insert into public.seller_payout_methods (
   '••••6789',
   'active',
   true
+);
+
+select throws_ok(
+  $$select public.request_provider_payout_idempotent(
+    'seller-pgtap',
+    'request_bad_quote',
+    repeat('f', 64),
+    '00000000-0000-4000-8000-000000000001',
+    'ach_standard',
+    'standard',
+    'USD',
+    'USD',
+    11990,
+    540,
+    639,
+    11450,
+    10810,
+    10810,
+    'quote_bad',
+    now() + interval '10 minutes',
+    null,
+    now() + interval '2 days',
+    10810,
+    'koopfy_payout_bad_quote'
+  )$$,
+  '22023',
+  'Snapshot financeiro do payout inválido.',
+  'provider fee and net must reconcile to the provider payout amount'
 );
 
 create temporary table first_request as

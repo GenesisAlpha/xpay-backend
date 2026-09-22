@@ -303,6 +303,39 @@ describe("WhopPayoutClient", () => {
     });
   });
 
+  it('rejects a non-withdrawal id after payout creation', async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse(
+        {
+          id: 'cofr_confirmation_only',
+          status: 'processing',
+          amount: '114.50',
+          currency: 'usd',
+          fee_amount: '4.20',
+          markup_fee: '0.00',
+          net_amount: '110.30',
+          created_at: '2026-09-21T12:00:00.000Z',
+        },
+        201,
+      ),
+    );
+
+    await expect(
+      client.createPayout(
+        {
+          accountId: 'biz_seller',
+          amount: 114.5,
+          currency: 'usd',
+          payoutMethodId: 'potk_1',
+        },
+        'koopfy_payout_abc',
+      ),
+    ).rejects.toMatchObject({
+      code: 'invalid_provider_response',
+      requestMayHaveSucceeded: true,
+    });
+  });
+
   it("marks HTTP 409 as an idempotency replay signal", async () => {
     fetchMock.mockResolvedValue(
       jsonResponse({ error: { type: "conflict", message: "duplicate" } }, 409),

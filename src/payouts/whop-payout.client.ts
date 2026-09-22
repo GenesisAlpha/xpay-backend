@@ -511,7 +511,7 @@ function parsePayout(
     const status = expectString(record.status) as WhopPayoutStatus;
     if (!PAYOUT_STATUSES.includes(status)) throw new Error("status");
     return {
-      id: expectOneOfPrefixes(record.id, ["wdrl_", "cofr_"]),
+      id: expectPrefixedString(record.id, "wdrl_"),
       status,
       amount: expectDecimal(record.amount),
       currency: expectCurrency(record.currency),

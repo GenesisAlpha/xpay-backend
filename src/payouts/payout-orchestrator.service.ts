@@ -1245,6 +1245,7 @@ export class PayoutOrchestratorService {
     const attemptToken = requiredAttemptToken(execution);
     let createStarted = false;
     let payout: WhopPayout;
+    let verifyRecoveredOwnership = false;
     try {
       const [account, method] = await Promise.all([
         this.readyAccount(execution.sellerId),
@@ -1320,6 +1321,7 @@ export class PayoutOrchestratorService {
           error.providerPayoutId ?? execution.providerPayoutId!,
           execution.providerAccountId,
         );
+        verifyRecoveredOwnership = true;
       } else {
         const failure = dispatchFailure(error);
         if (createStarted) {
@@ -1367,6 +1369,11 @@ export class PayoutOrchestratorService {
           retryable: failure.retryable,
         };
       }
+    }
+
+    assertProviderPayoutFinancials(execution, payout);
+    if (verifyRecoveredOwnership) {
+      assertRecoveredPayoutOwnership(execution, payout);
     }
 
     await this.repository.recordProviderPayoutId(
@@ -1508,7 +1515,7 @@ function quoteSnapshot(
     amountMinor !== expectedPayoutMinor ||
     providerFeeMinor < 0 ||
     netMinor < 0 ||
-    netMinor > expectedPayoutMinor
+    providerFeeMinor + netMinor !== expectedPayoutMinor
   ) {
     throw new ServiceUnavailableException(
       'O provedor retornou uma cotação inconsistente.',

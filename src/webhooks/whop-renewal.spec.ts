@@ -223,4 +223,48 @@ describe('Whop payout event routing', () => {
       {},
     )
   })
+
+  it('never writes the raw Whop account id to logs or signature errors', async () => {
+    const payoutHandler = { handles: jest.fn().mockReturnValue(true) }
+    const whopAccounts = {
+      getById: jest.fn().mockResolvedValue({
+        config: { webhook_secret: 'ws_secret' },
+      }),
+    }
+    const service = new WebhookService(
+      {} as never,
+      {} as never,
+      whopAccounts as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      payoutHandler as never,
+    )
+    jest.spyOn(service as any, 'verifyWhopSignature').mockReturnValue({
+      valid: false,
+      reason: 'bad signature',
+    })
+    const logged = [
+      jest.spyOn(console, 'log').mockImplementation(),
+      jest.spyOn(console, 'warn').mockImplementation(),
+      jest.spyOn(console, 'error').mockImplementation(),
+    ]
+
+    const result = service.handleWhopWebhook(
+      'biz_master_secret',
+      { type: 'payout.updated' },
+      '{}',
+      {},
+    )
+    await expect(result).rejects.toThrow('assinatura inválida')
+
+    expect(
+      JSON.stringify(logged.flatMap((spy) => spy.mock.calls)),
+    ).not.toContain('biz_master_secret')
+    await result.catch((error) => {
+      expect(String(error)).not.toContain('biz_master_secret')
+    })
+  })
 })

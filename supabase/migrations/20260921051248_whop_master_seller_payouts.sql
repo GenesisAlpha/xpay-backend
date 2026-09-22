@@ -202,7 +202,7 @@ create table public.payout_executions (
   constraint payout_executions_amounts_check check (
     koopfy_fee_minor < gross_minor
     and provider_payout_minor = gross_minor - koopfy_fee_minor
-    and net_minor <= provider_payout_minor
+    and provider_fee_minor + net_minor = provider_payout_minor
   )
 );
 
@@ -277,7 +277,7 @@ begin
      or p_provider_fee_minor < 0
      or p_provider_payout_minor <> p_gross_minor - p_koopfy_fee_minor
      or p_net_minor < 0
-     or p_net_minor > p_provider_payout_minor
+     or p_provider_fee_minor + p_net_minor <> p_provider_payout_minor
      or p_destination_amount_minor < 0
      or p_confirmed_minimum_net_minor < 0
      or p_net_minor < p_confirmed_minimum_net_minor then
@@ -614,6 +614,7 @@ begin
   end if;
   if p_provider_fee_minor < 0
      or p_net_minor < 0
+     or p_provider_fee_minor + p_net_minor <> execution.provider_payout_minor
      or p_net_minor >= execution.confirmed_minimum_net_minor
      or p_destination_amount_minor < 0
      or p_destination_currency !~ '^[A-Z]{3}$' then
@@ -1130,7 +1131,7 @@ begin
   end if;
   if p_provider_fee_minor < 0
      or p_net_minor < 0
-     or p_net_minor > execution.provider_payout_minor
+     or p_provider_fee_minor + p_net_minor <> execution.provider_payout_minor
      or p_net_minor < p_confirmed_minimum_net_minor
      or p_destination_amount_minor < 0 then
     raise exception 'Nova cotação inválida.' using errcode = '22023';

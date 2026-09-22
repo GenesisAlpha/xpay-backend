@@ -90,6 +90,28 @@ describe('PayoutOrchestratorService', () => {
     ...overrides,
   });
 
+  const providerPayout = (overrides: Record<string, unknown> = {}) => ({
+    id: 'wdrl_1',
+    status: 'processing',
+    amount: '114.50',
+    currency: 'usd',
+    feeAmount: '6.40',
+    markupFee: '0.00',
+    netAmount: '108.10',
+    destinationAmount: '621.15',
+    destinationCurrency: 'brl',
+    exchangeRate: '5.74607',
+    estimatedArrival: '2026-09-23T12:00:00.000Z',
+    createdAt: '2026-09-21T15:00:00.000Z',
+    metadata: {
+      koopfy_payout_id: 'payout-1',
+      koopfy_seller_id: 'seller-1',
+      koopfy_account_id: 'biz_secret',
+    },
+    failure: null,
+    ...overrides,
+  });
+
   const providerFailure = (status: number | 'timeout') =>
     new WhopPayoutApiError(
       status === 'timeout' ? 0 : status,
@@ -221,6 +243,21 @@ describe('PayoutOrchestratorService', () => {
     expect(JSON.stringify(preview)).not.toContain('quote_secret');
     expect(JSON.stringify(preview)).not.toContain('biz_secret');
     expect(JSON.stringify(preview)).not.toContain('potk_secret');
+    expect(repository.reserve).not.toHaveBeenCalled();
+    expect(whop.createPayout).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when provider fee and net do not equal the payout amount', async () => {
+    whop.createQuote.mockResolvedValue(quote('108.09', '6.40'));
+
+    await expect(
+      service.preview('seller-1', {
+        methodId: 'local-method-1',
+        speed: 'standard',
+        grossMinor: 11_990,
+      }),
+    ).rejects.toBeInstanceOf(ServiceUnavailableException);
+
     expect(repository.reserve).not.toHaveBeenCalled();
     expect(whop.createPayout).not.toHaveBeenCalled();
   });
@@ -400,7 +437,7 @@ describe('PayoutOrchestratorService', () => {
     repository.claimDispatch
       .mockResolvedValueOnce(execution())
       .mockResolvedValueOnce(null);
-    whop.createPayout.mockResolvedValue({ id: 'wdrl_1', status: 'processing' });
+    whop.createPayout.mockResolvedValue(providerPayout());
 
     const results = await Promise.allSettled([
       service.approveAndDispatch('payout-1', {
@@ -439,7 +476,7 @@ describe('PayoutOrchestratorService', () => {
 
   it('persists an acceptable refreshed quote before creating the payout', async () => {
     whop.createQuote.mockResolvedValue(quote('108.20', '6.30'));
-    whop.createPayout.mockResolvedValue({ id: 'wdrl_1', status: 'processing' });
+    whop.createPayout.mockResolvedValue(providerPayout());
 
     await service.approveAndDispatch('payout-1', {
       managerId: 'admin-a',
@@ -534,10 +571,9 @@ describe('PayoutOrchestratorService', () => {
         true,
       ),
     );
-    whop.retrievePayout.mockResolvedValue({
-      id: 'wdrl_original',
-      status: 'processing',
-    });
+    whop.retrievePayout.mockResolvedValue(
+      providerPayout({ id: 'wdrl_original' }),
+    );
 
     await expect(
       service.approveAndDispatch('payout-1', {
@@ -551,6 +587,53 @@ describe('PayoutOrchestratorService', () => {
       'biz_secret',
     );
     expect(repository.finalizeAccepted).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not bind an idempotency replay that belongs to another payout', async () => {
+    whop.createPayout.mockRejectedValue(
+      new WhopPayoutApiError(
+        409,
+        'idempotency_conflict',
+        false,
+        true,
+        'wdrl_wrong',
+        true,
+      ),
+    );
+    whop.retrievePayout.mockResolvedValue(
+      providerPayout({
+        id: 'wdrl_wrong',
+        metadata: {
+          koopfy_payout_id: 'payout-other',
+          koopfy_seller_id: 'seller-1',
+          koopfy_account_id: 'biz_secret',
+        },
+      }),
+    );
+
+    await expect(
+      service.approveAndDispatch('payout-1', {
+        managerId: 'admin-a',
+        role: 'admin',
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+
+    expect(repository.recordProviderPayoutId).not.toHaveBeenCalled();
+    expect(repository.finalizeAccepted).not.toHaveBeenCalled();
+  });
+
+  it('does not persist a successful create response with divergent financials', async () => {
+    whop.createPayout.mockResolvedValue(providerPayout({ amount: '999.00' }));
+
+    await expect(
+      service.approveAndDispatch('payout-1', {
+        managerId: 'admin-a',
+        role: 'admin',
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+
+    expect(repository.recordProviderPayoutId).not.toHaveBeenCalled();
+    expect(repository.finalizeAccepted).not.toHaveBeenCalled();
   });
 
   it('does not let a stale worker create after losing its dispatch lease', async () => {
@@ -607,7 +690,7 @@ describe('PayoutOrchestratorService', () => {
   });
 
   it('persists provider acceptance before finalizing the local outflow', async () => {
-    whop.createPayout.mockResolvedValue({ id: 'wdrl_1', status: 'processing' });
+    whop.createPayout.mockResolvedValue(providerPayout());
     repository.finalizeAccepted.mockRejectedValue(
       new Error('database unavailable'),
     );
@@ -628,10 +711,9 @@ describe('PayoutOrchestratorService', () => {
   });
 
   it('keeps a lost provider id non-refundable until externally resolved', async () => {
-    whop.createPayout.mockResolvedValueOnce({
-      id: 'wdrl_original',
-      status: 'processing',
-    });
+    whop.createPayout.mockResolvedValueOnce(
+      providerPayout({ id: 'wdrl_original' }),
+    );
     repository.recordProviderPayoutId.mockRejectedValueOnce(
       new Error('database unavailable'),
     );
@@ -748,7 +830,7 @@ describe('PayoutOrchestratorService', () => {
     repository.claimReconciliation
       .mockResolvedValueOnce(stale)
       .mockResolvedValueOnce(null);
-    whop.createPayout.mockResolvedValue({ id: 'wdrl_1', status: 'processing' });
+    whop.createPayout.mockResolvedValue(providerPayout());
 
     await Promise.allSettled([
       service.reconcileOne('payout-1', {
