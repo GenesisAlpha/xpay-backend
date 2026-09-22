@@ -187,7 +187,7 @@ export class PayoutExecutionRepository {
       );
     }
     if (!data.response) {
-      throw new ConflictException(
+      throw new ServiceUnavailableException(
         'Um saque com esta chave ainda está em processamento.',
       );
     }
@@ -810,8 +810,7 @@ export class PayoutOrchestratorService {
         sellerId,
         input.confirmationToken,
         previewSecret(),
-      ) ||
-      new Date(input.previewExpiresAt).getTime() <= now.getTime()
+      )
     ) {
       throw new ConflictException(
         'A cotação expirou ou foi alterada. Revise novamente.',
@@ -825,6 +824,12 @@ export class PayoutOrchestratorService {
       requestHash,
     );
     if (replay) return replay;
+
+    if (new Date(input.previewExpiresAt).getTime() <= now.getTime()) {
+      throw new ConflictException(
+        'A cotação expirou ou foi alterada. Revise novamente.',
+      );
+    }
 
     const context = await this.quoteContext(
       sellerId,
@@ -1668,8 +1673,11 @@ function mapRpcError(error: { code?: string; message?: string }) {
   if (['KP402', 'KP403', 'KP404'].includes(error.code ?? '')) {
     return new BadRequestException(safeRpcMessage(error.code));
   }
-  if (['KP409', 'KP425'].includes(error.code ?? '')) {
+  if (error.code === 'KP409') {
     return new ConflictException(safeRpcMessage(error.code));
+  }
+  if (error.code === 'KP425') {
+    return new ServiceUnavailableException(safeRpcMessage(error.code));
   }
   if (error.code === 'PGRST202' || error.code === '42883') {
     return storageUnavailable();

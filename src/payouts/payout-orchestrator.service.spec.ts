@@ -2,9 +2,13 @@ jest.mock('../lib/supabase.client', () => ({
   supabase: { from: jest.fn(), rpc: jest.fn() },
 }));
 
-import { ConflictException } from '@nestjs/common';
+import { ConflictException, ServiceUnavailableException } from '@nestjs/common';
+import { supabase } from '../lib/supabase.client';
 import { signPreviewConfirmation } from './payout-domain';
-import { PayoutOrchestratorService } from './payout-orchestrator.service';
+import {
+  PayoutExecutionRepository,
+  PayoutOrchestratorService,
+} from './payout-orchestrator.service';
 import { WhopPayoutApiError } from './whop-payout.client';
 
 describe('PayoutOrchestratorService', () => {
@@ -319,7 +323,7 @@ describe('PayoutOrchestratorService', () => {
     expect(repository.reserve).not.toHaveBeenCalled();
   });
 
-  it('returns an existing idempotent reservation before requesting another quote', async () => {
+  it('returns an existing idempotent reservation even after the preview expires', async () => {
     repository.findRequestReplay.mockResolvedValue({
       payoutId: 'payout-existing',
       status: 'pending_review',
@@ -345,7 +349,7 @@ describe('PayoutOrchestratorService', () => {
           ),
         },
         'payout_request_12345678',
-        new Date('2026-09-21T14:59:00.000Z'),
+        new Date('2026-09-21T15:05:00.000Z'),
       ),
     ).resolves.toMatchObject({ payoutId: 'payout-existing', replayed: true });
     expect(whop.createQuote).not.toHaveBeenCalled();
@@ -758,5 +762,29 @@ describe('PayoutOrchestratorService', () => {
     ]);
 
     expect(whop.createPayout).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('PayoutExecutionRepository idempotency', () => {
+  it('reports an unfinished request as temporarily unavailable instead of a quote conflict', async () => {
+    const query = {
+      select: jest.fn(),
+      eq: jest.fn(),
+      maybeSingle: jest.fn().mockResolvedValue({
+        data: { request_hash: 'hash-1', response: null },
+        error: null,
+      }),
+    };
+    query.select.mockReturnValue(query);
+    query.eq.mockReturnValue(query);
+    (supabase.from as jest.Mock).mockReturnValue(query);
+
+    await expect(
+      new PayoutExecutionRepository().findRequestReplay(
+        'seller-1',
+        'payout_request_12345678',
+        'hash-1',
+      ),
+    ).rejects.toBeInstanceOf(ServiceUnavailableException);
   });
 });
