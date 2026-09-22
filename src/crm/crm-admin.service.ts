@@ -53,6 +53,16 @@ interface AdminContext {
 // Converte cents (integer no banco) → USD (decimal pro frontend)
 const c2u = (cents: number | string | null | undefined) => Number(cents ?? 0) / 100
 
+// Um mesmo filtro do CRM pode cobrir status dos dois fluxos de saque: o antigo
+// (conta conectada, status 'pending'/'approved') e o da conta master, que grava
+// o local_state da execução no ledger.
+const WITHDRAWAL_STATUS_ALIASES: Record<string, string[]> = {
+  pending_review: ['pending', 'pending_review'],
+  processing: ['processing', 'dispatching'],
+  failed: ['failed', 'dispatch_failed'],
+  cancelled: ['cancelled', 'canceled'],
+}
+
 // ─── Sellers excluídos das métricas agregadas ──────────────────────────────
 // Estes sellers NÃO contam no overview (GMV, receita, timeseries, top sellers),
 // mas continuam aparecendo nas listagens individuais (transactions, withdrawals,
@@ -613,10 +623,14 @@ export class CrmAdminService {
       .order('requested_at', { ascending: false })
       .range(from, from + pageSize - 1)
 
-    // Mapeia status do frontend para os do ledger
+    // Mapeia status do frontend para os do ledger. O fluxo antigo grava
+    // 'pending' e o saque pela master grava 'pending_review' — a fila de
+    // pendentes precisa listar os dois.
     if (status && status !== 'all') {
-      const dbStatus = status === 'pending_review' ? 'pending' : status
-      q = q.eq('status', dbStatus)
+      const dbStatuses = WITHDRAWAL_STATUS_ALIASES[status] ?? [status]
+      q = dbStatuses.length > 1
+        ? q.in('status', dbStatuses)
+        : q.eq('status', dbStatuses[0])
     }
 
     if (search) {

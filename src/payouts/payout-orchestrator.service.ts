@@ -105,6 +105,15 @@ export interface DispatchExecution extends RequoteExecution {
   attemptToken: string | null;
   providerCreateStartedAt: string | null;
   providerCreateResolvedAt: string | null;
+  providerStatus: string | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+  createdAt: string | null;
+  reviewedAt: string | null;
+  dispatchedAt: string | null;
+  completedAt: string | null;
+  fundsReturnedAt: string | null;
+  walletRestoredAt: string | null;
 }
 
 export interface PayoutAdminContext {
@@ -139,6 +148,15 @@ const EXECUTION_COLUMNS = [
   'provider_create_started_at',
   'provider_create_resolved_at',
   'local_state',
+  'provider_status',
+  'error_code',
+  'error_message',
+  'created_at',
+  'reviewed_at',
+  'dispatched_at',
+  'completed_at',
+  'funds_returned_at',
+  'wallet_restored_at',
 ].join(', ');
 
 function isMissingPayoutTables(error: { code?: string } | null | undefined): boolean {
@@ -1214,7 +1232,16 @@ export class PayoutOrchestratorService {
 
   async getCrmDetail(reference: string) {
     const execution = await this.requiredExecution(reference);
-    const readiness = await this.accounts.getReadiness(execution.sellerId);
+    const [readiness, destination] = await Promise.all([
+      this.accounts.getReadiness(execution.sellerId),
+      this.accounts.describeMethod(execution.sellerId, execution.localMethodId),
+    ]);
+    // A criação começou e não resolveu: pode existir um payout na Whop sem
+    // vínculo local. Nunca repetir o create; só reconciliar ou anexar.
+    const uncertainCreate =
+      !execution.providerPayoutId &&
+      Boolean(execution.providerCreateStartedAt) &&
+      !execution.providerCreateResolvedAt;
     return {
       payoutId: execution.id,
       ledgerEntryId: execution.ledgerEntryId,
@@ -1222,6 +1249,28 @@ export class PayoutOrchestratorService {
       state: execution.localState,
       methodKey: execution.methodKey,
       speed: execution.speed,
+      destination,
+      providerStatus: execution.providerStatus,
+      errorCode: execution.errorCode,
+      errorMessage: execution.errorMessage,
+      createdAt: execution.createdAt,
+      reviewedAt: execution.reviewedAt,
+      dispatchedAt: execution.dispatchedAt,
+      acceptedAt: execution.acceptedAt,
+      completedAt: execution.completedAt,
+      fundsReturnedAt: execution.fundsReturnedAt,
+      walletRestoredAt: execution.walletRestoredAt,
+      uncertainCreate,
+      actions: {
+        approve: execution.localState === 'pending_review',
+        reject: execution.localState === 'pending_review',
+        retry: execution.localState === 'dispatch_failed',
+        reconcile: ['dispatching', 'processing', 'dispatch_failed'].includes(
+          execution.localState,
+        ),
+        manualOverride: Boolean(execution.providerPayoutId),
+        attachProviderPayout: uncertainCreate,
+      },
       grossMinor: execution.grossMinor,
       koopfyFeeMinor: execution.koopfyFeeMinor,
       providerFeeMinor: execution.providerFeeMinor,
@@ -1756,7 +1805,20 @@ function mapDispatchExecution(row: any): DispatchExecution {
         ? row.provider_create_resolved_at
         : null,
     localState: String(row.local_state),
+    providerStatus: nullableText(row.provider_status),
+    errorCode: nullableText(row.error_code),
+    errorMessage: nullableText(row.error_message),
+    createdAt: nullableText(row.created_at),
+    reviewedAt: nullableText(row.reviewed_at),
+    dispatchedAt: nullableText(row.dispatched_at),
+    completedAt: nullableText(row.completed_at),
+    fundsReturnedAt: nullableText(row.funds_returned_at),
+    walletRestoredAt: nullableText(row.wallet_restored_at),
   };
+}
+
+function nullableText(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 ? value : null;
 }
 
 function mapFeeRule(row: any) {

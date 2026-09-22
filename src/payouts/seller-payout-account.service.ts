@@ -424,6 +424,17 @@ export class SellerPayoutAccountService {
     await this.repository.deactivateMethod(sellerId, localMethodId);
   }
 
+  // Resumo mascarado do destino para o CRM: nunca devolve dados completos da
+  // conta, só o que o operador precisa para reconhecer para onde o saque vai.
+  async describeMethod(
+    sellerId: string,
+    localMethodId: string,
+  ): Promise<PublicSavedPayoutMethod | null> {
+    const method = await this.repository.getMethod(localMethodId);
+    if (!method || method.sellerId !== sellerId) return null;
+    return publicMethod(method);
+  }
+
   async assertOwnedActiveMethod(
     sellerId: string,
     localMethodId: string,

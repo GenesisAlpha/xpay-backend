@@ -146,6 +146,18 @@ describe('PayoutOrchestratorService', () => {
         payoutsEnabled: true,
       }),
       assertOwnedActiveMethod: jest.fn().mockResolvedValue(method),
+      describeMethod: jest.fn().mockResolvedValue({
+        id: 'local-method-1',
+        methodKey: 'pix',
+        label: 'Pix principal',
+        maskedReference: '•••1234',
+        currency: 'BRL',
+        country: 'BR',
+        network: null,
+        speeds: ['standard'],
+        isDefault: true,
+        status: 'active',
+      }),
     };
     whop = {
       getMasterAccountId: jest.fn().mockReturnValue('biz_master'),
@@ -845,6 +857,48 @@ describe('PayoutOrchestratorService', () => {
 
     expect(whop.createPayout).toHaveBeenCalledTimes(1);
   });
+  it('exposes a masked destination and the allowed recovery actions to the CRM', async () => {
+    repository.findByReference.mockResolvedValue(
+      execution({
+        localState: 'dispatch_failed',
+        errorCode: 'provider_unavailable',
+        errorMessage: 'Falha temporária do provedor.',
+        providerStatus: null,
+        createdAt: '2026-09-21T14:55:00.000Z',
+        reviewedAt: '2026-09-21T15:00:00.000Z',
+      }),
+    );
+
+    const detail = await service.getCrmDetail('ledger-1');
+
+    expect(detail.destination).toMatchObject({ maskedReference: '•••1234' });
+    expect(detail.errorCode).toBe('provider_unavailable');
+    expect(detail.uncertainCreate).toBe(false);
+    expect(detail.actions).toEqual({
+      approve: false,
+      reject: false,
+      retry: true,
+      reconcile: true,
+      manualOverride: false,
+      attachProviderPayout: false,
+    });
+  });
+
+  it('asks for reconciliation instead of retry when the provider create is uncertain', async () => {
+    repository.findByReference.mockResolvedValue(
+      execution({
+        localState: 'dispatching',
+        providerCreateStartedAt: '2026-09-21T15:01:00.000Z',
+        providerCreateResolvedAt: null,
+      }),
+    );
+
+    const detail = await service.getCrmDetail('ledger-1');
+
+    expect(detail.uncertainCreate).toBe(true);
+    expect(detail.actions.retry).toBe(false);
+    expect(detail.actions.attachProviderPayout).toBe(true);
+  });
 });
 
 describe('PayoutExecutionRepository idempotency', () => {
@@ -869,4 +923,5 @@ describe('PayoutExecutionRepository idempotency', () => {
       ),
     ).rejects.toBeInstanceOf(ServiceUnavailableException);
   });
+
 });
