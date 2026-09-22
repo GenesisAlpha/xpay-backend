@@ -36,7 +36,7 @@ describe('CRM provider payout workflow', () => {
       updateFeeRule: jest.fn().mockResolvedValue({ methodKey: 'pix' }),
       getCrmDetail: jest.fn().mockResolvedValue({ payoutId: 'payout-1' }),
     };
-    service = new CrmAdminService(payouts as never);
+    service = new CrmAdminService({} as never, payouts as never);
     jest.spyOn(service as any, 'audit').mockResolvedValue(undefined);
   });
 

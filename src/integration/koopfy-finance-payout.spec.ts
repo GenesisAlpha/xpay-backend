@@ -344,6 +344,7 @@ describe('KoopfyFinanceService.requestPayout', () => {
       none,
       none,
       none,
+      undefined, // anticipation
       undefined,
       orchestrator as never,
     );
@@ -413,6 +414,7 @@ describe('KoopfyFinanceService payout account onboarding', () => {
         none,
         none,
         none,
+        undefined, // anticipation
         payouts as never,
       ),
     };
