@@ -1750,7 +1750,33 @@ export class PaymentService {
         if (!Number.isFinite(approvedAt) || Date.now() - approvedAt > PaymentService.UPSELL_WINDOW_MS) {
             return { parent: null, reason: 'window_expired' }
         }
+        // O id do cartão existe em qualquer compra; ser cobrável sem o comprador
+        // é outra coisa. Pergunta à Whop antes de a oferta aparecer.
+        if (await this.savedMethodChargeable(parent) === false) {
+            return { parent: null, reason: 'method_not_off_session' }
+        }
         return { parent, reason: null }
+    }
+
+    /**
+     * Cartão salvo da compra-mãe cobrável off-session, pela lista de métodos da
+     * Whop. `null` (conta indisponível, rede, permissão) NÃO bloqueia: derrubar
+     * a oferta por uma consulta que falhou custa uma venda que era possível.
+     */
+    private async savedMethodChargeable(parent: any): Promise<boolean | null> {
+        try {
+            const account: any = await this.accountRouter.resolveAccountById(parent.provider_account_id)
+            if (!account?.apiKey) return null
+            return await new WhopProvider().isSavedMethodChargeable({
+                apiUrl: account.api_url,
+                apiKey: account.apiKey,
+                memberId: String(parent.metadata.whop_member_id),
+                paymentMethodId: String(parent.metadata.whop_payment_method_id),
+            })
+        } catch (err: any) {
+            console.error('[PaymentService] upsell: método salvo:', err?.message ?? err)
+            return null
+        }
     }
 
     async checkUpsellEligibility(sellerId: string, transactionId: string) {

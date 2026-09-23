@@ -126,3 +126,56 @@ describe('WhopProvider off-session charge — recusa da API', () => {
     );
   });
 });
+
+describe('WhopProvider off-session charge — forma do plano', () => {
+  const originalFetch = (global as any).fetch;
+  afterEach(() => { (global as any).fetch = originalFetch; });
+
+  it('sends the same plan shape the checkout uses, with title and visibility', async () => {
+    const fetchMock = mockFetch(200, { id: 'pay_1', status: 'open', substatus: 'pending' });
+
+    await new WhopProvider().charge(ctx());
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.plan).toMatchObject({
+      currency: 'usd',
+      plan_type: 'one_time',
+      visibility: 'quick_link',
+    });
+    expect(typeof body.plan.title).toBe('string');
+    expect(body.plan.title.length).toBeGreaterThan(0);
+  });
+});
+
+describe('WhopProvider.isSavedMethodChargeable', () => {
+  const originalFetch = (global as any).fetch;
+  afterEach(() => { (global as any).fetch = originalFetch; });
+
+  const args = {
+    apiUrl: 'https://api.whop.test',
+    apiKey: 'whop-key',
+    memberId: 'mber_1',
+    paymentMethodId: 'payt_1',
+  };
+
+  it('asks the provider only for methods usable off session', async () => {
+    const fetchMock = mockFetch(200, { data: [{ id: 'payt_1' }] });
+
+    await expect(new WhopProvider().isSavedMethodChargeable(args)).resolves.toBe(true);
+
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain('/api/v1/payment_methods');
+    expect(url).toContain('member_id=mber_1');
+    expect(url).toContain('future_usage=off_session');
+  });
+
+  it('reports a card the provider will not reuse', async () => {
+    mockFetch(200, { data: [{ id: 'payt_outro' }] });
+    await expect(new WhopProvider().isSavedMethodChargeable(args)).resolves.toBe(false);
+  });
+
+  it('stays silent when the lookup itself fails, instead of killing the offer', async () => {
+    mockFetch(500, { error: { message: 'boom' } });
+    await expect(new WhopProvider().isSavedMethodChargeable(args)).resolves.toBeNull();
+  });
+});

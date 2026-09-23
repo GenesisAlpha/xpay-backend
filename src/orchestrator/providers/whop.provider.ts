@@ -285,6 +285,7 @@ export class WhopProvider {
         apiKey,
         companyId,
         transactionId,
+        title,
         memberId: String(ctx.offSession.memberId),
         paymentMethodId: String(ctx.offSession.paymentMethodId),
         parentTransactionId: String(ctx.offSession.parentTransactionId ?? ''),
@@ -751,6 +752,7 @@ export class WhopProvider {
     apiKey: string;
     companyId: string;
     transactionId: string;
+    title: string;
     memberId: string;
     paymentMethodId: string;
     parentTransactionId: string;
@@ -772,8 +774,13 @@ export class WhopProvider {
       account_id: args.companyId,
       member_id: args.memberId,
       payment_method_id: args.paymentMethodId,
+      // Mesma forma do plano que o checkout usa todos os dias (token do Elements).
+      // Sem `title`/`visibility` a Whop devolvia 400 bad_request, sem dizer qual
+      // campo faltava — e a oferta do funil morria com uma frase genérica.
       plan: {
         currency: args.currency,
+        title: args.title,
+        visibility: 'quick_link',
         initial_price: args.initialPrice,
         plan_type: 'one_time',
         ...(args.applicationFee != null ? { application_fee_amount: args.applicationFee } : {}),
@@ -874,6 +881,51 @@ export class WhopProvider {
     } catch (err: any) {
       console.error('[WhopProvider] off-session charge error:', err?.message);
       return this.failure(accountId, transactionId, err?.message ?? 'erro desconhecido');
+    }
+  }
+
+  // ─────────────────────────────────────────────
+  // O cartão salvo é cobrável sem o comprador?
+  //
+  // Ter um `payt_` na compra-mãe não significa que ele pode ser cobrado depois:
+  // a Whop só permite quando foi guardado com uso futuro off_session. A lista de
+  // métodos aceita esse filtro, então perguntamos a ela em vez de descobrir na
+  // recusa — o comprador não pode ver uma oferta que nunca poderia ser cobrada.
+  //
+  // true = pode cobrar · false = a Whop não guarda esse método para off_session
+  // null = não deu para saber (rede, permissão): quem chama decide, e a regra é
+  // não derrubar a venda por uma consulta que falhou.
+  // ─────────────────────────────────────────────
+  async isSavedMethodChargeable(args: {
+    apiUrl?: string;
+    apiKey: string;
+    memberId: string;
+    paymentMethodId: string;
+  }): Promise<boolean | null> {
+    const apiUrl = args.apiUrl ?? WHOP_API_URL_DEFAULT;
+    const query = new URLSearchParams({
+      member_id: args.memberId,
+      future_usage: 'off_session',
+      first: '50',
+    });
+
+    try {
+      const res = await fetch(`${apiUrl}/api/v1/payment_methods?${query.toString()}`, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${args.apiKey}`,
+          Accept: 'application/json',
+        },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) return null;
+      const json: any = await res.json().catch(() => null);
+      const list = Array.isArray(json?.data) ? json.data : null;
+      if (!list) return null;
+      return list.some((method: any) => String(method?.id ?? '') === args.paymentMethodId);
+    } catch (err: any) {
+      console.error('[WhopProvider] payment_methods lookup:', err?.message);
+      return null;
     }
   }
 
