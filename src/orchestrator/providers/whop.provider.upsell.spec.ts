@@ -94,3 +94,35 @@ describe('WhopProvider off-session charge (one-click upsell)', () => {
     expect(fetchMock.mock.calls[0][0]).toBe('https://api.whop.test/api/v1/checkout_configurations');
   });
 });
+
+describe('WhopProvider off-session charge — recusa da API', () => {
+  const originalFetch = (global as any).fetch;
+  afterEach(() => { (global as any).fetch = originalFetch; });
+
+  it('keeps the provider error code and what was sent, not just the generic message', async () => {
+    mockFetch(422, {
+      error: {
+        type: 'invalid_request_error',
+        code: 'payment_method_not_reusable',
+        message: 'We could not process this payment request right now. Please try again later.',
+      },
+    });
+
+    const result = await new WhopProvider().charge(ctx());
+
+    expect(result.success).toBe(false);
+    expect(result.failureMessage).toContain('could not process');
+    expect(result.data).toMatchObject({
+      http_status: 422,
+      whop_error: { code: 'payment_method_not_reusable' },
+      request: {
+        account_id: 'biz_123',
+        member_id: 'mber_1',
+        payment_method_id: 'payt_1',
+      },
+    });
+    expect((result.data as any).request.plan).toEqual(
+      expect.arrayContaining(['currency', 'initial_price', 'plan_type']),
+    );
+  });
+});

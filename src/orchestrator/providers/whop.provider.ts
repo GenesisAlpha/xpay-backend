@@ -812,8 +812,20 @@ export class WhopProvider {
       if (!res.ok) {
         const message = json?.error?.message ?? json?.message ?? `Whop HTTP ${res.status}`;
         const code = whopDeclineCode(json);
+        // Recusa da própria API (não do banco): a Whop responde uma frase
+        // genérica e o motivo real só existia no log do container. Sem o código
+        // e sem saber o que foi enviado, todo teste de funil termina no escuro.
         return {
-          ...this.failure(accountId, transactionId, message, json),
+          ...this.failure(accountId, transactionId, message, {
+            http_status: res.status,
+            whop_error: json?.error ?? json,
+            request: {
+              account_id: body.account_id,
+              member_id: body.member_id,
+              payment_method_id: body.payment_method_id,
+              plan: Object.keys(body.plan ?? {}),
+            },
+          }),
           ...(code ? { failureCode: code } : {}),
         };
       }

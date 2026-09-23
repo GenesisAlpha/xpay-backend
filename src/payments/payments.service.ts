@@ -65,6 +65,29 @@ interface SettlementPayload {
 // Minutos que uma reserva de CARTÃO sobrevive sem virar cobrança.
 const CARD_HOLD_TTL_MIN = Number(process.env.CLIP_CARD_HOLD_TTL_MIN ?? 25)
 
+// Resumo do erro do provider guardado na transação: código, tipo, mensagem e o
+// que foi enviado — nunca o corpo inteiro, que pode trazer dado do comprador.
+function summarizeProviderError(data: unknown): Record<string, unknown> | null {
+    if (!data || typeof data !== 'object') return null
+    const raw = data as Record<string, any>
+    const error = (raw.whop_error ?? raw.error ?? raw) as Record<string, any>
+    const text = (value: unknown) =>
+        typeof value === 'string' && value.trim() ? value.trim().slice(0, 500) : undefined
+    const summary: Record<string, unknown> = {
+        at: new Date().toISOString(),
+        code: text(error?.code) ?? text(raw.decline_code),
+        type: text(error?.type),
+        param: text(error?.param),
+        message: text(error?.message) ?? text(raw.failure_message),
+        httpStatus: typeof raw.http_status === 'number' ? raw.http_status : undefined,
+        request: raw.request && typeof raw.request === 'object' ? raw.request : undefined,
+    }
+    for (const key of Object.keys(summary)) {
+        if (summary[key] === undefined) delete summary[key]
+    }
+    return Object.keys(summary).length > 1 ? summary : null
+}
+
 @Injectable()
 export class PaymentService {
 
@@ -697,6 +720,11 @@ export class PaymentService {
         // ─── Falha total ───────────────────────────────────────────────────────
         if (!result?.success) {
             const now = new Date().toISOString()
+            // A mensagem do provider costuma ser genérica ("could not process
+            // this payment request"). O detalhe que explica a recusa fica aqui,
+            // na transação — antes vivia só no log do container, fora do alcance
+            // de quem está testando.
+            const providerError = summarizeProviderError(result?.data)
             await supabase.from('transactions').update({
                 status: 'failed',
                 provider_status: result?.providerStatus ?? null,
@@ -705,6 +733,9 @@ export class PaymentService {
                 error_message: lastError?.message ?? null,
                 failed_at: now,
                 processed_at: now,
+                ...(providerError
+                    ? { metadata: { ...(transaction.metadata ?? {}), provider_error: providerError } }
+                    : {}),
             }).eq('id', transaction.id)
 
             await this.registerKpi({
