@@ -1730,6 +1730,9 @@ export class PaymentService {
     // Janela do upsell pós-compra: passado disto a oferta de um clique já não é
     // pós-compra, e cobrar sem o comprador na página vira risco de chargeback.
     private static readonly UPSELL_WINDOW_MS = 60 * 60 * 1000
+    /** Última consulta ao provedor por transação (ver confirmAtProvider). */
+    private static readonly providerPulls = new Map<string, number>()
+    private static readonly PROVIDER_PULL_INTERVAL_MS = 2_000
 
     /** Compra-mãe apta a upsell de um clique: Whop, aprovada, recente e com meio de pagamento salvo. */
     private async loadUpsellParent(sellerId: string, transactionId: string) {
@@ -1796,10 +1799,23 @@ export class PaymentService {
     }
 
     async getTransactionStatus(sellerId: string, transactionId: string) {
-        const { data } = await supabase.from('transactions')
-            .select('id, status, provider_status, provider_transaction_id, failure_message, metadata, amount, currency, payment_brand, payment_last4')
+        const columns = 'id, status, provider_status, provider_transaction_id, failure_message, metadata, amount, currency, payment_brand, payment_last4, provider, provider_account_id'
+        let { data } = await supabase.from('transactions')
+            .select(columns)
             .eq('id', transactionId).eq('seller_id', sellerId).single()
         if (!data) throw new BadRequestException('Transação não encontrada.')
+
+        // Quem está esperando é o comprador, na tela de resultado. Em vez de
+        // aguardar o aviso da Whop chegar (fila + entrega + retentativa, ~13 s
+        // medidos, e às vezes entrega que falha), perguntamos à fonte e
+        // aplicamos pelo mesmo caminho do webhook. O webhook continua valendo:
+        // isto só deixa de depender de ele ser o ÚNICO caminho.
+        if (await this.confirmAtProvider(data)) {
+            const refreshed = await supabase.from('transactions')
+                .select(columns)
+                .eq('id', transactionId).eq('seller_id', sellerId).single()
+            if (refreshed.data) data = refreshed.data
+        }
         // Bandeira informada pelo processador (webhook da Whop) — o checkout grava
         // no pedido. 'unknown' é o que o checkout mandou sem saber: não serve.
         const brand = String(data.metadata?.whop_card_brand ?? data.payment_brand ?? '').toLowerCase()
@@ -1831,6 +1847,50 @@ export class PaymentService {
             renewalCycle: data.metadata?.renewal_cycle ?? null,
             amount: data.amount ?? null,
             currency: data.currency ?? null,
+        }
+    }
+
+    /**
+     * Pergunta o pagamento à Whop e aplica o resultado, se ela já decidiu.
+     * Devolve true quando algo mudou — aí quem chamou relê a transação.
+     *
+     * Só vale para transação ainda indefinida e com pagamento criado no
+     * provedor. Uma consulta por transação a cada 2 s: a tela do comprador
+     * pergunta de 3 em 3 segundos e várias abas não podem virar várias
+     * chamadas à Whop.
+     */
+    private async confirmAtProvider(tx: any): Promise<boolean> {
+        if (!tx || ['approved', 'refunded', 'chargeback'].includes(String(tx.status))) return false
+        if (this.normalizeProviderName(tx.provider) !== 'whop') return false
+        const paymentId = tx.metadata?.whop_payment_id
+        if (typeof paymentId !== 'string' || !paymentId) return false
+
+        const last = PaymentService.providerPulls.get(tx.id) ?? 0
+        if (Date.now() - last < PaymentService.PROVIDER_PULL_INTERVAL_MS) return false
+        PaymentService.providerPulls.set(tx.id, Date.now())
+
+        try {
+            const account: any = await this.accountRouter.resolveAccountById(tx.provider_account_id)
+            if (!account?.apiKey) return false
+            const { status } = await new WhopProvider().getPaymentStatus(paymentId, account)
+            const mapped = String(status ?? '').toLowerCase() === 'paid'
+                ? 'PAID'
+                : ['failed', 'uncollectible', 'void'].includes(String(status ?? '').toLowerCase())
+                    ? 'FAILED'
+                    : null
+            if (!mapped) return false
+
+            await this.webhookService.handleWebhookProvider({
+                reference: tx.id,
+                status: mapped,
+                type: 'TRANSACTION',
+            })
+            return true
+        } catch (err: any) {
+            // A consulta é um atalho, não uma dependência: falhou, o comprador
+            // continua esperando o webhook como antes.
+            console.error('[PaymentService] confirmação na fonte:', err?.message ?? err)
+            return false
         }
     }
 
