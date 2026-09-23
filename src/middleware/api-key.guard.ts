@@ -21,6 +21,7 @@ import {
     UnauthorizedException,
 } from '@nestjs/common';
 import { supabase } from '../lib/supabase.client';
+import { readApiKeyCache, writeApiKeyCache } from './api-key-cache';
 import * as bcrypt from 'bcrypt';
 
 declare module 'express' {
@@ -49,16 +50,23 @@ export class ApiKeyGuard implements CanActivate {
         // 🔥 1. extrai prefixo (ex: sk_live_abc123)
         const prefix = token.slice(0, 20); // pode ajustar tamanho
 
-        // 🔥 2. busca só UMA key
-        const { data: apiKey, error } = await supabase
-            .from('api_keys')
-            .select('*')
-            .eq('key_prefix', prefix)
-            .eq('is_active', true)
-            .single();
-        console.log(`[timing][ApiKeyGuard] busca api_keys: ${Date.now() - __t0}ms`);
+        // 🔥 2. a chave vem do cache; o banco só entra quando ele não tem.
+        let apiKey = readApiKeyCache(prefix);
+        if (apiKey === undefined) {
+            const { data } = await supabase
+                .from('api_keys')
+                .select('id, seller_id, secret_key_hash')
+                .eq('key_prefix', prefix)
+                .eq('is_active', true)
+                .single();
+            apiKey = data
+                ? { id: data.id, sellerId: data.seller_id, secretKeyHash: data.secret_key_hash }
+                : null;
+            writeApiKeyCache(prefix, apiKey);
+            console.log(`[timing][ApiKeyGuard] busca api_keys: ${Date.now() - __t0}ms`);
+        }
 
-        if (error || !apiKey) {
+        if (!apiKey) {
             throw new UnauthorizedException('Invalid API Key');
         }
 
@@ -67,13 +75,12 @@ export class ApiKeyGuard implements CanActivate {
             .update(token)
             .digest('hex');
 
-        // compara direto
-        if (hashedToken !== apiKey.secret_key_hash) {
+        // compara direto — o hash guardado é o mesmo do banco.
+        if (hashedToken !== apiKey.secretKeyHash) {
             throw new UnauthorizedException('Invalid API Key');
         }
         // 🔥 4. injeta seller no request
-        req.sellerId = apiKey.seller_id;
-        console.log(`[timing][ApiKeyGuard] canActivate fim: ${Date.now() - __t0}ms`);
+        req.sellerId = apiKey.sellerId;
 
         return true;
     }

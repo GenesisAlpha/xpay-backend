@@ -7,6 +7,7 @@ import { Injectable, BadRequestException, ConflictException, NotFoundException, 
 import { formatBusinessDate } from '../../shared/business-time'
 import { WhopPayoutDestinationsService } from '../../orchestrator/whop/whop-payout-destinations.service'
 import { supabase } from '../../lib/supabase.client'
+import { invalidateApiKeyCache } from '../../middleware/api-key-cache';
 import * as bcrypt from 'bcrypt';
 import { generateKey, hashKey } from '../../utils/apikeys.utils';
 import * as crypto from 'crypto';
@@ -1721,6 +1722,8 @@ export class ApiKeysService {
       .eq('seller_id', sellerId);
 
     if (error) throw new Error('Failed to revoke key');
+    // Revogação imediata não pode esperar o TTL do cache deste processo.
+    invalidateApiKeyCache();
     return { success: true };
   }
 
@@ -1744,6 +1747,7 @@ export class ApiKeysService {
       .eq('is_active', true); // só agenda revogação em chaves ativas
 
     if (error) throw new Error('Failed to schedule revocation');
+    invalidateApiKeyCache();
     return { success: true, expiresAt: expiresAt.toISOString() };
   }
 
