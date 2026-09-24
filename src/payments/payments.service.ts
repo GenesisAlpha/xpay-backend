@@ -1753,21 +1753,24 @@ export class PaymentService {
         if (!Number.isFinite(approvedAt) || Date.now() - approvedAt > PaymentService.UPSELL_WINDOW_MS) {
             return { parent: null, reason: 'window_expired' }
         }
-        // O id do cartão existe em qualquer compra; ser cobrável sem o comprador
-        // é outra coisa. Pergunta à Whop antes de a oferta aparecer.
-        if (await this.savedMethodChargeable(parent) === false) {
-            return { parent: null, reason: 'method_not_off_session' }
-        }
+        // A lista de métodos da Whop diz se o cartão é cobrável off-session, mas
+        // ela NÃO decide: em produção respondeu "não" para cartão que a compra
+        // tinha acabado de salvar, e toda oferta virou "não está mais
+        // disponível". Fica como sinal no log; quem decide é a cobrança.
+        void this.savedMethodChargeable(parent)
         return { parent, reason: null }
     }
 
     /**
      * Cartão salvo da compra-mãe cobrável off-session, pela lista de métodos da
-     * Whop. `null` (conta indisponível, rede, permissão) NÃO bloqueia: derrubar
-     * a oferta por uma consulta que falhou custa uma venda que era possível.
+     * Whop. Hoje é só observação: a consulta respondeu "não" para cartão recém
+     * salvo e derrubou ofertas legítimas, então ela não bloqueia mais nada.
+     * Ligar com WHOP_UPSELL_METHOD_CHECK=true só depois de conferir, no log,
+     * que ela concorda com a realidade.
      */
     private async savedMethodChargeable(parent: any): Promise<boolean | null> {
         try {
+            if (process.env.WHOP_UPSELL_METHOD_CHECK !== 'true') return null
             const account: any = await this.accountRouter.resolveAccountById(parent.provider_account_id)
             if (!account?.apiKey) return null
             return await new WhopProvider().isSavedMethodChargeable({

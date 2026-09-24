@@ -70,3 +70,18 @@ describe('confirmação na fonte (upsell da espera)', () => {
     await expect(service.confirmAtProvider(tx())).resolves.toBe(false);
   });
 });
+
+// A lista de métodos da Whop disse "não cobrável" para um cartão recém salvo e
+// toda oferta virou "não está mais disponível". Ela não pode mais reprovar
+// ninguém sozinha.
+describe('elegibilidade do upsell não é derrubada pela lista de métodos', () => {
+  const service = Object.create(PaymentService.prototype) as any;
+
+  it('não consulta a Whop enquanto a checagem não for ligada de propósito', async () => {
+    delete process.env.WHOP_UPSELL_METHOD_CHECK;
+    service.accountRouter = { resolveAccountById: jest.fn() };
+    await expect(service.savedMethodChargeable({ provider_account_id: 'whop_main', metadata: {} }))
+      .resolves.toBeNull();
+    expect(service.accountRouter.resolveAccountById).not.toHaveBeenCalled();
+  });
+});
