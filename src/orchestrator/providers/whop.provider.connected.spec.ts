@@ -30,7 +30,13 @@ function ctx(overrides: Record<string, any> = {}) {
 }
 
 function mockFetch(status: number, body: any) {
-  const fetchMock = jest.fn().mockResolvedValue({ ok: status < 400, status, json: async () => body });
+  // A cobrança off-session cria o plano antes: ele responde sozinho e a resposta
+  // do teste vale para a cobrança.
+  const fetchMock = jest.fn().mockImplementation((url: string) =>
+    String(url).includes('/api/v1/plans')
+      ? Promise.resolve({ ok: true, status: 200, json: async () => ({ id: 'plan_test' }) })
+      : Promise.resolve({ ok: status < 400, status, json: async () => body }),
+  );
   (global as any).fetch = fetchMock;
   return fetchMock;
 }
@@ -80,10 +86,17 @@ describe('WhopProvider em conta conectada', () => {
     }));
 
     expect(result.success).toBe(true);
-    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({
+    // A fee vive no plano, e o plano virou recurso próprio (ver ensureOneTimePlan).
+    const planCall = fetchMock.mock.calls.find(([url]: any[]) => String(url).includes('/api/v1/plans'));
+    expect(JSON.parse(planCall![1].body)).toMatchObject({
+      account_id: 'biz_seller',
+      initial_price: 343.48,
+      application_fee_amount: 343.47,
+    });
+    const paymentCall = fetchMock.mock.calls.find(([url]: any[]) => String(url).includes('/api/v1/payments'));
+    expect(JSON.parse(paymentCall![1].body)).toMatchObject({
       account_id: 'biz_seller',
       member_id: 'mber_1',
-      plan: { initial_price: 343.48, application_fee_amount: 343.47 },
     });
   });
 

@@ -746,6 +746,79 @@ export class WhopProvider {
     }
   }
 
+  // ─────────────────────────────────────────────
+  // Plano para a cobrança do cartão salvo.
+  //
+  // O guia da Whop para cobrar meio de pagamento salvo manda `plan_id`; o plano
+  // inline, que o checkout usa todos os dias com confirmation_token, é recusado
+  // nessa rota com 400 bad_request e sem dizer qual campo. Então criamos o plano
+  // antes e cobramos por id.
+  //
+  // O mesmo plano serve todas as ofertas de mesmo preço na mesma conta: a chave
+  // de idempotência e o cache em memória evitam um plano novo por comprador.
+  // ─────────────────────────────────────────────
+  private static readonly planCache = new Map<string, { id: string; until: number }>();
+  private static readonly PLAN_CACHE_MS = 60 * 60 * 1000;
+
+  private async ensureOneTimePlan(args: {
+    apiUrl: string;
+    apiKey: string;
+    companyId: string;
+    currency: string;
+    initialPrice: number;
+    title: string;
+    applicationFee: number | null;
+    config: any;
+    store: StoreRef;
+  }): Promise<{ planId: string } | { error: any }> {
+    const productLink = this.buildProductLink(args.config, args.store);
+    const key = [
+      args.companyId,
+      args.currency,
+      args.initialPrice.toFixed(2),
+      args.applicationFee == null ? '-' : args.applicationFee.toFixed(2),
+      JSON.stringify(productLink),
+    ].join('|');
+
+    const cached = WhopProvider.planCache.get(key);
+    if (cached && cached.until > Date.now()) return { planId: cached.id };
+
+    const body = {
+      account_id: args.companyId,
+      currency: args.currency,
+      initial_price: args.initialPrice,
+      plan_type: 'one_time',
+      title: args.title,
+      visibility: 'quick_link',
+      ...(args.applicationFee != null ? { application_fee_amount: args.applicationFee } : {}),
+      ...productLink,
+    };
+
+    try {
+      const res = await fetch(`${args.apiUrl}/api/v1/plans`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${args.apiKey}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          // Mesma chave para o mesmo plano: retry de rede não cria dois.
+          'Idempotency-Key': `koopfy_plan_${createHash('sha256').update(key).digest('hex').slice(0, 32)}`,
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(15_000),
+      });
+      const json: any = await res.json().catch(() => ({}));
+      const planId = typeof json?.id === 'string' ? json.id : null;
+      if (!res.ok || !planId) {
+        return { error: { http_status: res.status, whop_error: json?.error ?? json, plan: Object.keys(body) } };
+      }
+      WhopProvider.planCache.set(key, { id: planId, until: Date.now() + WhopProvider.PLAN_CACHE_MS });
+      return { planId };
+    } catch (err: any) {
+      return { error: { message: err?.message ?? 'erro desconhecido' } };
+    }
+  }
+
   private async chargeSavedPaymentMethod(args: {
     accountId: string;
     apiUrl: string;
@@ -770,6 +843,23 @@ export class WhopProvider {
   }): Promise<ChargeResponse> {
     const { accountId, transactionId } = args;
 
+    // Caminho do guia: plano criado antes, cobrança por id. Se a criação falhar,
+    // segue o corpo antigo (plano inline) — pior que hoje é que não pode ficar.
+    const plan = await this.ensureOneTimePlan({
+      apiUrl: args.apiUrl,
+      apiKey: args.apiKey,
+      companyId: args.companyId,
+      currency: args.currency,
+      initialPrice: args.initialPrice,
+      title: args.title,
+      applicationFee: args.applicationFee,
+      config: args.config,
+      store: args.store,
+    });
+    const planId = 'planId' in plan ? plan.planId : null;
+    const planError = 'error' in plan ? plan.error : null;
+    if (planError) console.error('[WhopProvider] plano do upsell:', JSON.stringify(planError));
+
     const body = {
       account_id: args.companyId,
       member_id: args.memberId,
@@ -777,15 +867,17 @@ export class WhopProvider {
       // Mesma forma do plano que o checkout usa todos os dias (token do Elements).
       // Sem `title`/`visibility` a Whop devolvia 400 bad_request, sem dizer qual
       // campo faltava — e a oferta do funil morria com uma frase genérica.
-      plan: {
-        currency: args.currency,
-        title: args.title,
-        visibility: 'quick_link',
-        initial_price: args.initialPrice,
-        plan_type: 'one_time',
-        ...(args.applicationFee != null ? { application_fee_amount: args.applicationFee } : {}),
-        ...this.buildProductLink(args.config, args.store),
-      },
+      ...(planId ? { plan_id: planId } : {
+        plan: {
+          currency: args.currency,
+          title: args.title,
+          visibility: 'quick_link',
+          initial_price: args.initialPrice,
+          plan_type: 'one_time',
+          ...(args.applicationFee != null ? { application_fee_amount: args.applicationFee } : {}),
+          ...this.buildProductLink(args.config, args.store),
+        },
+      }),
       metadata: {
         koopfy_transaction_id: transactionId,
         koopfy_order_ref: args.orderRef,
@@ -830,7 +922,10 @@ export class WhopProvider {
               account_id: body.account_id,
               member_id: body.member_id,
               payment_method_id: body.payment_method_id,
-              plan: Object.keys(body.plan ?? {}),
+              via: planId ? 'plan_id' : 'plano inline',
+              plan_id: planId,
+              plan: Object.keys((body as any).plan ?? {}),
+              plan_error: planError,
             },
           }),
           ...(code ? { failureCode: code } : {}),

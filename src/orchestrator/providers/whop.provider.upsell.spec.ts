@@ -25,10 +25,25 @@ function ctx(overrides: Record<string, any> = {}) {
   };
 }
 
+// A cobrança do cartão salvo cria o plano antes (ver ensureOneTimePlan): o plano
+// responde sozinho e a resposta do teste vale para a cobrança.
 function mockFetch(status: number, body: any) {
-  const fetchMock = jest.fn().mockResolvedValue({ ok: status < 400, status, json: async () => body });
+  const fetchMock = jest.fn().mockImplementation((url: string) =>
+    String(url).includes('/api/v1/plans')
+      ? Promise.resolve({ ok: true, status: 200, json: async () => ({ id: 'plan_test' }) })
+      : Promise.resolve({ ok: status < 400, status, json: async () => body }),
+  );
   (global as any).fetch = fetchMock;
   return fetchMock;
+}
+
+/** O cache de planos é estático — sem limpar, um teste esconde a criação no outro. */
+beforeEach(() => { (WhopProvider as any).planCache?.clear() });
+
+/** A chamada da cobrança, ignorando a criação do plano. */
+function paymentCall(fetchMock: jest.Mock) {
+  return fetchMock.mock.calls.find(([url]) => String(url).includes('/api/v1/payments'))
+    ?? fetchMock.mock.calls[0];
 }
 
 describe('WhopProvider off-session charge (one-click upsell)', () => {
@@ -40,14 +55,14 @@ describe('WhopProvider off-session charge (one-click upsell)', () => {
 
     const result = await new WhopProvider().charge(ctx());
 
-    const [url, init] = fetchMock.mock.calls[0];
+    const [url, init] = paymentCall(fetchMock);
     expect(url).toBe('https://api.whop.test/api/v1/payments');
     expect(init.headers['Idempotency-Key']).toBe('koopfy_upsell_tx-upsell-1');
     expect(JSON.parse(init.body)).toMatchObject({
       account_id: 'biz_123',
       member_id: 'mber_1',
       payment_method_id: 'payt_1',
-      plan: { currency: 'usd', initial_price: 49, plan_type: 'one_time' },
+      plan_id: 'plan_test',
       metadata: {
         koopfy_transaction_id: 'tx-upsell-1',
         koopfy_payment_type: 'upsell',
@@ -121,9 +136,7 @@ describe('WhopProvider off-session charge — recusa da API', () => {
         payment_method_id: 'payt_1',
       },
     });
-    expect((result.data as any).request.plan).toEqual(
-      expect.arrayContaining(['currency', 'initial_price', 'plan_type']),
-    );
+    expect((result.data as any).request).toMatchObject({ via: 'plan_id', plan_id: 'plan_test' });
   });
 });
 
@@ -136,14 +149,16 @@ describe('WhopProvider off-session charge — forma do plano', () => {
 
     await new WhopProvider().charge(ctx());
 
-    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
-    expect(body.plan).toMatchObject({
+    // O plano virou recurso próprio: a forma que a Whop aceita está na criação.
+    const planCall = fetchMock.mock.calls.find(([url]) => String(url).includes('/api/v1/plans'));
+    const plan = JSON.parse(planCall![1].body);
+    expect(plan).toMatchObject({
       currency: 'usd',
       plan_type: 'one_time',
       visibility: 'quick_link',
     });
-    expect(typeof body.plan.title).toBe('string');
-    expect(body.plan.title.length).toBeGreaterThan(0);
+    expect(typeof plan.title).toBe('string');
+    expect(plan.title.length).toBeGreaterThan(0);
   });
 });
 
@@ -177,5 +192,53 @@ describe('WhopProvider.isSavedMethodChargeable', () => {
   it('stays silent when the lookup itself fails, instead of killing the offer', async () => {
     mockFetch(500, { error: { message: 'boom' } });
     await expect(new WhopProvider().isSavedMethodChargeable(args)).resolves.toBeNull();
+  });
+});
+
+
+// A rota de cartão salvo recusa plano inline com 400 sem dizer o campo; o guia
+// da Whop manda criar o plano e cobrar por id.
+describe('WhopProvider off-session charge — plano por id', () => {
+  const originalFetch = (global as any).fetch;
+  afterEach(() => { (global as any).fetch = originalFetch; });
+
+  function fetchSeq(responses: Array<{ status: number; body: any }>) {
+    const calls: any[] = [];
+    const mock = jest.fn().mockImplementation((url: string, init: any) => {
+      calls.push({ url: String(url), body: init?.body ? JSON.parse(init.body) : null });
+      const next = responses.shift() ?? { status: 200, body: {} };
+      return Promise.resolve({ ok: next.status < 400, status: next.status, json: async () => next.body });
+    });
+    (global as any).fetch = mock;
+    return calls;
+  }
+
+  it('cria o plano e cobra por plan_id, sem plano inline', async () => {
+    const calls = fetchSeq([
+      { status: 200, body: { id: 'plan_123' } },
+      { status: 200, body: { id: 'pay_1', status: 'open', substatus: 'pending' } },
+    ]);
+
+    const result = await new WhopProvider().charge(ctx());
+
+    expect(result.success).toBe(true);
+    expect(calls[0].url).toContain('/api/v1/plans');
+    expect(calls[0].body).toMatchObject({ plan_type: 'one_time', currency: 'usd' });
+    expect(calls[1].url).toContain('/api/v1/payments');
+    expect(calls[1].body).toMatchObject({ plan_id: 'plan_123', member_id: 'mber_1' });
+    expect(calls[1].body.plan).toBeUndefined();
+  });
+
+  it('plano recusado não derruba a cobrança: volta ao plano inline', async () => {
+    const calls = fetchSeq([
+      { status: 422, body: { error: { message: 'nope' } } },
+      { status: 200, body: { id: 'pay_1', status: 'open', substatus: 'pending' } },
+    ]);
+
+    const result = await new WhopProvider().charge(ctx({ transactionId: 'tx-upsell-2' }));
+
+    expect(result.success).toBe(true);
+    expect(calls[1].body.plan_id).toBeUndefined();
+    expect(calls[1].body.plan).toMatchObject({ plan_type: 'one_time' });
   });
 });
