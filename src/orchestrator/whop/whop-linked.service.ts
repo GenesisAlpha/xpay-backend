@@ -553,7 +553,7 @@ export class WhopLinkedAccountsService {
       status: row.status,
       commissionPct: Number(row.commission_pct ?? 0),
       // Sem afiliado + rev-share na conta dele, a Koopfy não recebe nada.
-      affiliateReady: Boolean(row.affiliate_id && row.affiliate_override_id),
+      affiliateReady: Boolean(row.affiliate_id && row.affiliate_code && row.affiliate_override_id),
       // Saldo, extrato e saque da conta dele dentro do painel da Koopfy.
       walletReady: Boolean(row.wallet_ready),
       blocker: linkedChargeBlocker(row),
@@ -651,12 +651,14 @@ export class WhopLinkedAccountsService {
     const id = String(affiliate?.id ?? '').trim();
     if (!id) throw new Error('A Whop não devolveu o afiliado criado.');
 
+    // O código que atribui a venda é o USERNAME do afiliado (é o `?a=<username>`
+    // dos links da Whop). A resposta não tem `affiliate_code`: sem isto o
+    // checkout sairia sem afiliado e a comissão nunca seria cobrada.
+    const code = String(affiliate?.user?.username ?? '').trim();
+    if (!code) throw new Error('A Whop não devolveu o username do afiliado: sem ele a venda não é atribuída à Koopfy.');
+
     const override = await this.createOverride(apiKey, apiUrl, id, commissionPct);
-    return {
-      id,
-      code: affiliate?.affiliate_code ?? affiliate?.code ?? null,
-      overrideId: override?.id ?? null,
-    };
+    return { id, code, overrideId: override?.id ?? null };
   }
 
   /** Rev-share da conta toda: vale para qualquer produto dele vendido pela Koopfy. */
