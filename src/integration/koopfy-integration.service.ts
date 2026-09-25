@@ -31,7 +31,7 @@ const CREATE_ACCOUNT_FAILED = 'Não foi possível criar a conta financeira agora
 import { WalletService } from '../dashboard/services/services';
 import { ActivationRequestsService } from '../activation/activation-requests.service';
 import { WhopConnectService } from '../orchestrator/whop/whop-connect.service';
-import { WhopLinkedAccountsService } from '../orchestrator/whop/whop-linked.service';
+import { WhopLinkedAccountsService, sellerMayOperate } from '../orchestrator/whop/whop-linked.service';
 import { sellerExternalProviderView } from '../orchestrator/whop/whop-linked';
 import { connectedActivationBlocker } from '../orchestrator/whop/whop-connected';
 import {
@@ -457,7 +457,17 @@ export class KoopfyIntegrationService {
     // Usamos documents_completed (último passo) p/ distinguir.
     const documentsSubmitted = !!user?.documents_completed;
 
-    const state: 'not_found' | AccountState = seller ? accountState(sellerStatus, documentsSubmitted) : 'not_found';
+    // Modo conta externa: a liberação no CRM faz as vezes da aprovação. Conta
+    // Whop dele cobrando = conta ativa para o painel, sem cadastro nem
+    // pendências da Koopfy (quem faz o KYC da empresa é a Whop).
+    const externalProvider = seller
+      ? sellerExternalProviderView(await this.whopLinked.status(seller.id).catch(() => null))
+      : null;
+    const externalOnly = sellerStatus === 'pending_review' && Boolean(externalProvider?.charging);
+
+    const state: 'not_found' | AccountState = !seller
+      ? 'not_found'
+      : externalOnly ? 'active' : accountState(sellerStatus, documentsSubmitted);
 
     // Dados da conta detectada (login unificado por email) — usados na UI para
     // oferecer "associar esta conta" em vez de criar uma nova.
@@ -473,7 +483,7 @@ export class KoopfyIntegrationService {
         }
       : null;
 
-    const requirements = seller
+    const requirements = seller && !externalOnly
       ? await this.loadRequirements(user.id, seller.id, documentsSubmitted, sellerStatus === 'active', seller.rejection_reason ?? null)
       : null;
 
@@ -492,9 +502,7 @@ export class KoopfyIntegrationService {
       requirements,
       // Modo conta externa: o painel mostra "conecte seu provedor externo"
       // quando a equipe liberou; com a conta conectada, mostra a situação dela.
-      externalProvider: seller
-        ? sellerExternalProviderView(await this.whopLinked.status(seller.id).catch(() => null))
-        : null,
+      externalProvider,
     };
   }
 
@@ -527,7 +535,9 @@ export class KoopfyIntegrationService {
     if (!seller) {
       throw new NotFoundException('Seller sem conta no Koopfy Pay. Faça o onboarding.');
     }
-    if (seller.status !== 'active') {
+    // Modo conta externa: com a conta Whop dele conectada, a liberação do CRM
+    // faz as vezes da aprovação (ver sellerMayOperate).
+    if (!(await sellerMayOperate(seller))) {
       throw new ConflictException(
         `Onboarding ainda não aprovado (status: ${seller.status}).`,
       );

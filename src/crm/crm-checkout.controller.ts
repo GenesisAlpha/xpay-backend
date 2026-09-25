@@ -1,7 +1,8 @@
 // src/crm/crm-checkout.controller.ts
 //
 // As telas do CRM que mostram o CHECKOUT: os sellers (as pessoas) e as lojas.
-// Tudo só leitura — escrever no checkout continua sendo do checkout.
+// Leitura, mais as ações de admin abaixo (conta da loja, provedor externo,
+// reenvio à Shopify). Escrever no checkout continua sendo do checkout.
 //
 // Restrito a admin e supervisor: aqui aparece a operação inteira de cada loja
 // (pedidos, equipe, domínios), não só os sellers que o gerente assumiu.
@@ -124,6 +125,33 @@ export class CrmCheckoutController {
       workspace_id: workspaceId,
       store_name: result.storeName,
       account_name: result.accountName,
+    })
+
+    return result
+  }
+
+  /**
+   * Libera (ou corta) o provedor externo do seller: liberado, o painel dele em
+   * Koopfy Payments mostra "Conecte seu provedor externo" e ele cola a chave da
+   * conta Whop dele, sem passar pelo cadastro da Koopfy.
+   */
+  @Post('sellers/:userId/external-provider')
+  @Roles('admin')
+  @HttpCode(HttpStatus.OK)
+  async setExternalProvider(
+    @Param('userId') userId: string,
+    @Req() req: any,
+    @Body() body: { enabled?: boolean },
+  ) {
+    const ctx = ctxFromReq(req)
+    const enabled = body?.enabled !== false
+    const result = await this.checkout.setExternalProvider(userId, enabled, ctx)
+
+    await logCheckoutAction(ctx, enabled ? 'checkout.external_provider_allowed' : 'checkout.external_provider_disabled', userId, {
+      seller_id: result.sellerIds?.[0] ?? null,
+      seller_ids: result.sellerIds ?? [],
+      checkout_user_id: userId,
+      provisioned: result.provisioned,
     })
 
     return result

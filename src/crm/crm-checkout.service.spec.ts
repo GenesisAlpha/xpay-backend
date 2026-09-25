@@ -24,6 +24,10 @@ jest.mock('../lib/supabase.client', () => ({
   },
 }))
 
+// Só as classes entram na injeção; o comportamento vem dos dublês abaixo.
+jest.mock('../integration/koopfy-integration.service', () => ({ KoopfyIntegrationService: class { } }))
+jest.mock('../orchestrator/whop/whop-linked.service', () => ({ WhopLinkedAccountsService: class { } }))
+
 import { ServiceUnavailableException } from '@nestjs/common'
 import { CrmCheckoutService } from './crm-checkout.service'
 
@@ -40,6 +44,25 @@ const fetchMock = jest.fn(async (url: unknown, init?: any) => {
 
 let service: CrmCheckoutService
 
+// Modo provedor externo por conta: o que o WhopLinkedAccountsService guardaria.
+const linkedRows = new Map<string, { status: string }>()
+const linked = {
+  allow: jest.fn(async (sellerId: string, enabled: boolean) => {
+    linkedRows.set(sellerId, { status: enabled ? 'allowed' : 'disabled' })
+  }),
+  status: jest.fn(async (sellerId: string) => {
+    const row = linkedRows.get(sellerId)
+    return row ? { status: row.status, companyTitle: null, commissionPct: 3, blocker: null } : { allowed: false }
+  }),
+}
+const integration = {
+  provision: jest.fn(async (email: string) => {
+    tables.users.push({ id: 'u-nova', name: 'Nova', email, owner_user_id: null })
+    tables.seller_profiles.push({ id: 's-nova', user_id: 'u-nova', name: 'Nova', status: 'pending_review', risk_level: 'WHITE', created_at: '2026-09-25' })
+    return { provisioned: true, alreadyExisted: false, userId: 'u-nova' }
+  }),
+}
+
 beforeEach(() => {
   jest.spyOn(console, 'error').mockImplementation(() => { })
   process.env.CHECKOUT_INTERNAL_KEY = 'chave-interna'
@@ -48,7 +71,10 @@ beforeEach(() => {
   fetchMock.mockClear()
   for (const key of Object.keys(respostas)) delete respostas[key]
 
-  service = new CrmCheckoutService()
+  linkedRows.clear()
+  linked.allow.mockClear()
+  integration.provision.mockClear()
+  service = new CrmCheckoutService(linked as any, integration as any)
 
   tables.users = [
     { id: 'u-ana', name: 'Ana', email: 'ana@loja.com', owner_user_id: null },
@@ -274,5 +300,63 @@ describe('checkout fora do ar', () => {
     expect(erro).toBeInstanceOf(ServiceUnavailableException)
     expect(erro.message).toContain('CHECKOUT_INTERNAL_KEY')
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+})
+
+describe('provedor externo', () => {
+  it('libera todas as contas do e-mail e a ficha passa a mostrar liberado', async () => {
+    respostas['admin/sellers/chk-ana'] = { seller: { id: 'chk-ana', email: 'Ana@Loja.com' }, workspaces: [] }
+
+    const result = await service.setExternalProvider('chk-ana', true, { managerId: 'm-1' })
+
+    expect(integration.provision).not.toHaveBeenCalled()
+    expect(linked.allow.mock.calls.map(call => call.slice(0, 3))).toEqual([
+      ['s-principal', true, 'm-1'],
+      ['s-extra', true, 'm-1'],
+    ])
+    expect(result.provisioned).toBe(false)
+    expect(result.externalProvider.allowed).toBe(true)
+
+    const detail: any = await service.seller('chk-ana')
+    expect(detail.externalProvider.accounts.map((a: any) => [a.sellerId, a.status])).toEqual([
+      ['s-principal', 'allowed'],
+      ['s-extra', 'allowed'],
+    ])
+  })
+
+  it('seller sem conta de pagamento ganha a principal antes da liberação', async () => {
+    respostas['admin/sellers/chk-nova'] = { seller: { id: 'chk-nova', email: 'nova@loja.com', name: 'Nova' }, workspaces: [] }
+
+    const result = await service.setExternalProvider('chk-nova', true, { managerId: 'm-1' })
+
+    expect(integration.provision).toHaveBeenCalledWith('nova@loja.com', { name: 'Nova' })
+    expect(linked.allow).toHaveBeenCalledWith('s-nova', true, 'm-1')
+    expect(result.provisioned).toBe(true)
+    expect(result.externalProvider.allowed).toBe(true)
+  })
+
+  it('cortar o modo de quem não tem conta não cria conta', async () => {
+    respostas['admin/sellers/chk-sem'] = { seller: { id: 'chk-sem', email: 'sem@loja.com' }, workspaces: [] }
+
+    const result = await service.setExternalProvider('chk-sem', false, { managerId: 'm-1' })
+
+    expect(integration.provision).not.toHaveBeenCalled()
+    expect(linked.allow).not.toHaveBeenCalled()
+    expect(result.externalProvider).toEqual({ allowed: false, accounts: [] })
+  })
+
+  it('cortar marca as contas como desligadas', async () => {
+    respostas['admin/sellers/chk-ana'] = { seller: { id: 'chk-ana', email: 'ana@loja.com' }, workspaces: [] }
+    await service.setExternalProvider('chk-ana', true, { managerId: 'm-1' })
+
+    const result = await service.setExternalProvider('chk-ana', false, { managerId: 'm-1' })
+
+    expect(result.externalProvider.allowed).toBe(false)
+    expect(result.externalProvider.accounts.every(a => a.status === 'disabled')).toBe(true)
+  })
+
+  it('seller sem e-mail no checkout é recusado', async () => {
+    respostas['admin/sellers/chk-x'] = { seller: { id: 'chk-x', email: null }, workspaces: [] }
+    await expect(service.setExternalProvider('chk-x', true, { managerId: 'm-1' })).rejects.toThrow('e-mail')
   })
 })

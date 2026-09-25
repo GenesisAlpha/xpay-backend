@@ -21,11 +21,17 @@ import {
 import * as jwt from 'jsonwebtoken';
 import { supabase } from '../lib/supabase.client';
 import { normalizeEmail, resolveAccountUserId, sellerIdFromHeaders } from './seller-accounts';
+import { sellerMayOperate } from '../orchestrator/whop/whop-linked.service';
 
 export interface SellerCtx {
   userId: string;
   email: string;
   seller: { id: string; status: string; kyc_status: string | null } | null;
+  /**
+   * Sem aprovação da Koopfy, mas vendendo pela conta Whop PRÓPRIA dele (modo
+   * conta externa liberado no CRM). Abre só a leitura do financeiro.
+   */
+  externalOnly?: boolean;
 }
 
 function verifiedEmail(req: any): string {
@@ -63,7 +69,8 @@ export class CrossServiceJwtGuard implements CanActivate {
       .eq('user_id', userId)
       .maybeSingle();
 
-    const ctx: SellerCtx = { userId, email, seller: seller ?? null };
+    const externalOnly = seller?.status === 'pending_review' && await sellerMayOperate(seller);
+    const ctx: SellerCtx = { userId, email, seller: seller ?? null, externalOnly };
     req.sellerCtx = ctx;
 
     return true;

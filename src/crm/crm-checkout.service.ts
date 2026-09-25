@@ -12,6 +12,8 @@
 import { BadRequestException, Injectable, ServiceUnavailableException } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
 import { normalizeEmail } from '../integration/seller-accounts'
+import { KoopfyIntegrationService } from '../integration/koopfy-integration.service'
+import { WhopLinkedAccountsService } from '../orchestrator/whop/whop-linked.service'
 import { checkoutFailureMessage, checkoutInternal } from './checkout-internal'
 
 // ─── O que o checkout devolve (só o que costuramos daqui) ────────────────────
@@ -92,10 +94,37 @@ interface PaymentAccountView {
   workspaceIds: string[]
 }
 
+/** Modo provedor externo de uma conta de pagamento do seller. */
+interface ExternalProviderAccountView {
+  sellerId: string
+  name: string | null
+  isOwnerAccount: boolean
+  /** allowed = liberado, aguardando a chave; active = cobrando na conta dele. */
+  status: 'allowed' | 'active' | 'invalid' | 'disabled' | null
+  companyTitle: string | null
+  commissionPct: number | null
+  blocker: string | null
+}
+
+/**
+ * O modo provedor externo visto pela PESSOA: liberado quando alguma conta dela
+ * está liberada. A liberação vale para todas as contas do e-mail, porque a loja
+ * pode cobrar por qualquer uma delas.
+ */
+export interface ExternalProviderView {
+  allowed: boolean
+  accounts: ExternalProviderAccountView[]
+}
+
 const cents = (value: number | string | null | undefined): number => Number(value ?? 0) || 0
 
 @Injectable()
 export class CrmCheckoutService {
+  constructor(
+    private readonly linked: WhopLinkedAccountsService,
+    private readonly integration: KoopfyIntegrationService,
+  ) { }
+
   // ─── Repasse puro ──────────────────────────────────────────────────────────
 
   async overview(): Promise<unknown> {
@@ -149,6 +178,7 @@ export class CrmCheckoutService {
     return {
       ...detail,
       paymentAccounts: await this.paymentAccountsOf(email, storesByAccount),
+      externalProvider: await this.externalProviderOf(email),
     }
   }
 
@@ -190,6 +220,26 @@ export class CrmCheckoutService {
   }
 
   // ─── Helpers ──────────────────────────────────────────────────────────────
+
+  private async externalProviderOf(email: string): Promise<ExternalProviderView> {
+    const accounts = await this.accountsOfEmail(email)
+    const views = await Promise.all(accounts.map(async (account): Promise<ExternalProviderAccountView> => {
+      const view: any = await this.linked.status(account.id).catch(() => null)
+      return {
+        sellerId: account.id,
+        name: account.name ?? null,
+        isOwnerAccount: account.isOwnerAccount,
+        status: view?.status ?? null,
+        companyTitle: view?.companyTitle ?? null,
+        commissionPct: view?.commissionPct ?? null,
+        blocker: view?.status && view.status !== 'allowed' ? view?.blocker ?? null : null,
+      }
+    }))
+    return {
+      allowed: views.some(view => view.status === 'allowed' || view.status === 'active' || view.status === 'invalid'),
+      accounts: views,
+    }
+  }
 
   /**
    * Contas Koopfy Payments do e-mail: a principal e as contas a mais criadas por
@@ -350,6 +400,45 @@ export class CrmCheckoutService {
     }
 
     return { ...result, accountName: account?.name ?? null, storeName: store.workspace?.name ?? null }
+  }
+
+  /**
+   * Libera (ou corta) o modo provedor externo para o seller: com ele liberado, o
+   * painel mostra "Conecte seu provedor externo" em Koopfy Payments e o seller
+   * cola a chave da conta Whop dele — sem cadastro nem documentos da Koopfy.
+   *
+   * Vale para todas as contas de pagamento do e-mail. Quem ainda não tem conta
+   * no pay ganha a principal agora, por baixo: é ela que guarda a conexão e
+   * recebe o registro das vendas.
+   */
+  async setExternalProvider(userId: string, enabled: boolean, ctx: { managerId: string }) {
+    const detail = await this.fetchOrFail<CheckoutSellerDetail>(
+      `admin/sellers/${encodeURIComponent(userId)}`,
+      'carregar o seller no checkout',
+    )
+    const email = normalizeEmail(detail.seller?.email)
+    if (!email) throw new BadRequestException('O seller não tem e-mail no checkout: não dá para achar a conta de pagamento.')
+
+    let accounts = await this.accountsOfEmail(email)
+    let provisioned = false
+    if (!accounts.length) {
+      if (!enabled) return { provisioned, externalProvider: await this.externalProviderOf(email) }
+      const name = typeof detail.seller?.name === 'string' ? detail.seller.name : undefined
+      await this.integration.provision(email, name ? { name } : {})
+      accounts = await this.accountsOfEmail(email)
+      provisioned = true
+      if (!accounts.length) throw new BadRequestException('Não foi possível criar a conta de pagamento do seller agora.')
+    }
+
+    for (const account of accounts) {
+      await this.linked.allow(account.id, enabled, ctx.managerId)
+    }
+
+    return {
+      provisioned,
+      sellerIds: accounts.map(account => account.id),
+      externalProvider: await this.externalProviderOf(email),
+    }
   }
 
   /**

@@ -24,6 +24,7 @@ import {
 import { JwtService } from '@nestjs/jwt'
 import * as crypto from 'crypto'
 import { supabase } from '../../lib/supabase.client'
+import { sellerMayOperate } from '../../orchestrator/whop/whop-linked.service'
 
 @Injectable()
 export class UnifiedAuthGuard implements CanActivate {
@@ -157,7 +158,9 @@ export class UnifiedAuthGuard implements CanActivate {
             throw new UnauthorizedException('Seller não encontrado')
         }
 
-        if (seller.status !== 'active') {
+        // Conta ainda sem aprovação passa só no modo conta externa, cobrando na
+        // conta Whop dele (sellerMayOperate).
+        if (!(await sellerMayOperate(seller))) {
             throw new UnauthorizedException('Conta suspensa ou inativa')
         }
 

@@ -48,6 +48,13 @@ const CACHE_TTL_MS = 15 * 1000;
 // Permissões que a chave dele precisa ter para o Financeiro do painel
 // funcionar (saldo, contas bancárias e saque). Sem elas a cobrança ainda sai,
 // mas a tela de saldo fica cega — por isso conferimos na conexão.
+// Métodos de quem vende só pela conta dele: a mesma lista padrão da aprovação
+// no CRM (ALL_METHODS do dash-pay), para ele ficar igual a um seller aprovado.
+const EXTERNAL_DEFAULT_METHODS = [
+  'credit_card', 'spei', 'apple_pay', 'google_pay', 'ideal', 'bizum', 'bancontact', 'mbway', 'blik',
+  'ach', 'venmo', 'cash_app', 'zelle', 'interac_debit', 'interac_etransfer',
+];
+
 export const WALLET_SCOPES = [
   'company:balance:read',
   'payout:account:read',
@@ -437,12 +444,37 @@ export class WhopLinkedAccountsService {
     }
 
     this.cache.delete(sellerId);
+    await this.prepareExternalOnlySeller(sellerId);
     await this.log(sellerId, actor, 'whop_linked.connected', {
       whop_account_id: company.id,
       company_title: company.title,
       webhook_id: webhook.id,
     });
     return this.publicView(await this.getRow(sellerId));
+  }
+
+  /**
+   * Seller que vende só pela conta dele, sem aprovação da Koopfy: provider e
+   * métodos são gravados na aprovação do CRM, que ele não passa. Sem isso a
+   * venda nem chegaria na Whop. Seller aprovado mantém o que o CRM definiu.
+   */
+  private async prepareExternalOnlySeller(sellerId: string) {
+    const { data: seller } = await supabase
+      .from('seller_profiles')
+      .select('status, provider_default, enabled_methods')
+      .eq('id', sellerId)
+      .maybeSingle();
+    if (!seller || seller.status === 'active') return;
+
+    const patch: Record<string, unknown> = {};
+    if (String(seller.provider_default ?? '').toLowerCase().replace(/provider$/, '') !== 'whop') {
+      patch.provider_default = 'whop';
+    }
+    if (!(seller.enabled_methods ?? []).length) patch.enabled_methods = EXTERNAL_DEFAULT_METHODS;
+    if (!Object.keys(patch).length) return;
+
+    const { error } = await supabase.from('seller_profiles').update(patch).eq('id', sellerId);
+    if (error) console.error(`[WhopLinked] provider do seller ${sellerId}:`, error.message);
   }
 
   /** Desliga a conexão. As vendas voltam a sair pela conta da Koopfy. */
@@ -746,4 +778,21 @@ export async function sellerChargesOnOwnWhopAccount(sellerId: string): Promise<b
     .maybeSingle();
   if (!data) return false;
   return linkedChargeBlocker(data as WhopLinkedAccountRow) === null;
+}
+
+/**
+ * Seller que pode cobrar e ativar o checkout: aprovado pela Koopfy, ou ainda
+ * sem aprovação mas cobrando na conta Whop PRÓPRIA dele.
+ *
+ * No modo conta externa a liberação no CRM faz as vezes da aprovação: quem faz
+ * o KYC da empresa é a Whop, e o dinheiro nunca passa pela Koopfy. Por isso a
+ * exceção vale só enquanto a conta dele está conectada e cobrando — chave
+ * recusada ou conexão desligada volta a travar, e a venda nunca cai no pool da
+ * Koopfy (o router só manda para a conta dele). Recusado e suspenso não passam.
+ */
+export async function sellerMayOperate(seller: { id: string; status?: string | null } | null): Promise<boolean> {
+  if (!seller) return false;
+  if (seller.status === 'active') return true;
+  if (seller.status !== 'pending_review') return false;
+  return sellerChargesOnOwnWhopAccount(seller.id);
 }

@@ -44,5 +44,8 @@ import { KoopfyPaymentDomainsService } from './koopfy-payment-domains.service';
   ],
   controllers: [KoopfyIntegrationController, KoopfyFinanceController, KoopfyPaymentDomainsController],
   providers: [KoopfyIntegrationService, KoopfyFinanceService, StorageService, AnticipationService, KoopfyPaymentDomainsService],
+  // O CRM cria a conta de pagamento de quem recebe o provedor externo sem ter
+  // passado pelo Koopfy Payments (CrmCheckoutService.setExternalProvider).
+  exports: [KoopfyIntegrationService],
 })
 export class KoopfyIntegrationModule {}

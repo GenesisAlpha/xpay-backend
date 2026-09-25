@@ -1,3 +1,7 @@
+// O crm.module importa o KoopfyIntegrationModule, que arrasta o dashboard
+// inteiro (e o uuid em ESM, que o jest não transforma); este teste não usa.
+jest.mock('../integration/koopfy-integration.module', () => ({ KoopfyIntegrationModule: class { } }));
+jest.mock('../integration/koopfy-integration.service', () => ({ KoopfyIntegrationService: class { } }));
 jest.mock('../lib/supabase.client', () => ({
   supabase: { from: jest.fn(), rpc: jest.fn() },
 }));

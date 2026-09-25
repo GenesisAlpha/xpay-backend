@@ -61,6 +61,7 @@ import { AffiliatesModule } from '../affiliates/affiliates.module'
 import { AffiliateCrmController } from '../affiliates/affiliate-crm.controller'
 import { crmRequestContext } from './crm-request-context'
 import { PayoutModule } from '../payouts/payout.module'
+import { KoopfyIntegrationModule } from '../integration/koopfy-integration.module'
 
 @Module({
   imports: [
@@ -90,6 +91,9 @@ import { PayoutModule } from '../payouts/payout.module'
     // porque o CrmAuthGuard precisa do JwtModule registrado neste módulo.
     AffiliatesModule,
     PayoutModule,
+    // KoopfyIntegrationModule: provedor externo liberado para quem ainda não
+    // tem conta de pagamento cria a conta principal (provision).
+    KoopfyIntegrationModule,
   ],
   // WhopConnectController: conta conectada da Whop por seller (serviço vem do
   // OrchestratorModule).

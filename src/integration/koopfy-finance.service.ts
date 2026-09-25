@@ -154,6 +154,16 @@ export class KoopfyFinanceService {
     return ctx.seller;
   }
 
+  /**
+   * Leitura (vendas, extrato, disputas): vale também para quem vende só pela
+   * conta Whop dele, sem aprovação da Koopfy. Saque, antecipação e resposta a
+   * disputa seguem em `seller()` — o dinheiro dele não passa pela Koopfy.
+   */
+  private readableSeller(ctx: SellerCtx) {
+    if (ctx.seller && ctx.externalOnly) return ctx.seller;
+    return this.seller(ctx);
+  }
+
   private requirePayoutAccounts(): SellerPayoutAccountService {
     if (!this.payoutAccounts) {
       throw new ConflictException('Configuração de saques indisponível.');
@@ -180,7 +190,7 @@ export class KoopfyFinanceService {
   }
 
   async getOverview(ctx: SellerCtx, requestedPeriod: unknown) {
-    const seller = this.seller(ctx);
+    const seller = this.readableSeller(ctx);
     const period = PERIODS.includes(requestedPeriod as Period)
       ? (requestedPeriod as Period)
       : '30d';
@@ -195,7 +205,7 @@ export class KoopfyFinanceService {
   }
 
   async listTransactions(ctx: SellerCtx, raw: Record<string, unknown>) {
-    const seller = this.seller(ctx);
+    const seller = this.readableSeller(ctx);
     const query = normalizeFinanceListQuery(raw, TRANSACTION_STATUSES);
     const response = await this.transactions.list(seller.id, {
       page: query.page,
@@ -210,16 +220,16 @@ export class KoopfyFinanceService {
   }
 
   async getTransaction(ctx: SellerCtx, id: string) {
-    const seller = this.seller(ctx);
+    const seller = this.readableSeller(ctx);
     return publicTransaction(await this.transactions.getById(seller.id, id));
   }
 
   async getWallet(ctx: SellerCtx) {
-    return this.wallet.getBalance(this.seller(ctx).id);
+    return this.wallet.getBalance(this.readableSeller(ctx).id);
   }
 
   async listWalletEntries(ctx: SellerCtx, raw: Record<string, unknown>) {
-    const seller = this.seller(ctx);
+    const seller = this.readableSeller(ctx);
     const query = normalizeFinanceListQuery(raw, []);
     const response = await this.wallet.getEntries(seller.id, {
       page: query.page,
@@ -278,7 +288,7 @@ export class KoopfyFinanceService {
   }
 
   async listPayouts(ctx: SellerCtx, raw: Record<string, unknown>) {
-    const seller = this.seller(ctx);
+    const seller = this.readableSeller(ctx);
     const query = normalizeFinanceListQuery(raw, []);
     const response = await this.wallet.getPayouts(seller.id, {
       page: query.page,
@@ -464,11 +474,11 @@ export class KoopfyFinanceService {
   }
 
   async getTransferTotals(ctx: SellerCtx) {
-    return this.transfers.getTotals(this.seller(ctx).id);
+    return this.transfers.getTotals(this.readableSeller(ctx).id);
   }
 
   async listTransfers(ctx: SellerCtx, raw: Record<string, unknown>) {
-    const seller = this.seller(ctx);
+    const seller = this.readableSeller(ctx);
     const query = normalizeFinanceListQuery(raw, TRANSFER_STATUSES);
     const response = await this.transfers.list(seller.id, {
       page: query.page,
@@ -502,11 +512,11 @@ export class KoopfyFinanceService {
   }
 
   async getDisputeStats(ctx: SellerCtx) {
-    return this.disputes.getStats(this.seller(ctx).id);
+    return this.disputes.getStats(this.readableSeller(ctx).id);
   }
 
   async listDisputes(ctx: SellerCtx, raw: Record<string, unknown>) {
-    const seller = this.seller(ctx);
+    const seller = this.readableSeller(ctx);
     const query = normalizeFinanceListQuery(raw, DISPUTE_STATUSES);
     const response = await this.disputes.list(seller.id, {
       page: query.page,
@@ -550,7 +560,7 @@ export class KoopfyFinanceService {
   }
 
   async listPaymentMethods(ctx: SellerCtx) {
-    const methods = await this.methods.list(this.seller(ctx).id);
+    const methods = await this.methods.list(this.readableSeller(ctx).id);
     return methods.map((method: any) => ({
       id: method.id,
       name: method.name,
@@ -574,11 +584,11 @@ export class KoopfyFinanceService {
   }
 
   async getPaymentMethodPerformance(ctx: SellerCtx, id: string) {
-    return this.methods.getPerformance(this.seller(ctx).id, id);
+    return this.methods.getPerformance(this.readableSeller(ctx).id, id);
   }
 
   async getIntegrationSettings(ctx: SellerCtx) {
-    const result = await this.settings.get(this.seller(ctx).id, ctx.userId);
+    const result = await this.settings.get(this.readableSeller(ctx).id, ctx.userId);
     return {
       webhooks: {
         url: result.webhooks?.url ?? '',

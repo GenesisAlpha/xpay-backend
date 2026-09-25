@@ -6,7 +6,7 @@ import { CurrencyService } from '../currency/currency.service'
 import { WalletService } from '../wallets/wallet.service'
 import { AccountRouterService } from '../orchestrator/router/account-router.service'
 import { DEFAULT_FEE_SETTINGS, calculateSaleFees, getEffectiveSellerFees, saleFeePct } from '../shared/fee.calculator'
-import { sellerChargesOnOwnWhopAccount } from '../orchestrator/whop/whop-linked.service'
+import { sellerChargesOnOwnWhopAccount, sellerMayOperate } from '../orchestrator/whop/whop-linked.service'
 import { validateMbwayPhone } from '../utils/mbway.validator'
 import { RetrieveResponse } from '../orchestrator/providers/provider.types'
 import { CardCryptoService } from '../crypto/card-crypto.service'
@@ -136,7 +136,9 @@ export class PaymentService {
 
         // ─── Guards ────────────────────────────────────────────────────────────
 
-        if (seller.status !== 'active') {
+        // Sem aprovação da Koopfy, só cobra quem está no modo conta externa com a
+        // conta Whop dele conectada — ver sellerMayOperate.
+        if (!(await sellerMayOperate(seller))) {
             const messages: Record<string, string> = {
                 pending_review: 'Sua conta está em análise. Aguarde a aprovação da equipe.',
                 suspended: 'Sua conta está suspensa. Entre em contato com o suporte.',
@@ -1449,7 +1451,7 @@ export class PaymentService {
         }
 
         return {
-            active: seller.status === 'active',
+            active: await sellerMayOperate({ id: sellerId, status: seller.status }),
             provider, // ex.: 'setinel_gate' | 'approvebly' | 'coinflow' | 'stripe'
             methods: seller.enabled_methods ?? [],
             providerConfig: provider
