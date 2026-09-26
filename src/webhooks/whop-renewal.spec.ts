@@ -159,6 +159,7 @@ describe('Whop payout event routing', () => {
         {} as never,
         {} as never,
         payoutHandler as never,
+      {} as never,
       )
 
       await (service as any).processWhopEvent(
@@ -198,6 +199,7 @@ describe('Whop payout event routing', () => {
       {} as never,
       {} as never,
       payoutHandler as never,
+      {} as never,
     )
     const delegated = jest
       .spyOn(service, 'handleWhopWebhook')
@@ -241,6 +243,7 @@ describe('Whop payout event routing', () => {
       {} as never,
       {} as never,
       payoutHandler as never,
+      {} as never,
     )
     jest.spyOn(service as any, 'verifyWhopSignature').mockReturnValue({
       valid: false,
