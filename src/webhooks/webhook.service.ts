@@ -3,6 +3,7 @@
 import { SellerBillingService } from '../seller-billing/seller-billing.service'
 import { whopDeclineCode } from '../orchestrator/providers/whop.provider'
 import { whopCardOf } from './whop-card'
+import { refundFeeCents } from './refund-fee'
 import { Injectable } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
 import { WalletService } from '../wallets/wallet.service'
@@ -2049,20 +2050,43 @@ export class WebhookService {
 
     if (!updated || updated.length === 0) return { alreadyProcessed: true }
 
-    // 2) Reverte APENAS o net do seller. As taxas (platform/external) NÃO são
-    //    estornadas — num refund nossas taxas permanecem.
+    // 2) Reverte o net do seller e cobra dele a taxa da Koopfy, que não é
+    //    reembolsável: o comprador recebe o bruto de volta, então o seller
+    //    arca com o valor cheio (crédito + reserva + taxa). Ver refund-fee.ts.
     const { data: credits } = await supabase
       .from('wallet_ledger')
       .select('seller_id, type, amount, status')
       .eq('transaction_id', tx.id)
       .eq('type', 'credit_pending')
 
+    // Lida ANTES do cancel_reserve_hold: reserva ainda presa fica com a Koopfy
+    // e conta como parte do que o seller devolve.
+    const { data: reserves } = await supabase
+      .from('wallet_ledger')
+      .select('amount')
+      .eq('transaction_id', tx.id)
+      .eq('type', 'reserve_hold')
+      .eq('status', 'hold')
+
+    let creditedCents = 0
     for (const c of credits ?? []) {
       if (!c.amount || c.amount <= 0) continue
 
       // credit_pending pode estar em pending (não liquidado) ou available (liquidado)
       const bucket = c.status === 'completed' ? 'available' : 'pending'
       await this.reverseBalance(c.seller_id, bucket, c.amount, tx.id, 'refund')
+      creditedCents += Number(c.amount)
+
+      // Sem crédito (conta Whop do próprio seller) não há taxa a cobrar aqui.
+      const feeCents = refundFeeCents({
+        grossUsdCents: tx.amount_usd_gross_cents,
+        creditedCents,
+        reserveHeldCents: (reserves ?? []).reduce((s, r) => s + Number(r.amount ?? 0), 0),
+        feeCents: tx.fee,
+        externalFeeCents: tx.external_fee_cents,
+      })
+      if (feeCents > 0) await this.reverseBalance(c.seller_id, bucket, feeCents, tx.id, 'refund_fee')
+      break // um credit_pending por venda (unique transaction_id + type)
     }
 
     // Reserva da venda estornada não volta ao seller.

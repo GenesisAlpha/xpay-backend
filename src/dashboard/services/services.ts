@@ -361,7 +361,7 @@ export class WalletService {
 
     if (type && type !== 'all') {
       if (type === 'credit') q = q.in('type', ['credit_pending', 'credit_available', 'release_to_available', 'anticipation_release'])
-      if (type === 'debit') q = q.in('type', ['debit_payout', 'fee_platform', 'anticipation_fee', 'chargeback_fee', 'chargeback_alert_fee', 'chargeback_debit', 'refund'])
+      if (type === 'debit') q = q.in('type', ['debit_payout', 'fee_platform', 'anticipation_fee', 'chargeback_fee', 'chargeback_alert_fee', 'chargeback_debit', 'refund', 'refund_fee'])
     }
 
     const { data, error, count } = await q
@@ -588,6 +588,7 @@ export class WalletService {
       chargeback_fee: 'Taxa de chargeback',
       chargeback_alert_fee: 'Taxa de alerta de chargeback',
       refund: 'Estorno',
+      refund_fee: 'Taxa não reembolsável do estorno',
     }
     return map[type] ?? type
   }
