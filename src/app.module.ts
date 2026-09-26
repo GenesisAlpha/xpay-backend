@@ -17,6 +17,7 @@ import { AffiliatesModule } from './affiliates/affiliates.module';
 import { KoopfyIntegrationModule } from './integration/koopfy-integration.module';
 import { AppController } from './app.controller';
 import { PayoutModule } from './payouts/payout.module';
+import { SellerBillingModule } from './seller-billing/seller-billing.module';
 
 @Module({
   imports: [
@@ -53,6 +54,7 @@ import { PayoutModule } from './payouts/payout.module';
     // Integração com o serviço checkout (Koopfy Pay como gateway)
     KoopfyIntegrationModule,
     PayoutModule,
+    SellerBillingModule,
   ],
   controllers: [AppController]
 })

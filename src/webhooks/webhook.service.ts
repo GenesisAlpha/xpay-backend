@@ -1,5 +1,6 @@
 // nexor/src/webhooks/webhook.service.ts
 
+import { SellerBillingService } from '../seller-billing/seller-billing.service'
 import { whopDeclineCode } from '../orchestrator/providers/whop.provider'
 import { whopCardOf } from './whop-card'
 import { Injectable } from '@nestjs/common'
@@ -142,6 +143,7 @@ export class WebhookService {
     private readonly affiliateRisk: AffiliateRiskService,
     private readonly currencyService: CurrencyService,
     private readonly payoutHandler: WhopPayoutWebhookService,
+    private readonly sellerBilling: SellerBillingService,
   ) { }
 
   // opts.skipDispatch: pula o postback ao seller (usado na aprovação SÍNCRONA do
@@ -776,6 +778,12 @@ export class WebhookService {
   ) {
     if (this.payoutHandler.handles(eventType)) {
       return this.payoutHandler.handleVerifiedEvent(body, accountId)
+    }
+    // Comissão da Koopfy cobrada no cartão do seller (ou o cartão sendo salvo):
+    // não há transação nossa por trás — sem este desvio o evento cairia em
+    // "transação não encontrada" e a Whop reenviaria para sempre.
+    if (SellerBillingService.isBillingEvent(body)) {
+      return this.sellerBilling.handleWebhook(eventType, body)
     }
     if (eventType.startsWith('membership.')) {
       return this.persistWhopMembership(accountId, eventType, body);
