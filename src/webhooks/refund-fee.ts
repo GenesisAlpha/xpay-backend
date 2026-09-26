@@ -19,6 +19,18 @@ export interface RefundFeeInput {
   externalFeeCents?: number | null
 }
 
+/**
+ * Estorno que a própria Whop fez (alerta de chargeback com estorno automático,
+ * decisão dela) cobra também a taxa de chargeback do seller. Reembolso pedido
+ * do nosso lado (seller/CRM) marca a transação antes (refunded_by /
+ * refund_requested_by) e não paga essa taxa — só o valor cheio.
+ */
+export function isWhopInitiatedRefund(tx: { provider?: string | null; metadata?: Record<string, any> | null }): boolean {
+  if (String(tx?.provider ?? '').toLowerCase() !== 'whop') return false
+  const metadata = tx?.metadata ?? {}
+  return !metadata.refunded_by && !metadata.refund_requested_by
+}
+
 /** Centavos a debitar do seller além do crédito revertido. Nunca negativo. */
 export function refundFeeCents(input: RefundFeeInput): number {
   const gross = Number(input.grossUsdCents)

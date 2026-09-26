@@ -1,4 +1,20 @@
-import { refundFeeCents } from './refund-fee'
+import { isWhopInitiatedRefund, refundFeeCents } from './refund-fee'
+
+describe('isWhopInitiatedRefund', () => {
+  it('estorno da Whop sem pedido nosso cobra a taxa de chargeback', () => {
+    expect(isWhopInitiatedRefund({ provider: 'whop', metadata: {} })).toBe(true)
+    expect(isWhopInitiatedRefund({ provider: 'whop', metadata: null })).toBe(true)
+  })
+
+  it('reembolso pedido do nosso lado não cobra', () => {
+    expect(isWhopInitiatedRefund({ provider: 'whop', metadata: { refunded_by: 'mgr-1' } })).toBe(false)
+    expect(isWhopInitiatedRefund({ provider: 'whop', metadata: { refund_requested_by: 'seller' } })).toBe(false)
+  })
+
+  it('só vale para a Whop', () => {
+    expect(isWhopInitiatedRefund({ provider: 'stripe', metadata: {} })).toBe(false)
+  })
+})
 
 // Estorno: seller arca com o valor cheio — a taxa da Koopfy não é reembolsável.
 

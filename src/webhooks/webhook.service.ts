@@ -3,7 +3,7 @@
 import { SellerBillingService } from '../seller-billing/seller-billing.service'
 import { whopDeclineCode } from '../orchestrator/providers/whop.provider'
 import { whopCardOf } from './whop-card'
-import { refundFeeCents } from './refund-fee'
+import { isWhopInitiatedRefund, refundFeeCents } from './refund-fee'
 import { Injectable } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
 import { WalletService } from '../wallets/wallet.service'
@@ -2086,6 +2086,17 @@ export class WebhookService {
         externalFeeCents: tx.external_fee_cents,
       })
       if (feeCents > 0) await this.reverseBalance(c.seller_id, bucket, feeCents, tx.id, 'refund_fee')
+
+      // Estorno feito pela Whop cobra a taxa de chargeback do seller. Mesmo tipo
+      // do alerta: reverseBalance é idempotente por transação + tipo e o aceite
+      // de chargeback no CRM não cobra de novo — uma taxa por venda.
+      if (isWhopInitiatedRefund(tx)) {
+        const sellerFees = await getEffectiveSellerFees(c.seller_id)
+        const chargebackFeeCents = Math.round(sellerFees.chargebackFeeUsd * 100)
+        if (chargebackFeeCents > 0) {
+          await this.reverseBalance(c.seller_id, bucket, chargebackFeeCents, tx.id, 'chargeback_alert_fee')
+        }
+      }
       break // um credit_pending por venda (unique transaction_id + type)
     }
 
