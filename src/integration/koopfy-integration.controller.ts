@@ -127,12 +127,13 @@ export class KoopfyIntegrationController {
   }
 
   // ─── Provedor externo (conta Whop do próprio seller) ───────────────────────
-  // Só funciona com o modo liberado no CRM, a pedido do seller.
+  // Liberado para todos; o CRM só corta.
 
+  // Guard leve: quem ainda não tem conta no pay também conecta (a conta nasce aqui).
   @Post('external-provider/connect')
-  @UseGuards(CrossServiceJwtGuard)
+  @UseGuards(CrossServiceTokenGuard)
   connectExternalProvider(@Req() req: any, @Body() body: { apiKey?: string }) {
-    return this.svc.connectExternalProvider(req.sellerCtx, String(body?.apiKey ?? ''));
+    return this.svc.connectExternalProvider(req.tokenEmail, req.accountSellerId ?? null, String(body?.apiKey ?? ''));
   }
 
   // Financeiro da conta externa: saldo, contas bancárias e saques, lidos da

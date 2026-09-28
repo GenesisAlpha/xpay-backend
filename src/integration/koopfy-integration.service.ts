@@ -24,6 +24,7 @@ import {
   accountAliasEmail,
   accountState,
   listSellerAccounts,
+  normalizeEmail,
   resolveAccountUserId,
 } from './seller-accounts';
 
@@ -72,25 +73,28 @@ export class KoopfyIntegrationService {
   /**
    * Conecta a conta Whop do próprio seller. Quem ainda não tem conta no pay
    * ganha a principal agora, por baixo (como a liberação do CRM fazia): é ela
-   * que guarda a conexão e recebe o registro das vendas.
+   * que guarda a conexão e recebe o registro das vendas. Conta escolhida pelo
+   * workspace (header) é conferida como do mesmo usuário.
    */
-  async connectExternalProvider(ctx: SellerCtx, apiKey: string) {
-    const sellerId = ctx.seller?.id ?? (await this.provisionForExternal(ctx.email));
-    return sellerExternalProviderView(
-      await this.whopLinked.connect(sellerId, apiKey, `seller:${ctx.userId}`),
-    );
-  }
+  async connectExternalProvider(email: string, accountSellerId: string | null, apiKey: string) {
+    const normEmail = normalizeEmail(email);
+    if (!normEmail) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
+    // Antes de criar conta: pedido sem chave não pode deixar conta vazia para trás.
+    if (!String(apiKey ?? '').trim()) throw new BadRequestException('Informe a chave de API da sua conta Whop.');
 
-  private async provisionForExternal(email: string): Promise<string> {
-    if (!email?.trim()) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
-    const { userId } = await this.provision(email, {});
+    let userId = await resolveAccountUserId(normEmail, accountSellerId);
+    if (!userId) userId = (await this.provision(normEmail, {})).userId;
+
     const { data: seller } = await supabase
       .from('seller_profiles')
       .select('id')
       .eq('user_id', userId)
       .maybeSingle();
     if (!seller?.id) throw new NotFoundException('Não foi possível criar a sua conta Koopfy Pay agora. Tente de novo.');
-    return seller.id;
+
+    return sellerExternalProviderView(
+      await this.whopLinked.connect(seller.id, apiKey, `seller:${userId}`),
+    );
   }
 
   /**
@@ -456,6 +460,8 @@ export class KoopfyIntegrationService {
         kycStatus: null,
         account: null,
         onboarding: { kyc: false, operation: false, documents: false, completed: false },
+        // Provedor externo liberado para todos: conectar cria a conta (connectExternalProvider).
+        externalProvider: sellerExternalProviderView(this.whopLinked.publicView(null)),
       };
     }
 
@@ -476,7 +482,7 @@ export class KoopfyIntegrationService {
     // Modo conta externa: a liberação no CRM faz as vezes da aprovação. Conta
     // Whop dele cobrando = conta ativa para o painel, sem cadastro nem
     // pendências da Koopfy (quem faz o KYC da empresa é a Whop).
-    // Sem conta no pay também vê a opção: conectar cria a conta (connectExternalProvider).
+    // Usuário sem perfil de seller também vê a opção: conectar cria a conta.
     const externalProvider = seller
       ? sellerExternalProviderView(await this.whopLinked.status(seller.id).catch(() => null))
       : sellerExternalProviderView(this.whopLinked.publicView(null));
