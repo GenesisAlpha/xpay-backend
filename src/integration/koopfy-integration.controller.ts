@@ -136,6 +136,33 @@ export class KoopfyIntegrationController {
     return this.svc.connectExternalProvider(req.tokenEmail, req.accountSellerId ?? null, String(body?.apiKey ?? ''));
   }
 
+  // Stripe e PayPal do próprio seller (mesmo guard leve e mesma criação de conta
+  // da Whop). Whop e Stripe são exclusivas; PayPal combina com qualquer uma.
+  // Resposta: a mesma visão de status.externalProvider (com `providers`).
+  @Post('external-provider/stripe/connect')
+  @UseGuards(CrossServiceTokenGuard)
+  connectStripe(@Req() req: any, @Body() body: { secretKey?: string; publishableKey?: string }) {
+    return this.svc.connectOwnProvider(req.tokenEmail, req.accountSellerId ?? null, 'stripe', body ?? {});
+  }
+
+  @Post('external-provider/stripe/disconnect')
+  @UseGuards(CrossServiceJwtGuard)
+  disconnectStripe(@Req() req: any) {
+    return this.svc.disconnectOwnProvider(req.sellerCtx, 'stripe');
+  }
+
+  @Post('external-provider/paypal/connect')
+  @UseGuards(CrossServiceTokenGuard)
+  connectPaypal(@Req() req: any, @Body() body: { clientId?: string; clientSecret?: string; mode?: 'live' | 'test' }) {
+    return this.svc.connectOwnProvider(req.tokenEmail, req.accountSellerId ?? null, 'paypal', body ?? {});
+  }
+
+  @Post('external-provider/paypal/disconnect')
+  @UseGuards(CrossServiceJwtGuard)
+  disconnectPaypal(@Req() req: any) {
+    return this.svc.disconnectOwnProvider(req.sellerCtx, 'paypal');
+  }
+
   // Financeiro da conta externa: saldo, contas bancárias e saques, lidos da
   // conta Whop do seller com a chave que ele conectou.
   @Get('external-provider/wallet')

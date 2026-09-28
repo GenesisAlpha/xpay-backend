@@ -34,6 +34,13 @@ import { ActivationRequestsService } from '../activation/activation-requests.ser
 import { WhopConnectService } from '../orchestrator/whop/whop-connect.service';
 import { WhopLinkedAccountsService, sellerMayOperate } from '../orchestrator/whop/whop-linked.service';
 import { sellerExternalProviderView } from '../orchestrator/whop/whop-linked';
+import { SellerProviderAccountsService } from '../orchestrator/seller-provider/seller-provider-accounts.service';
+import {
+  SellerProviderKind,
+  combineExternalProviderView,
+  validatePaypalCredentials,
+  validateStripeKeys,
+} from '../orchestrator/seller-provider/seller-provider-accounts';
 import { connectedActivationBlocker } from '../orchestrator/whop/whop-connected';
 import {
   buildSubscriptionReport,
@@ -68,19 +75,28 @@ export class KoopfyIntegrationService {
     // Modo conta externa: o seller conecta a conta Whop dele pelo painel
     // (liberado para todos; o CRM só corta).
     private readonly whopLinked: WhopLinkedAccountsService,
+    // Stripe e PayPal próprios do seller (mesmo modo conta externa).
+    private readonly sellerProviders: SellerProviderAccountsService,
   ) {}
 
   /**
-   * Conecta a conta Whop do próprio seller. Quem ainda não tem conta no pay
-   * ganha a principal agora, por baixo (como a liberação do CRM fazia): é ela
-   * que guarda a conexão e recebe o registro das vendas. Conta escolhida pelo
-   * workspace (header) é conferida como do mesmo usuário.
+   * Situação do provedor externo para o painel: os campos de sempre (Whop) +
+   * `providers` com Whop, Stripe e PayPal. null quando o CRM cortou o modo.
    */
-  async connectExternalProvider(email: string, accountSellerId: string | null, apiKey: string) {
+  async externalProviderStatus(sellerId: string | null) {
+    const whop = sellerExternalProviderView(
+      sellerId ? await this.whopLinked.status(sellerId).catch(() => null) : this.whopLinked.publicView(null),
+    );
+    const rows = sellerId
+      ? await this.sellerProviders.rows(sellerId).catch(() => ({ stripe: null, paypal: null }))
+      : { stripe: null, paypal: null };
+    return combineExternalProviderView(whop, rows);
+  }
+
+  /** Conta do pay de quem conecta; cria a principal quando ainda não existe. */
+  private async sellerForConnection(email: string, accountSellerId: string | null): Promise<{ sellerId: string; userId: string }> {
     const normEmail = normalizeEmail(email);
     if (!normEmail) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
-    // Antes de criar conta: pedido sem chave não pode deixar conta vazia para trás.
-    if (!String(apiKey ?? '').trim()) throw new BadRequestException('Informe a chave de API da sua conta Whop.');
 
     let userId = await resolveAccountUserId(normEmail, accountSellerId);
     if (!userId) userId = (await this.provision(normEmail, {})).userId;
@@ -91,10 +107,64 @@ export class KoopfyIntegrationService {
       .eq('user_id', userId)
       .maybeSingle();
     if (!seller?.id) throw new NotFoundException('Não foi possível criar a sua conta Koopfy Pay agora. Tente de novo.');
+    return { sellerId: seller.id, userId };
+  }
 
-    return sellerExternalProviderView(
-      await this.whopLinked.connect(seller.id, apiKey, `seller:${userId}`),
-    );
+  /**
+   * Conecta a Stripe ou o PayPal do próprio seller. Mesma regra da Whop: quem
+   * ainda não tem conta no pay ganha a principal agora. As credenciais são
+   * conferidas ANTES — pedido inválido não pode deixar conta vazia para trás.
+   */
+  async connectOwnProvider(
+    email: string,
+    accountSellerId: string | null,
+    provider: SellerProviderKind,
+    body: Record<string, any>,
+  ) {
+    try {
+      if (provider === 'stripe') validateStripeKeys(String(body?.secretKey ?? ''), String(body?.publishableKey ?? ''));
+      else validatePaypalCredentials(body ?? {});
+    } catch (err: any) {
+      throw new BadRequestException(err.message);
+    }
+
+    const { sellerId, userId } = await this.sellerForConnection(email, accountSellerId);
+    if (provider === 'stripe') {
+      await this.sellerProviders.connectStripe(
+        sellerId,
+        { secretKey: body?.secretKey, publishableKey: body?.publishableKey },
+        `seller:${userId}`,
+      );
+    } else {
+      await this.sellerProviders.connectPaypal(
+        sellerId,
+        { clientId: body?.clientId, clientSecret: body?.clientSecret, mode: body?.mode },
+        `seller:${userId}`,
+      );
+    }
+    return this.externalProviderStatus(sellerId);
+  }
+
+  async disconnectOwnProvider(ctx: SellerCtx, provider: SellerProviderKind) {
+    if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
+    await this.sellerProviders.disconnect(ctx.seller.id, provider, `seller:${ctx.userId}`);
+    return this.externalProviderStatus(ctx.seller.id);
+  }
+
+  /**
+   * Conecta a conta Whop do próprio seller. Quem ainda não tem conta no pay
+   * ganha a principal agora, por baixo (como a liberação do CRM fazia): é ela
+   * que guarda a conexão e recebe o registro das vendas. Conta escolhida pelo
+   * workspace (header) é conferida como do mesmo usuário.
+   */
+  async connectExternalProvider(email: string, accountSellerId: string | null, apiKey: string) {
+    // Antes de criar conta: pedido sem chave não pode deixar conta vazia para trás.
+    if (!String(apiKey ?? '').trim()) throw new BadRequestException('Informe a chave de API da sua conta Whop.');
+    const { sellerId, userId } = await this.sellerForConnection(email, accountSellerId);
+
+    await this.whopLinked.connect(sellerId, apiKey, `seller:${userId}`);
+    // Mesma visão do /status (campos da Whop + `providers`).
+    return this.externalProviderStatus(sellerId);
   }
 
   /**
@@ -130,9 +200,9 @@ export class KoopfyIntegrationService {
 
   async disconnectExternalProvider(ctx: SellerCtx) {
     if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
-    return sellerExternalProviderView(
-      await this.whopLinked.disconnect(ctx.seller.id, 'desconectado pelo seller', `seller:${ctx.userId}`),
-    );
+    // Pelo seller: volta a 'allowed' (pode reconectar ou trocar pela Stripe).
+    await this.whopLinked.disconnect(ctx.seller.id, 'desconectado pelo seller', `seller:${ctx.userId}`, { bySeller: true });
+    return this.externalProviderStatus(ctx.seller.id);
   }
 
   /** Sessão (token de 1h) para a verificação embutida no painel. */
@@ -461,7 +531,7 @@ export class KoopfyIntegrationService {
         account: null,
         onboarding: { kyc: false, operation: false, documents: false, completed: false },
         // Provedor externo liberado para todos: conectar cria a conta (connectExternalProvider).
-        externalProvider: sellerExternalProviderView(this.whopLinked.publicView(null)),
+        externalProvider: await this.externalProviderStatus(null),
       };
     }
 
@@ -483,9 +553,7 @@ export class KoopfyIntegrationService {
     // Whop dele cobrando = conta ativa para o painel, sem cadastro nem
     // pendências da Koopfy (quem faz o KYC da empresa é a Whop).
     // Usuário sem perfil de seller também vê a opção: conectar cria a conta.
-    const externalProvider = seller
-      ? sellerExternalProviderView(await this.whopLinked.status(seller.id).catch(() => null))
-      : sellerExternalProviderView(this.whopLinked.publicView(null));
+    const externalProvider = await this.externalProviderStatus(seller?.id ?? null);
     const externalOnly = sellerStatus === 'pending_review' && Boolean(externalProvider?.charging);
 
     const state: 'not_found' | AccountState = !seller
@@ -538,7 +606,7 @@ export class KoopfyIntegrationService {
     try {
       const [requirements, external] = await Promise.all([
         this.whopConnect.getSellerRequirements(sellerId),
-        this.whopLinked.status(sellerId).catch(() => null),
+        this.externalProviderStatus(sellerId).catch(() => null),
       ]);
       return connectedActivationBlocker({
         required: Boolean(requirements?.connected?.required),

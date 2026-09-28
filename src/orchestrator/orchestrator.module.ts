@@ -14,6 +14,7 @@ import { StripeRiskService } from './stripe/stripe-risk.service';
 import { StripeEfwService } from './stripe/stripe-efw.service';
 import { AffiliateRiskService } from './stripe/affiliate-risk.service';
 import { CryptoModule } from '../crypto/crypto.module';
+import { SellerProviderAccountsService } from './seller-provider/seller-provider-accounts.service';
 
 @Module({
   imports: [CryptoModule], // 🔥 precisa pra decrypt
@@ -35,6 +36,8 @@ import { CryptoModule } from '../crypto/crypto.module';
     WhopPayoutDestinationsService,
     // Conta Whop própria do seller (modo conexão): a cobrança sai na conta dele.
     WhopLinkedAccountsService,
+    // Stripe e PayPal próprios do seller (provedor externo).
+    SellerProviderAccountsService,
     StripeAccountsService,
     StripeRiskService,
     StripeEfwService,
@@ -68,6 +71,9 @@ import { CryptoModule } from '../crypto/crypto.module';
     WhopLinkedAccountsService,
     // WhopPlatformClient: domínios de pagamento (Apple Pay) das contas da loja.
     WhopPlatformClient,
+    // SellerProviderAccountsService: o painel conecta/desliga Stripe e PayPal
+    // próprios, e o webhook resolve os ids 'stripel_…'/'paypall_…'.
+    SellerProviderAccountsService,
     StripeAccountsService,
     StripeRiskService,
     StripeEfwService,

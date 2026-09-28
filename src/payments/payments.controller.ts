@@ -111,6 +111,16 @@ export class PaymentController {
     return this.paymentService.getTransactionStatus(req.sellerId as string, transactionId);
   }
 
+  // PayPal na conta do seller: os botões aprovaram a order no navegador; a
+  // captura é no servidor. Mesma chave (sk_live_ do seller) do /status.
+  // Resposta: status approved | pending; recusa/estado inválido → 4xx com código.
+  @Post(':transactionId/paypal/capture')
+  @UseGuards(ApiKeyGuard)
+  @HttpCode(HttpStatus.OK)
+  capturePaypal(@Req() req: Request, @Param('transactionId') transactionId: string) {
+    return this.paymentService.capturePaypalOrder(req.sellerId as string, transactionId);
+  }
+
   // Upsell de um clique (Whop): a compra pode ser cobrada de novo sem o comprador
   // digitar o cartão? O checkout consulta antes de mostrar a oferta — uma oferta
   // que falha no clique é pior do que nenhuma. A cobrança em si vai pelo
