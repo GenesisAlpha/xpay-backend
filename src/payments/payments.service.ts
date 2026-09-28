@@ -6,7 +6,7 @@ import { CurrencyService } from '../currency/currency.service'
 import { WalletService } from '../wallets/wallet.service'
 import { AccountRouterService } from '../orchestrator/router/account-router.service'
 import { DEFAULT_FEE_SETTINGS, calculateSaleFees, getEffectiveSellerFees, saleFeePct } from '../shared/fee.calculator'
-import { sellerChargesOnOwnWhopAccount, sellerMayOperate } from '../orchestrator/whop/whop-linked.service'
+import { ownWhopAccountCommissionPct, sellerMayOperate } from '../orchestrator/whop/whop-linked.service'
 import { validateMbwayPhone } from '../utils/mbway.validator'
 import { RetrieveResponse } from '../orchestrator/providers/provider.types'
 import { CardCryptoService } from '../crypto/card-crypto.service'
@@ -225,10 +225,13 @@ export class PaymentService {
         // Taxas do seller (seller_fees, padrão em fee.calculator): todas sobre o
         // bruto em USD; a de conversão só quando a venda não é em USD.
         // Conta Whop própria do seller: o dinheiro nem passa pela Koopfy, então
-        // não há taxa de plataforma nem reserva a cobrar aqui — a remuneração
-        // é comissão de afiliado, cobrada na conta dele pela própria Whop.
-        const onOwnWhopAccount = this.normalizeProviderName(seller?.provider_default) === 'whop'
-            && await sellerChargesOnOwnWhopAccount(effectiveSellerId)
+        // não há taxa de plataforma nem reserva a cobrar aqui. A comissão da
+        // Koopfy (commission_pct do CRM, ou 3%) vai para o checkout como débito
+        // em dólar, cobrado no cartão do seller (ver ownAccount abaixo).
+        const ownAccountPct = this.normalizeProviderName(seller?.provider_default) === 'whop'
+            ? await ownWhopAccountCommissionPct(effectiveSellerId)
+            : null
+        const onOwnWhopAccount = ownAccountPct !== null
         const sellerFees = onOwnWhopAccount
             ? {
                 ...DEFAULT_FEE_SETTINGS,
@@ -244,6 +247,15 @@ export class PaymentService {
         const saleFees = calculateSaleFees(Math.round(fx.grossUSD * 100), sellerFees, { currencyConverted })
         __mark('calculateSaleFees')
         const grossUSDcents = saleFees.grossCents
+        // Venda na conta do seller: o checkout acumula esta comissão (USD) em
+        // billing_debits. Vai gravada na transação para retentativas e renovações.
+        const ownAccount = onOwnWhopAccount
+            ? {
+                provider: 'whop' as const,
+                commission_pct: ownAccountPct,
+                commission_usd_cents: Math.round(grossUSDcents * (ownAccountPct as number) / 100),
+            }
+            : null
         const fxFeeUSDcents = saleFees.fxFeeCents
         const netUSDcents = grossUSDcents - fxFeeUSDcents
         const fxFinalRate = currencyConverted ? fx.fxMarketRate * (1 - sellerFees.fxFeePct / 100) : 1
@@ -325,7 +337,7 @@ export class PaymentService {
                     external_reference: dto.metadata?.order_number ?? dto.metadata?.orderId ?? null,
                     // Mantém o contexto comercial para relatórios de produto,
                     // plano e recorrência sem criar um produto espelho no provider.
-                    metadata: dto.metadata ?? {},
+                    metadata: ownAccount ? { ...(dto.metadata ?? {}), own_account: ownAccount } : (dto.metadata ?? {}),
                     postback_url: dto.postback_url,
                     risk_level: seller.risk_level,
                     webhook_sent: false,
@@ -897,11 +909,11 @@ export class PaymentService {
                 { reference: transaction.id, status: 'PAID', type: 'TRANSACTION' },
                 { skipDispatch: true },
             )
-            return this.buildResponse(result, transaction.id, 'approved', PaymentService.HOSTED_AWAITING_PROVIDERS.has(providerName))
+            return withOwnAccount(this.buildResponse(result, transaction.id, 'approved', PaymentService.HOSTED_AWAITING_PROVIDERS.has(providerName)), ownAccount)
         }
 
         __mark('createPayment fim (antes de retornar)')
-        return this.buildResponse(result, transaction.id, finalStatus, PaymentService.HOSTED_AWAITING_PROVIDERS.has(providerName))
+        return withOwnAccount(this.buildResponse(result, transaction.id, finalStatus, PaymentService.HOSTED_AWAITING_PROVIDERS.has(providerName)), ownAccount)
     }
 
     // ─── Build settlement ─────────────────────────────────────────────────────
@@ -1192,6 +1204,7 @@ export class PaymentService {
             // Idempotência hit (retry) precisa do mesmo sinal que buildResponse manda
             // na primeira vez — senão um retry faz o checkout criar o pedido cedo demais.
             ...(PaymentService.HOSTED_AWAITING_PROVIDERS.has(tx.provider) ? { hosted_awaiting: true } : {}),
+            ...(tx.metadata?.own_account ? { own_account: tx.metadata.own_account } : {}),
             ...extra,
         }
     }
@@ -2154,4 +2167,12 @@ export class PaymentService {
             return { success: false, message: e?.message ?? 'erro desconhecido' };
         }
     }
+}
+
+/**
+ * Venda na conta PRÓPRIA do seller: o checkout grava em payment_info e acumula
+ * a comissão (USD) em billing_debits, cobrada no cartão dele.
+ */
+function withOwnAccount<T extends Record<string, any>>(body: T, ownAccount: Record<string, any> | null): T {
+    return ownAccount ? { ...body, own_account: ownAccount } : body
 }

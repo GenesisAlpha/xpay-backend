@@ -408,14 +408,11 @@ export class WhopLinkedAccountsService {
     const accountId = toLinkedProviderAccountId(company.id);
     const webhook = await this.registerWebhook(key, company.apiUrl, company.id, accountId);
 
-    // Como a Koopfy recebe: afiliada da conta dele, com rev-share do percentual
-    // combinado. Falhar aqui NÃO derruba a conexão — a venda já sai, e o CRM
-    // mostra que a comissão ficou pendente para o time resolver.
+    // Como a Koopfy recebe (desde 2026-09-28): a comissão (commission_pct, do
+    // CRM ou 3%) de cada venda vira débito em dólar e é cobrada no cartão que
+    // o seller salvou na Whop da Koopfy (checkout: billing_debits + cron). Não
+    // há mais afiliado nem rev-share na conta dele.
     const commissionPct = Number(current.commission_pct ?? DEFAULT_LINKED_COMMISSION_PCT);
-    const affiliate = await this.setupAffiliate(key, company.apiUrl, company.id, commissionPct).catch((err: any) => {
-      console.error(`[WhopLinked] afiliado na conta ${company.id}:`, err?.message);
-      return { id: null, code: null, overrideId: null, error: String(err?.message ?? err).slice(0, 300) };
-    });
 
     // A chave serve para o financeiro do painel (saldo e saque)? Vale saber
     // agora, na tela em que ele ainda tem a chave na mão, e não depois, quando
@@ -439,12 +436,9 @@ export class WhopLinkedAccountsService {
         webhook_id: webhook.id,
         webhook_secret: webhook.secret ? this.crypto.encrypt(webhook.secret) : null,
         commission_pct: commissionPct,
-        affiliate_id: affiliate.id,
-        affiliate_code: affiliate.code,
-        affiliate_override_id: affiliate.overrideId,
         status: 'active',
         last_checked_at: now,
-        last_error: (affiliate as any).error ?? null,
+        last_error: null,
         created_by: actor,
         updated_at: now,
       },
@@ -505,7 +499,7 @@ export class WhopLinkedAccountsService {
     return this.publicView(await this.getRow(sellerId));
   }
 
-  /** Comissão da Koopfy nessa conta (cobrada como afiliado na Whop). */
+  /** Comissão da Koopfy nessa conta: vira débito em dólar cobrado no cartão do seller. */
   async setCommission(sellerId: string, commissionPct: number, actor: string | null = null) {
     const pct = Number(commissionPct);
     if (!Number.isFinite(pct) || pct < 0 || pct > 25) {
@@ -515,21 +509,9 @@ export class WhopLinkedAccountsService {
     const row = await this.getRow(sellerId);
     if (!row) throw new NotFoundException('Seller sem conta Whop própria conectada.');
 
-    // O percentual que vale é o que está na Whop: sem atualizar a rev-share, o
-    // número mudaria só na nossa tela e a comissão continuaria a antiga.
+    // Vale a partir da próxima venda: o pay grava o percentual em cada
+    // transação (metadata.own_account) e o checkout cobra por ele.
     const patch: Record<string, any> = { commission_pct: pct, updated_at: new Date().toISOString() };
-    const apiKey = this.reveal(row);
-    if (row.affiliate_id && apiKey) {
-      try {
-        const override = await this.createOverride(apiKey, row.api_url ?? WHOP_API_URL_DEFAULT, row.affiliate_id, pct);
-        patch.affiliate_override_id = override?.id ?? row.affiliate_override_id;
-        patch.last_error = null;
-      } catch (err: any) {
-        throw new BadRequestException(`A Whop recusou a nova comissão: ${err?.message ?? err}`);
-      }
-    } else {
-      patch.last_error = 'comissão salva só na Koopfy: a conta dele ainda não tem afiliado configurado';
-    }
 
     const { error } = await supabase.from(TABLE).update(patch).eq('seller_id', sellerId);
     if (error) throw new BadRequestException(`Não foi possível salvar a comissão: ${error.message}`);
@@ -609,8 +591,6 @@ export class WhopLinkedAccountsService {
         // carteira da Koopfy (o dinheiro é do seller).
         linked: true,
         seller_id: row.seller_id,
-        // Vai em cada checkout: é o que atribui a venda à Koopfy e paga a comissão.
-        affiliate_code: row.affiliate_code ?? undefined,
         // Segredo do webhook que criamos na conta dele, para validar o evento.
         webhook_secret: row.webhook_secret ? this.decryptOrNull(row.webhook_secret) : undefined,
       },
@@ -633,56 +613,6 @@ export class WhopLinkedAccountsService {
     } catch {
       return undefined;
     }
-  }
-
-  /**
-   * Como a Koopfy recebe: vira afiliada da conta dele e ganha uma rev-share do
-   * percentual combinado. O `affiliate_code` viaja em cada checkout que
-   * criamos — as vendas que ele fizer por fora não entram na comissão.
-   *
-   * A Whop credita no saldo da conta Koopfy e estorna sozinha no reembolso.
-   */
-  private async setupAffiliate(apiKey: string, apiUrl: string, companyId: string, commissionPct: number) {
-    const identifier = process.env.KOOPFY_WHOP_AFFILIATE?.trim();
-    if (!identifier) {
-      throw new Error('KOOPFY_WHOP_AFFILIATE ausente: sem ele a Koopfy não vira afiliada e a comissão não é cobrada.');
-    }
-    // Afiliado na Whop é sempre uma PESSOA (username, e-mail, user_… ou Discord).
-    // Com um biz_ a Whop recusa e a comissão passaria a não ser cobrada em
-    // silêncio — melhor falhar aqui, dizendo o que está errado.
-    if (identifier.startsWith('biz_')) {
-      throw new Error(
-        `KOOPFY_WHOP_AFFILIATE está com um id de empresa (${identifier}): use o usuário dono da conta `
-        + '(e-mail, username ou user_…), porque a comissão de afiliado é creditada a uma pessoa.',
-      );
-    }
-
-    const affiliate = await this.whopPost(apiKey, apiUrl, '/api/v1/affiliates', {
-      account_id: companyId,
-      user_identifier: identifier,
-    });
-    const id = String(affiliate?.id ?? '').trim();
-    if (!id) throw new Error('A Whop não devolveu o afiliado criado.');
-
-    // O código que atribui a venda é o USERNAME do afiliado (é o `?a=<username>`
-    // dos links da Whop). A resposta não tem `affiliate_code`: sem isto o
-    // checkout sairia sem afiliado e a comissão nunca seria cobrada.
-    const code = String(affiliate?.user?.username ?? '').trim();
-    if (!code) throw new Error('A Whop não devolveu o username do afiliado: sem ele a venda não é atribuída à Koopfy.');
-
-    const override = await this.createOverride(apiKey, apiUrl, id, commissionPct);
-    return { id, code, overrideId: override?.id ?? null };
-  }
-
-  /** Rev-share da conta toda: vale para qualquer produto dele vendido pela Koopfy. */
-  private createOverride(apiKey: string, apiUrl: string, affiliateId: string, commissionPct: number) {
-    return this.whopPost(apiKey, apiUrl, `/api/v1/affiliates/${encodeURIComponent(affiliateId)}/overrides`, {
-      override_type: 'rev_share',
-      commission_type: 'percentage',
-      commission_value: commissionPct,
-      // Sobre o líquido, depois das taxas da Whop — o que sobra de verdade.
-      revenue_basis: 'post_fees',
-    });
   }
 
   private async whopGet(apiKey: string, apiUrl: string, path: string) {
@@ -785,6 +715,23 @@ export class WhopLinkedAccountsService {
  * Atalho para o caminho da venda: o seller cobra na conta dele? Sem DI porque
  * o serviço de pagamentos monta as taxas antes de resolver a conta no router.
  */
+/**
+ * Comissão da Koopfy (%) quando o seller cobra na conta Whop PRÓPRIA dele;
+ * null quando a venda não sai por lá. Percentual do CRM ou 3%.
+ */
+export async function ownWhopAccountCommissionPct(sellerId: string): Promise<number | null> {
+  const { data } = await supabase
+    .from(TABLE)
+    .select('status, whop_account_id, last_error, commission_pct')
+    .eq('seller_id', sellerId)
+    .maybeSingle();
+  if (!data || linkedChargeBlocker(data as WhopLinkedAccountRow) !== null) return null;
+  // null/ausente = padrão (Number(null) seria 0% e a Koopfy não cobraria nada).
+  const raw = (data as any).commission_pct;
+  const pct = raw === null || raw === undefined || raw === '' ? NaN : Number(raw);
+  return Number.isFinite(pct) && pct >= 0 ? pct : DEFAULT_LINKED_COMMISSION_PCT;
+}
+
 export async function sellerChargesOnOwnWhopAccount(sellerId: string): Promise<boolean> {
   const { data } = await supabase
     .from(TABLE)
