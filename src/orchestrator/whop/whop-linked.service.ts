@@ -89,19 +89,26 @@ export class WhopLinkedAccountsService {
   }
 
   /**
-   * Libera (ou corta) o modo conta externa para o seller. Só depois disso o
-   * painel dele mostra "Conecte seu provedor externo" — quem conecta é ele.
+   * Libera (ou corta) o modo conta externa para o seller. Desde 2026-09-28 ele
+   * vem liberado para todos (decisão do dono): sem registro = liberado, e o
+   * CRM só serve para CORTAR ('disabled') ou religar quem foi cortado.
    */
   async allow(sellerId: string, enabled: boolean, actor: string | null = null) {
     const row = await this.getRow(sellerId);
     const now = new Date().toISOString();
 
     if (!enabled) {
-      if (!row) return this.publicView(null);
-      const { error } = await supabase
-        .from(TABLE)
-        .update({ status: 'disabled', updated_at: now })
-        .eq('seller_id', sellerId);
+      // Sem registro o modo vale liberado: cortar precisa gravar o bloqueio.
+      const { error } = await supabase.from(TABLE).upsert(
+        {
+          seller_id: sellerId,
+          status: 'disabled',
+          commission_pct: Number(row?.commission_pct ?? DEFAULT_LINKED_COMMISSION_PCT),
+          updated_at: now,
+          ...(row ? {} : { created_by: actor }),
+        },
+        { onConflict: 'seller_id' },
+      );
       if (error) throw new BadRequestException(`Não foi possível cortar o modo conta externa: ${error.message}`);
       this.cache.delete(sellerId);
       await this.log(sellerId, actor, 'whop_linked.mode_disabled', {});
@@ -360,11 +367,16 @@ export class WhopLinkedAccountsService {
     const key = String(apiKey ?? '').trim();
     if (!key) throw new BadRequestException('Informe a chave de API da sua conta Whop.');
 
-    // O modo conta externa é liberado pela equipe, a pedido do seller. Sem
-    // liberação, ninguém conecta uma conta de fora sozinho.
-    const current = await this.getRow(sellerId);
-    if (!current || current.status === 'disabled') {
-      throw new BadRequestException('O modo conta externa não está liberado para esta conta. Fale com o atendimento da Koopfy.');
+    // Liberado para todos; só quem a equipe cortou no CRM ('disabled') não
+    // conecta. Primeira conexão cria o registro, como a liberação do CRM fazia.
+    let current = await this.getRow(sellerId);
+    if (current?.status === 'disabled') {
+      throw new BadRequestException('O modo conta externa foi desativado para esta conta. Fale com o atendimento da Koopfy.');
+    }
+    if (!current) {
+      await this.allow(sellerId, true, actor);
+      current = await this.getRow(sellerId);
+      if (!current) throw new BadRequestException('Não foi possível preparar a conexão agora. Tente de novo.');
     }
 
     const company = await this.readCompany(key);
@@ -543,9 +555,10 @@ export class WhopLinkedAccountsService {
 
   /** O que o painel e o CRM podem ver: nunca a chave. */
   publicView(row: WhopLinkedAccountRow | null) {
-    if (!row) return { allowed: false as const, connected: false as const };
+    // Sem registro = liberado (ninguém cortou): o painel mostra "conecte seu provedor".
+    if (!row) return { allowed: true as const, connected: false as const };
     return {
-      // Liberado pela equipe: o painel do seller mostra "conecte seu provedor".
+      // Só 'disabled' (cortado no CRM) esconde a opção.
       allowed: row.status !== 'disabled',
       connected: Boolean(row.whop_account_id && row.api_key),
       whopAccountId: row.whop_account_id,
