@@ -48,6 +48,16 @@ export class WebhookController {
         return this.webhookService.handleRoxPayWebhook(req.body, headers);
     }
 
+    // SLASH — um endpoint só (uma conta). O corpo tem que chegar BRUTO: a
+    // assinatura RSA é sobre os bytes exatos — ver express.raw em main.ts.
+    @Post('slash')
+    async handleSlashWebhook(@Req() req: any, @Headers() headers: Record<string, string>) {
+        const raw: Buffer | string = Buffer.isBuffer(req.body)
+            ? req.body
+            : (req.rawBody ?? JSON.stringify(req.body ?? {}));
+        return this.webhookService.handleSlashWebhook(raw, headers);
+    }
+
     // WHOP — endpoint compartilhado configurado no dashboard da Whop.
     // A conta é recuperada do metadata que nós mesmos gravamos na checkout
     // configuration; o WebhookService ainda valida a assinatura com o segredo

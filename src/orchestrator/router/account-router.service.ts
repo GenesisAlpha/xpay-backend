@@ -10,6 +10,7 @@ import { RoxPayProvider } from '../providers/rox-pay.provider';
 import { WhopProvider } from '../providers/whop.provider';
 import { StripeProvider } from '../providers/stripe.provider';
 import { ClipProvider } from '../providers/clip.provider';
+import { SlashProvider } from '../providers/slash.provider';
 import { WhopAccountsService } from '../whop/whop-accounts.service';
 import { StripeAccountsService } from '../stripe/stripe-accounts.service';
 import { ClipAccountsService } from '../clip/clip-accounts.service';
@@ -286,6 +287,8 @@ export class AccountRouterService implements OnModuleInit {
         // resolvida ANTES de o formulário de cartão existir — não há decisão de
         // roteamento a tomar no momento da cobrança.
         return new ClipProvider();
+      case 'slash':
+        return new SlashProvider();
       default:
         throw new Error(`Unknown provider: "${provider}"`);
     }

@@ -10,6 +10,8 @@ import { WalletService } from '../wallets/wallet.service'
 import { AccountRouterService } from '../orchestrator/router/account-router.service'
 import { getProviderAccountById } from '../orchestrator/provider-accounts.config'
 import { RoxPayProvider } from '../orchestrator/providers/rox-pay.provider'
+import { SlashProvider, mapSlashIntentStatus } from '../orchestrator/providers/slash.provider'
+import { verifySlashSignature } from './slash-signature'
 import { WhopAccountsService } from '../orchestrator/whop/whop-accounts.service'
 import { isLinkedProviderAccountId } from '../orchestrator/whop/whop-linked'
 import { StripeAccountsService } from '../orchestrator/stripe/stripe-accounts.service'
@@ -647,6 +649,180 @@ export class WebhookService {
       type: 'TRANSACTION',
       failure_message: raw?.Message ?? null,
     })
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // SLASH — /webhook/slash
+  // ══════════════════════════════════════════════════════════════════════════
+  //
+  // O corpo só avisa ({ event, eventId, entityId, eventTimestamp }); o estado
+  // vem do GET do intent/refund. Entrega é at-least-once e fora de ordem, por
+  // isso não há tabela de dedupe: cada transição daqui é idempotente
+  // (aprovação, falha e estorno checam o status atual antes de mexer) e o GET
+  // sempre devolve o estado MAIS NOVO, então um evento atrasado não desfaz nada.
+  //
+  // ⚠️ O CORPO TEM QUE SER O BRUTO — a assinatura RSA é sobre os bytes exatos.
+  // Ver express.raw em main.ts, registrado em /webhook/slash.
+  async handleSlashWebhook(rawBody: Buffer | string, headers: Record<string, string> = {}) {
+    const verification = verifySlashSignature(rawBody, headers['slash-webhook-signature'])
+    if (!verification.valid) {
+      console.error(
+        `[WebhookService] Slash: ASSINATURA INVÁLIDA (${verification.reason}). `
+        + 'Suspeita nº1: o body chegou re-serializado (confira express.raw em /webhook/slash no main.ts). '
+        + 'Suspeita nº2: a Slash trocou a chave — ver SLASH_WEBHOOK_PUBLIC_KEYS.',
+      )
+      // THROW, não 2xx: com 2xx a Slash dá o evento por entregue e a venda some.
+      // Com erro ela tenta de novo (12x, backoff), o que dá tempo de corrigir.
+      throw new Error(`Slash: assinatura inválida (${verification.reason})`)
+    }
+
+    let event: any = {}
+    try {
+      event = JSON.parse(Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : (rawBody || '{}'))
+    } catch { /* payload inválido */ }
+
+    const eventType = String(event?.event ?? '')
+    const entityId = String(event?.entityId ?? '')
+    console.log('[Slash webhook]', eventType, event?.eventId ?? '-', entityId)
+
+    if (!entityId) return { ignored: true, reason: 'missing entityId' }
+
+    const account = getProviderAccountById('slash_main')
+    if (!account?.apiKey) {
+      // Sem chave não há como ler o estado; erro faz a Slash reentregar depois
+      // que a env for corrigida.
+      throw new Error('Slash: SLASH_API_KEY ausente — não dá para confirmar o evento')
+    }
+    const provider = this.router.getProviderInstance('slash') as SlashProvider
+
+    if (eventType === 'payments.payment_intent.updated' || eventType === 'payments.payment_intent.created') {
+      const intent = await provider.getPaymentIntent(account, entityId)
+      if (!intent) throw new Error(`Slash: não foi possível ler o intent ${entityId}`)
+      return this.processSlashIntent(intent)
+    }
+
+    if (eventType === 'payments.refund.updated' || eventType === 'payments.refund.created') {
+      const refund = await provider.getRefund(account, entityId)
+      if (!refund) throw new Error(`Slash: não foi possível ler o reembolso ${entityId}`)
+      return this.processSlashRefund(provider, account, refund)
+    }
+
+    return { ignored: true, reason: 'unmapped event' }
+  }
+
+  // Transação do intent: pelo metadata que nós gravamos (vale também para um
+  // intent antigo do mesmo pedido, criado antes de o total mudar), com o id do
+  // intent como reserva.
+  private async resolveSlashTx(intent: any): Promise<any | null> {
+    const txId = intent?.metadata?.koopfy_transaction_id
+    if (txId) {
+      const { data } = await supabase.from('transactions').select('*').eq('id', String(txId)).maybeSingle()
+      if (data) return data
+    }
+    if (intent?.id) {
+      const { data } = await supabase
+        .from('transactions').select('*').eq('provider_transaction_id', String(intent.id)).maybeSingle()
+      if (data) return data
+    }
+    return null
+  }
+
+  private async processSlashIntent(intent: any) {
+    const tx = await this.resolveSlashTx(intent)
+    if (!tx) {
+      // Intent criado fora do checkout (painel, outro sistema na mesma conta)
+      // não tem o nosso metadata — nada a fazer aqui.
+      if (!intent?.metadata?.koopfy_transaction_id) return { ignored: true, reason: 'not a koopfy intent' }
+      console.error('[WebhookService] Slash: PAGAMENTO ÓRFÃO — nenhuma transação casou.', intent?.id)
+      throw new Error(`Slash: transação não encontrada para o intent ${intent?.id}`)
+    }
+    if (tx.provider && tx.provider !== 'slash') {
+      console.error(`[WebhookService] Slash: intent ${intent.id} aponta para a transação ${tx.id}, que é do provider ${tx.provider}`)
+      return { ignored: true, reason: 'provider mismatch' }
+    }
+
+    const isCurrentIntent = !tx.provider_transaction_id || tx.provider_transaction_id === intent.id
+    const mapped = mapSlashIntentStatus(intent.status)
+
+    if (mapped === 'paid') {
+      // Pago por um intent que não é o último do pedido: aconteceu com o
+      // comprador pagando numa aba antiga, antes de o total mudar. O dinheiro
+      // entrou, então aprova — mas o valor pode divergir do registrado.
+      const intentCurrency = String(intent.currency ?? '').toUpperCase()
+      if (Number(intent.amount) !== Number(tx.amount) || intentCurrency !== String(tx.currency).toUpperCase()) {
+        console.error(
+          `[WebhookService] ⚠️ Slash: valor pago (${intent.amount} ${intentCurrency}) difere da transação `
+          + `${tx.id} (${tx.amount} ${tx.currency}). Conferir o crédito do seller.`,
+        )
+      }
+      if (!isCurrentIntent) {
+        await supabase.from('transactions')
+          .update({ provider_transaction_id: intent.id })
+          .eq('id', tx.id).neq('status', 'approved')
+      }
+      return this.handleWebhookProvider({ reference: tx.id, status: 'PAID', type: 'TRANSACTION' })
+    }
+
+    // Os demais só contam para o intent atual: um intent velho do mesmo pedido
+    // ser cancelado não diz nada sobre o pagamento que está valendo.
+    if (!isCurrentIntent) return { ignored: true, reason: 'stale intent' }
+
+    if (mapped === 'processing') {
+      return this.handleWebhookProvider({ reference: tx.id, status: 'PROCESSING', type: 'TRANSACTION' })
+    }
+    if (mapped === 'failed') {
+      return this.handleWebhookProvider({
+        reference: tx.id, status: 'FAILED', type: 'TRANSACTION',
+        failure_code: 'canceled',
+        failure_message: 'Pagamento cancelado na Slash',
+      })
+    }
+    // `pending` depois de `processing` = cartão recusado; o comprador pode
+    // tentar outro no mesmo formulário. Só volta a transação se ela já tinha
+    // avançado — pending sobre pending não muda nada.
+    if (mapped === 'pending' && tx.status === 'processing') {
+      return this.handleWebhookProvider({ reference: tx.id, status: 'PENDING', type: 'TRANSACTION' })
+    }
+    return { received: true, status: intent.status }
+  }
+
+  // Reembolso: só o TOTAL vira `refunded` (e reverte saldo e reserva — ver
+  // refundTransaction, que não sabe estornar parcial). Parcial fica registrado
+  // no metadata da transação para conferência.
+  private async processSlashRefund(provider: SlashProvider, account: any, refund: any) {
+    if (String(refund?.status ?? '').toLowerCase() !== 'succeeded') {
+      return { received: true, status: refund?.status ?? null }
+    }
+
+    const intentId = String(refund?.paymentIntentId ?? '')
+    const intent = intentId ? await provider.getPaymentIntent(account, intentId) : null
+    if (!intent) throw new Error(`Slash: intent ${intentId || '(vazio)'} do reembolso ${refund?.id} ilegível`)
+
+    const tx = await this.resolveSlashTx(intent)
+    if (!tx) {
+      if (!intent?.metadata?.koopfy_transaction_id) return { ignored: true, reason: 'not a koopfy intent' }
+      throw new Error(`Slash: transação não encontrada para o reembolso ${refund?.id}`)
+    }
+
+    const refunds = await provider.listRefunds(account, intentId)
+    const refundedMinor = (refunds ?? [refund])
+      .filter(r => String(r?.status ?? '').toLowerCase() === 'succeeded')
+      .reduce((sum, r) => sum + Number(r?.amount ?? 0), 0)
+
+    if (refundedMinor >= Number(intent.amount)) {
+      return this.refundTransaction(tx.id)
+    }
+
+    const slashRefunds = { ...(tx.metadata?.slash_refunds ?? {}) }
+    slashRefunds[String(refund.id)] = { amount: refund.amount, currency: refund.currency, at: refund.updatedAt ?? null }
+    await supabase.from('transactions')
+      .update({ metadata: { ...(tx.metadata ?? {}), slash_refunds: slashRefunds, slash_refunded_minor: refundedMinor } })
+      .eq('id', tx.id)
+    console.warn(
+      `[WebhookService] Slash: reembolso PARCIAL ${refund.id} (${refundedMinor}/${intent.amount}) na transação ${tx.id} `
+      + '— saldo do seller não foi ajustado automaticamente.',
+    )
+    return { partialRefund: true, refundedMinor }
   }
 
   // ══════════════════════════════════════════════════════════════════════════

@@ -83,6 +83,15 @@ async function bootstrap() {
   );
 
   // =========================================
+  // 🔥 WEBHOOK SLASH (RAW BODY p/ verificar a assinatura RSA)
+  // Prefixo /webhook (singular), o mesmo do WebhookController.
+  // =========================================
+  app.use(
+    '/webhook/slash',
+    express.raw({ type: '*/*' })
+  );
+
+  // =========================================
   // 🔥 REST NORMAL (JSON)
   //    Limite alto p/ uploads de documentos do onboarding (base64, vários
   //    arquivos de até 8MB → ~43MB no pior caso).

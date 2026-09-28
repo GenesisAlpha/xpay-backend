@@ -28,7 +28,7 @@ const loginLimiter = new LoginAttemptLimiter()
 
 // Provedores que o CRM pode atribuir. Sellers antigos com outro provider seguem
 // funcionando, mas não recebem mais essas opções.
-const VALID_PROVIDERS = ['whop', 'stripe'] as const
+const VALID_PROVIDERS = ['whop', 'stripe', 'slash'] as const
 const DEFAULT_PROVIDER: ProviderDefault = 'whop'
 type ProviderDefault = typeof VALID_PROVIDERS[number] | null
 
