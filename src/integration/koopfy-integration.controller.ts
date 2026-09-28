@@ -7,7 +7,11 @@ import {
   Body,
   Controller,
   Get,
+  HttpCode,
+  HttpStatus,
+  Param,
   Post,
+  Put,
   Query,
   Req,
   UseGuards,
@@ -132,8 +136,8 @@ export class KoopfyIntegrationController {
   // Guard leve: quem ainda não tem conta no pay também conecta (a conta nasce aqui).
   @Post('external-provider/connect')
   @UseGuards(CrossServiceTokenGuard)
-  connectExternalProvider(@Req() req: any, @Body() body: { apiKey?: string }) {
-    return this.svc.connectExternalProvider(req.tokenEmail, req.accountSellerId ?? null, String(body?.apiKey ?? ''));
+  connectExternalProvider(@Req() req: any, @Body() body: { apiKey?: string; label?: string }) {
+    return this.svc.connectExternalProvider(req.tokenEmail, req.accountSellerId ?? null, String(body?.apiKey ?? ''), body?.label ?? null);
   }
 
   // Stripe e PayPal do próprio seller (mesmo guard leve e mesma criação de conta
@@ -141,7 +145,7 @@ export class KoopfyIntegrationController {
   // Resposta: a mesma visão de status.externalProvider (com `providers`).
   @Post('external-provider/stripe/connect')
   @UseGuards(CrossServiceTokenGuard)
-  connectStripe(@Req() req: any, @Body() body: { secretKey?: string; publishableKey?: string }) {
+  connectStripe(@Req() req: any, @Body() body: { secretKey?: string; publishableKey?: string; label?: string }) {
     return this.svc.connectOwnProvider(req.tokenEmail, req.accountSellerId ?? null, 'stripe', body ?? {});
   }
 
@@ -153,7 +157,7 @@ export class KoopfyIntegrationController {
 
   @Post('external-provider/paypal/connect')
   @UseGuards(CrossServiceTokenGuard)
-  connectPaypal(@Req() req: any, @Body() body: { clientId?: string; clientSecret?: string; mode?: 'live' | 'test' }) {
+  connectPaypal(@Req() req: any, @Body() body: { clientId?: string; clientSecret?: string; mode?: 'live' | 'test'; label?: string }) {
     return this.svc.connectOwnProvider(req.tokenEmail, req.accountSellerId ?? null, 'paypal', body ?? {});
   }
 
@@ -161,6 +165,41 @@ export class KoopfyIntegrationController {
   @UseGuards(CrossServiceJwtGuard)
   disconnectPaypal(@Req() req: any) {
     return this.svc.disconnectOwnProvider(req.sellerCtx, 'paypal');
+  }
+
+  // Desconecta UMA conta própria (whopl_/whopa_/stripel_/paypall_): com o
+  // roteamento o seller tem várias do mesmo provedor. Resposta: a visão de
+  // status.externalProvider.
+  @Post('external-provider/accounts/:accountId/disconnect')
+  @UseGuards(CrossServiceJwtGuard)
+  @HttpCode(HttpStatus.OK)
+  disconnectOwnAccount(@Req() req: any, @Param('accountId') accountId: string) {
+    return this.svc.disconnectOwnAccount(req.sellerCtx, accountId);
+  }
+
+  // ─── Roteamento de contas ──────────────────────────────────────────────
+  // Ligado pelo seller (com aceite da taxa); várias Whop/Stripe/PayPal e a
+  // estratégia de cada grupo. Resposta de todas: a visão completa do GET.
+
+  @Get('routing')
+  @UseGuards(CrossServiceJwtGuard)
+  routing(@Req() req: any) {
+    return this.svc.routingView(req.sellerCtx);
+  }
+
+  // Body: { enabled?, acceptFee?, cardStrategy?, paypalStrategy? }
+  @Put('routing')
+  @UseGuards(CrossServiceJwtGuard)
+  updateRouting(@Req() req: any, @Body() body: any) {
+    return this.svc.updateRouting(req.sellerCtx, body ?? {});
+  }
+
+  // Body: { label?, weight?, priority?, dailyCapUsdCents?, dailyCapOrders?,
+  // minTicketUsdCents?, maxTicketUsdCents?, countries?, currencies?, paused? }
+  @Put('routing/accounts/:accountId')
+  @UseGuards(CrossServiceJwtGuard)
+  updateRoutingAccount(@Req() req: any, @Param('accountId') accountId: string, @Body() body: any) {
+    return this.svc.updateRoutingAccount(req.sellerCtx, accountId, body ?? {});
   }
 
   // Financeiro da conta externa: saldo, contas bancárias e saques, lidos da

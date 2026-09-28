@@ -1,6 +1,6 @@
 // nexor/src/payments/payment.service.ts
 
-import { Injectable, BadRequestException, ConflictException, ForbiddenException, NotFoundException, ServiceUnavailableException } from '@nestjs/common'
+import { Injectable, BadRequestException, ConflictException, ForbiddenException, NotFoundException, Optional, ServiceUnavailableException } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
 import { CurrencyService } from '../currency/currency.service'
 import { WalletService } from '../wallets/wallet.service'
@@ -15,6 +15,8 @@ import {
     isStripeOwnAccountId,
     paypalCaptureMismatch,
 } from '../orchestrator/seller-provider/seller-provider-accounts'
+import { SellerRoutingService, RoutingSalePick, normalizeRoutingKey } from '../orchestrator/routing/seller-routing.service'
+import { ownAccountCommissionUsdCents } from '../orchestrator/routing/seller-routing'
 import { PaypalProvider } from '../orchestrator/providers/paypal.provider'
 import { validateMbwayPhone } from '../utils/mbway.validator'
 import { RetrieveResponse } from '../orchestrator/providers/provider.types'
@@ -111,6 +113,10 @@ export class PaymentService {
         private readonly storage: StorageService,
         private readonly speiReceipts: SpeiReceiptService,
         private readonly affiliateCommissions: AffiliateCommissionService,
+        // Roteamento de contas próprias (várias Whop/Stripe/PayPal por seller).
+        // Opcional só para os testes que montam o serviço à mão; sem ele (ou
+        // com o roteamento desligado) a venda segue exatamente como antes.
+        @Optional() private readonly sellerRouting?: SellerRoutingService,
     ) { }
 
     private static readonly REDIRECT_PROVIDERS = new Set(['viva'])
@@ -241,6 +247,30 @@ export class PaymentService {
         //
         // Upsell de um clique cobra na conta da compra-mãe: quem decide é ela,
         // não a conexão de hoje (o seller pode ter trocado Whop por Stripe).
+        //
+        // Roteamento de contas ligado: a conta sai da sessão do comprador
+        // (metadata.routing_key = id da checkout session), escolhida no
+        // /payments/config — ver SellerRoutingService.resolveForSale. Conta
+        // da sessão que deixou de ser elegível responde 409 ROUTING_REASSIGNED
+        // ANTES de criar a transação (o checkout recarrega as formas de
+        // pagamento). Desligado: null, e segue o caminho de sempre.
+        const buyerCountry = dto.billing_address?.country ?? dto.customer?.country
+            ?? (dto.method === 'mbway' ? 'PT' : null)
+        const routingSale: RoutingSalePick | null = !upsellParent && this.sellerRouting
+            ? await this.sellerRouting.resolveForSale(effectiveSellerId, {
+                method: dto.method,
+                routingKey: normalizeRoutingKey(dto.metadata?.routing_key ?? dto.routing_key),
+                ctx: {
+                    country: buyerCountry,
+                    currency: String(currency).toUpperCase(),
+                    amountUsdCents: Math.round(fx.grossUSD * 100),
+                },
+                orderRef: dto.metadata?.order_number ?? dto.metadata?.orderId ?? null,
+                providerAccountId: dto.providerAccountId ?? null,
+                idempotencyKey: dto.idempotencyKey ?? null,
+            })
+            : null
+        const routedOwn = routingSale?.kind === 'account' ? routingSale : null
         const ownSale: { provider: OwnProvider; commissionPct: number } | null = upsellParent
             ? (isOwnProviderAccountId(upsellParent.provider_account_id)
                 ? {
@@ -248,13 +278,21 @@ export class PaymentService {
                     commissionPct: await ownAccountCommissionPct(effectiveSellerId),
                 }
                 : null)
-            : await resolveOwnSale({
-                sellerId: effectiveSellerId,
-                providerDefault: this.normalizeProviderName(seller?.provider_default),
-                method: dto.method,
-            })
+            : routedOwn
+                ? { provider: routedOwn.provider, commissionPct: await ownAccountCommissionPct(effectiveSellerId) }
+                : await resolveOwnSale({
+                    sellerId: effectiveSellerId,
+                    providerDefault: this.normalizeProviderName(seller?.provider_default),
+                    method: dto.method,
+                })
         const ownAccountPct = ownSale?.commissionPct ?? null
         const onOwnAccount = ownSale !== null
+        // Taxa de roteamento (% sobre o bruto em USD) somada à comissão quando
+        // o roteamento está ligado; 0 desligado. Upsell herda a regra de hoje.
+        const routingFeePct = !ownSale ? 0
+            : routedOwn ? routedOwn.feePct
+                : upsellParent && this.sellerRouting ? await this.sellerRouting.feeForSale(effectiveSellerId)
+                    : 0
 
         // Sem aprovação da Koopfy, só vende o que sai pela conta dele. Seller
         // em análise com só o PayPal próprio conectado passa no sellerMayOperate,
@@ -279,11 +317,13 @@ export class PaymentService {
         const grossUSDcents = saleFees.grossCents
         // Venda na conta do seller: o checkout acumula esta comissão (USD) em
         // billing_debits. Vai gravada na transação para retentativas e renovações.
+        // Com o roteamento: comissão = bruto × (commission_pct + routing_fee_pct).
         const ownAccount = ownSale
             ? {
                 provider: ownSale.provider,
                 commission_pct: ownAccountPct,
-                commission_usd_cents: Math.round(grossUSDcents * (ownAccountPct as number) / 100),
+                routing_fee_pct: routingFeePct,
+                commission_usd_cents: ownAccountCommissionUsdCents(grossUSDcents, ownAccountPct as number, routingFeePct),
             }
             : null
         const fxFeeUSDcents = saleFees.fxFeeCents
@@ -510,8 +550,7 @@ export class PaymentService {
         // conciliação do fim do mês.
         let providerName = this.normalizeProviderName(seller?.provider_default)
         const preferredProvider = providerName
-        const customerCountry = dto.billing_address?.country ?? dto.customer?.country
-            ?? (dto.method === 'mbway' ? 'PT' : null)
+        const customerCountry = buyerCountry
 
         // Cadeia de failover cross-PSP. Antes disto, pool preferido vazio =
         // pagamento morto; agora ele cai para o próximo PSP da cadeia do método
@@ -520,7 +559,13 @@ export class PaymentService {
         // Upsell não passa pelo router: a conta é a da compra-mãe (ver acima).
         // Venda de conta própria vai direto para ela — sem failover nem sticky
         // (ver resolveOwnRoute): no pool da Koopfy sairia sem taxa.
-        const routed = upsellParent ? null : ownSale ? await this.accountRouter.resolveOwnRoute(
+        // Roteamento de contas: a conta já foi escolhida acima (sessão).
+        const routed = upsellParent ? null : routedOwn ? {
+            account: routedOwn.entry.account as any,
+            provider: routedOwn.provider as string,
+            degraded: false,
+            attempted: [routedOwn.provider as string],
+        } : ownSale ? await this.accountRouter.resolveOwnRoute(
             effectiveSellerId,
             ownSale.provider,
         ) : await this.accountRouter.resolveWithFailover({
@@ -983,11 +1028,11 @@ export class PaymentService {
                 { reference: transaction.id, status: 'PAID', type: 'TRANSACTION' },
                 { skipDispatch: true },
             )
-            return withOwnAccount(this.buildResponse(result, transaction.id, 'approved', PaymentService.HOSTED_AWAITING_PROVIDERS.has(providerName)), ownAccount)
+            return withRouting(withOwnAccount(this.buildResponse(result, transaction.id, 'approved', PaymentService.HOSTED_AWAITING_PROVIDERS.has(providerName)), ownAccount), routedOwn)
         }
 
         __mark('createPayment fim (antes de retornar)')
-        return withOwnAccount(this.buildResponse(result, transaction.id, finalStatus, PaymentService.HOSTED_AWAITING_PROVIDERS.has(providerName)), ownAccount)
+        return withRouting(withOwnAccount(this.buildResponse(result, transaction.id, finalStatus, PaymentService.HOSTED_AWAITING_PROVIDERS.has(providerName)), ownAccount), routedOwn)
     }
 
     // ─── Build settlement ─────────────────────────────────────────────────────
@@ -1498,7 +1543,12 @@ export class PaymentService {
     // Consumido pelo backend checkout (autenticado com a sk_live_ do seller) p/
     // montar o checkout do comprador: conta ativa?, provider configurado e
     // métodos habilitados no dash-pay. Não retorna segredos.
-    async getPaymentConfig(sellerId: string) {
+    async getPaymentConfig(
+        sellerId: string,
+        // Roteamento de contas: chave da sessão do comprador (id da checkout
+        // session) e, quando o checkout já sabe, país/moeda para os filtros.
+        routingOpts: { routingKey?: string | null; country?: string | null; currency?: string | null } = {},
+    ) {
         const { data: seller } = await supabase
             .from('seller_profiles')
             .select('status, provider_default, enabled_methods, provider_mid, config')
@@ -1573,7 +1623,7 @@ export class PaymentService {
         const ownCard = Boolean(ownStripe)
             || (provider === 'whop' && Boolean(await this.accountRouter.getOwnAccount(sellerId, 'whop').catch(() => null)))
 
-        return {
+        const legacy = {
             active: await sellerMayOperate({ id: sellerId, status: seller.status }),
             provider, // ex.: 'setinel_gate' | 'approvebly' | 'coinflow' | 'stripe'
             methods: approved || ownCard ? (seller.enabled_methods ?? []) : [],
@@ -1582,13 +1632,58 @@ export class PaymentService {
                 : null,
             // PayPal do seller: o checkout monta os botões com este client-id.
             // Público — é o mesmo id que o SDK do PayPal carrega no navegador.
-            paypal: ownPaypal
-                ? {
-                    clientId: ownPaypal.apiKey ?? ownPaypal.config?.client_id ?? null,
-                    mode: ownPaypal.config?.mode === 'test' ? 'test' as const : 'live' as const,
-                    charging: true,
-                }
+            paypal: ownPaypal ? paypalPublicConfig(ownPaypal) : null,
+        }
+
+        // ── Roteamento de contas ──
+        // Ligado: a conta de cartão (Whop ou Stripe) e a de PayPal são as da
+        // SESSÃO do comprador, escolhidas (ou reaproveitadas) agora e gravadas
+        // em routing_assignments. O formulário é montado com a credencial
+        // pública DESSA conta; o createPayment com a mesma chave cobra nela.
+        const pick = this.sellerRouting
+            ? await this.sellerRouting.resolveForConfig(sellerId, normalizeRoutingKey(routingOpts.routingKey), {
+                country: routingOpts.country ?? null,
+                currency: routingOpts.currency ?? null,
+            }).catch((err: any) => {
+                console.error('[PaymentService] getPaymentConfig: roteamento indisponível:', err?.message)
+                return null
+            })
+            : null
+        if (!pick) return { ...legacy, routing: { enabled: false } }
+
+        const routing = {
+            enabled: true,
+            key: pick.routingKey,
+            cardAccountId: pick.card?.id ?? null,
+            cardProvider: pick.card?.provider ?? null,
+            paypalAccountId: pick.paypal?.id ?? null,
+        }
+        const paypal = pick.paypalAccounts > 0
+            ? (pick.paypal?.account ? paypalPublicConfig(pick.paypal.account) : null)
+            : legacy.paypal
+
+        // Sem conta de cartão conectada no roteamento: o cartão segue como antes.
+        if (pick.cardAccounts === 0) return { ...legacy, paypal, routing }
+
+        // Contas de cartão conectadas mas nenhuma elegível agora (pausa, teto,
+        // filtro): sem cartão nesta sessão — nunca cai no pool da Koopfy.
+        const card = pick.card?.account ?? null
+        const cardProvider = card ? pick.card!.provider : null
+        return {
+            ...legacy,
+            provider: cardProvider,
+            methods: card ? (seller.enabled_methods ?? []) : [],
+            providerConfig: card
+                ? this.buildProviderPublicConfig(
+                    cardProvider as string,
+                    null,
+                    seller.config,
+                    cardProvider === 'stripe' ? card : null,
+                    cardProvider === 'whop' ? card : null,
+                )
                 : null,
+            paypal,
+            routing,
         }
     }
 
@@ -2377,6 +2472,20 @@ function ownProviderOfAccountId(id: string): OwnProvider {
     if (isStripeOwnAccountId(id)) return 'stripe'
     if (isPaypalOwnAccountId(id)) return 'paypal'
     return 'whop'
+}
+
+/** Botões do PayPal: client id (público) e modo da conta. */
+function paypalPublicConfig(account: any) {
+    return {
+        clientId: account.apiKey ?? account.config?.client_id ?? null,
+        mode: account.config?.mode === 'test' ? 'test' as const : 'live' as const,
+        charging: true,
+    }
+}
+
+/** Venda roteada: o checkout confere a conta usada com a que montou o formulário. */
+function withRouting<T extends Record<string, any>>(body: T, routed: { entry: { id: string }; provider: string } | null): T {
+    return routed ? { ...body, routing: { enabled: true, account_id: routed.entry.id, provider: routed.provider } } : body
 }
 
 function withOwnAccount<T extends Record<string, any>>(body: T, ownAccount: Record<string, any> | null): T {

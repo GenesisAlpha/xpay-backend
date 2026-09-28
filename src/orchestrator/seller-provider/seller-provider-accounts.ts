@@ -9,7 +9,8 @@
 // Ids no roteador/webhook, para o pipeline distinguir dos pools da Koopfy:
 //   • `stripel_<uuid>`  → conta Stripe do seller
 //   • `paypall_<uuid>`  → conta PayPal do seller
-//   (a Whop própria já é `whopl_<biz>`)
+//   • `whopa_<uuid>`    → conta Whop EXTRA do seller (roteamento de contas)
+//   (a Whop própria principal já é `whopl_<biz>`)
 //
 // Combinação (decisão do dono, 2026-09-28): Whop e Stripe cobram cartão e são
 // mutuamente exclusivas; PayPal combina com qualquer uma, porque só atende o
@@ -20,10 +21,15 @@ import { DEFAULT_LINKED_COMMISSION_PCT, isLinkedProviderAccountId } from '../who
 
 export type OwnProvider = 'whop' | 'stripe' | 'paypal';
 export type SellerProviderKind = 'stripe' | 'paypal';
+/** O que mora em seller_provider_accounts: Stripe, PayPal e as Whop extras. */
+export type SellerProviderRowKind = SellerProviderKind | 'whop';
 export type SellerProviderMode = 'live' | 'test';
 
 const STRIPE_PREFIX = 'stripel_';
 const PAYPAL_PREFIX = 'paypall_';
+// Whop EXTRA (roteamento ligado): a principal continua em whop_linked_accounts
+// como `whopl_<biz>`; as demais contas Whop do seller moram aqui.
+const WHOP_EXTRA_PREFIX = 'whopa_';
 
 export function toStripeOwnAccountId(rowId: string): string {
   return `${STRIPE_PREFIX}${rowId}`;
@@ -41,10 +47,25 @@ export function isPaypalOwnAccountId(id: string | null | undefined): boolean {
   return typeof id === 'string' && id.startsWith(PAYPAL_PREFIX);
 }
 
+export function toWhopExtraAccountId(rowId: string): string {
+  return `${WHOP_EXTRA_PREFIX}${rowId}`;
+}
+
+export function isWhopExtraAccountId(id: string | null | undefined): boolean {
+  return typeof id === 'string' && id.startsWith(WHOP_EXTRA_PREFIX);
+}
+
+/** Id do roteador de uma linha de seller_provider_accounts, pelo provedor dela. */
+export function ownAccountIdOfRow(row: Pick<SellerProviderAccountRow, 'id' | 'provider'>): string {
+  if (row.provider === 'whop') return toWhopExtraAccountId(row.id);
+  return row.provider === 'paypal' ? toPaypalOwnAccountId(row.id) : toStripeOwnAccountId(row.id);
+}
+
 /** Id da linha em seller_provider_accounts a partir do id do roteador. */
 export function rowIdFromOwnAccountId(id: string): string | null {
   if (isStripeOwnAccountId(id)) return id.slice(STRIPE_PREFIX.length);
   if (isPaypalOwnAccountId(id)) return id.slice(PAYPAL_PREFIX.length);
+  if (isWhopExtraAccountId(id)) return id.slice(WHOP_EXTRA_PREFIX.length);
   return null;
 }
 
@@ -53,19 +74,21 @@ export function rowIdFromOwnAccountId(id: string): string | null {
  * não entra na carteira da Koopfy: o dinheiro já está na conta dele.
  */
 export function isOwnProviderAccountId(id: string | null | undefined): boolean {
-  return isLinkedProviderAccountId(id) || isStripeOwnAccountId(id) || isPaypalOwnAccountId(id);
+  return isLinkedProviderAccountId(id) || isWhopExtraAccountId(id) || isStripeOwnAccountId(id) || isPaypalOwnAccountId(id);
 }
 
 export interface SellerProviderAccountRow {
   id: string;
   seller_id: string;
-  provider: SellerProviderKind;
-  status: 'active' | 'invalid' | 'disabled';
+  provider: SellerProviderRowKind;
+  status: 'active' | 'invalid' | 'disabled' | 'standby';
   mode: SellerProviderMode;
   account_ref: string | null;
   display_name: string | null;
   public_key: string | null;
   secret_enc: string | null;
+  /** Só Whop extra. */
+  api_url?: string | null;
   webhook_id: string | null;
   webhook_secret_enc: string | null;
   last_error: string | null;
@@ -79,6 +102,8 @@ export interface SellerProviderAccountRow {
 export function providerChargeBlocker(row: Pick<SellerProviderAccountRow, 'status' | 'secret_enc' | 'public_key' | 'last_error' | 'provider'> | null): string | null {
   if (!row) return 'seller sem conta própria conectada';
   if (row.status === 'disabled') return 'conexão desligada';
+  // Guardada: o seller desligou o roteamento e esta não é a conta que vale.
+  if (row.status === 'standby') return 'conta guardada (roteamento desligado)';
   if (row.status === 'invalid') {
     return `credencial recusada pelo provedor${row.last_error ? `: ${row.last_error}` : ''}`;
   }
@@ -192,11 +217,13 @@ export interface OwnProviderStatus {
   accountName: string | null;
   mode?: SellerProviderMode;
   attention: string | null;
+  /** Contas conectadas deste provedor (com o roteamento ligado podem ser várias). */
+  accounts?: number;
 }
 
 /** Stripe/PayPal no formato do painel — nunca credencial nem id interno. */
 export function sellerProviderStatusView(row: SellerProviderAccountRow | null): OwnProviderStatus | null {
-  if (!row || row.status === 'disabled') return null;
+  if (!row || row.status === 'disabled' || row.status === 'standby') return null;
   const connected = Boolean(row.secret_enc && row.public_key);
   const name = row.display_name
     ?? (row.provider === 'paypal' ? (row.mode === 'test' ? 'PayPal Sandbox' : 'PayPal') : row.account_ref)
@@ -282,6 +309,14 @@ export interface CombinedExternalProviderView extends Omit<WhopExternalView, 'pr
     stripe: OwnProviderStatus | null;
     paypal: OwnProviderStatus | null;
   };
+  /** Roteamento de contas: ligado? e a taxa em vigor (%). */
+  routing?: { enabled: boolean; feePct: number };
+}
+
+/** Contagem de contas conectadas por provedor + estado do roteamento. */
+export interface ExternalProviderExtras {
+  counts?: { whop: number; stripe: number; paypal: number };
+  routing?: { enabled: boolean; feePct: number };
 }
 
 /**
@@ -289,17 +324,31 @@ export interface CombinedExternalProviderView extends Omit<WhopExternalView, 'pr
  * continuam lá para painel antigo em cache; `connected`/`charging` passam a
  * valer para QUALQUER provedor, e `providers` traz o detalhe de cada um.
  * null quando o modo foi cortado no CRM (a opção some do painel).
+ *
+ * Com o roteamento, `providers.*.accounts` diz quantas contas daquele
+ * provedor estão conectadas e `routing` diz se está ligado e a taxa.
  */
 export function combineExternalProviderView(
   whop: WhopExternalView | null,
   rows: { stripe: SellerProviderAccountRow | null; paypal: SellerProviderAccountRow | null },
+  extras: ExternalProviderExtras = {},
 ): CombinedExternalProviderView | null {
   if (!whop) return null;
-  const whopStatus: OwnProviderStatus | null = whop.connected
+  const counts = extras.counts;
+  const withCount = (status: OwnProviderStatus | null, count: number | undefined): OwnProviderStatus | null => {
+    if (counts === undefined) return status;
+    if (status) return { ...status, accounts: Math.max(count ?? 0, status.connected ? 1 : 0) };
+    return null;
+  };
+  // Whop principal desconectada mas com extras (roteamento): continua "conectada".
+  const whopBase: OwnProviderStatus | null = whop.connected
     ? { connected: true, charging: whop.charging, accountName: whop.accountName, attention: whop.attention }
-    : null;
-  const stripe = sellerProviderStatusView(rows.stripe);
-  const paypal = sellerProviderStatusView(rows.paypal);
+    : counts?.whop
+      ? { connected: true, charging: true, accountName: null, attention: null }
+      : null;
+  const whopStatus = withCount(whopBase, counts?.whop);
+  const stripe = withCount(sellerProviderStatusView(rows.stripe), counts?.stripe);
+  const paypal = withCount(sellerProviderStatusView(rows.paypal), counts?.paypal);
   const all = [whopStatus, stripe, paypal];
 
   const main: OwnProvider = whopStatus?.connected ? 'whop'
@@ -316,5 +365,6 @@ export function combineExternalProviderView(
     accountName: mainStatus?.accountName ?? whop.accountName,
     attention: whop.attention ?? stripe?.attention ?? paypal?.attention ?? null,
     providers: { whop: whopStatus, stripe, paypal },
+    ...(extras.routing ? { routing: extras.routing } : {}),
   };
 }

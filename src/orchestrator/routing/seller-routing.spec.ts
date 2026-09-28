@@ -1,0 +1,336 @@
+// Regras puras do roteamento de contas: estratégias com entradas
+// determinísticas (métricas do dia e sorteio injetado), filtros, tetos,
+// pausas automáticas, breaker, taxa e o que fica valendo ao desligar.
+
+import {
+  BREAKER_COOLDOWN_MS,
+  MIN_SAMPLE,
+  NEUTRAL_SCORE,
+  RoutingCandidate,
+  activePause,
+  computeStats,
+  defaultAccountConfig,
+  disputeLimitExceeded,
+  emptyStats,
+  ineligibility,
+  isTechnicalFailure,
+  keptOnDisable,
+  ownAccountCommissionUsdCents,
+  ownProviderOfId,
+  parseAccountPatch,
+  scoreOf,
+  selectAccount,
+} from './seller-routing';
+
+type Partial2 = {
+  config?: Partial<RoutingCandidate['config']>;
+  stats?: Partial<RoutingCandidate['stats']>;
+  chargeable?: boolean;
+  breakerOpen?: boolean;
+};
+
+function acc(id: string, opts: Partial2 = {}): RoutingCandidate {
+  const provider = ownProviderOfId(id) ?? 'stripe';
+  return {
+    id,
+    provider,
+    config: { ...defaultAccountConfig(id, 's-1', provider), ...(opts.config ?? {}) },
+    stats: { ...emptyStats(), ...(opts.stats ?? {}) },
+    chargeable: opts.chargeable ?? true,
+    breakerOpen: opts.breakerOpen ?? false,
+  };
+}
+
+/** Roda N escolhas seguidas, somando cada venda ao dia da conta escolhida. */
+function simulate(strategy: any, accounts: RoutingCandidate[], n: number, amount = 1000, random = () => 0.5) {
+  const counts: Record<string, number> = {};
+  for (let i = 0; i < n; i++) {
+    const chosen = selectAccount(strategy, accounts.filter(a => ineligibility(a, { amountUsdCents: amount }, 0.75) === null), { amountUsdCents: amount }, random);
+    if (!chosen) break;
+    counts[chosen.id] = (counts[chosen.id] ?? 0) + 1;
+    chosen.stats.todayOrders += 1;
+    chosen.stats.todayUsdCents += amount;
+  }
+  return counts;
+}
+
+describe('estratégias', () => {
+  it('orders_split divide os PEDIDOS do dia pelo peso', () => {
+    const a = acc('stripel_a', { config: { weight: 70 } });
+    const b = acc('whopa_b', { config: { weight: 30 } });
+    expect(simulate('orders_split', [a, b], 100)).toEqual({ stripel_a: 70, whopa_b: 30 });
+  });
+
+  it('orders_split parte do déficit do dia (quem está atrás recebe)', () => {
+    const a = acc('stripel_a', { config: { weight: 50 }, stats: { todayOrders: 10 } });
+    const b = acc('stripel_b', { config: { weight: 50 }, stats: { todayOrders: 2 } });
+    expect(selectAccount('orders_split', [a, b], {})?.id).toBe('stripel_b');
+  });
+
+  it('peso 0 deixa a conta só de reserva', () => {
+    const a = acc('stripel_a', { config: { weight: 0 } });
+    const b = acc('stripel_b', { config: { weight: 10 } });
+    expect(simulate('orders_split', [a, b], 5)).toEqual({ stripel_b: 5 });
+  });
+
+  it('revenue_split divide o FATURAMENTO (USD), não a contagem', () => {
+    // A já faturou 900 hoje em uma venda; B, 100 em outra. Pesos iguais:
+    // a próxima venda de 500 vai para B (déficit de faturamento), mesmo com
+    // os dois empatados em pedidos.
+    const a = acc('stripel_a', { stats: { todayOrders: 1, todayUsdCents: 900 } });
+    const b = acc('stripel_b', { stats: { todayOrders: 1, todayUsdCents: 100 } });
+    expect(selectAccount('revenue_split', [a, b], { amountUsdCents: 500 })?.id).toBe('stripel_b');
+    expect(selectAccount('orders_split', [a, b], { amountUsdCents: 500 })?.id).toBe('stripel_a');
+
+    const c = acc('stripel_c', { config: { weight: 75 } });
+    const d = acc('stripel_d', { config: { weight: 25 } });
+    const counts = simulate('revenue_split', [c, d], 40, 2500);
+    expect(c.stats.todayUsdCents).toBe(75000);
+    expect(d.stats.todayUsdCents).toBe(25000);
+    expect(counts).toEqual({ stripel_c: 30, stripel_d: 10 });
+  });
+
+  it('priority_cap: cascata por prioridade, cada conta até o seu teto', () => {
+    const first = acc('whopl_biz_1', { config: { priority: 1, daily_cap_usd_cents: 3000 } });
+    const second = acc('stripel_2', { config: { priority: 2, daily_cap_orders: 2 } });
+    const third = acc('stripel_3', { config: { priority: 3 } });
+    // 1000 por venda: a primeira leva 3 (teto 3000), a segunda 2 (teto de pedidos), o resto vai para a terceira.
+    expect(simulate('priority_cap', [third, second, first], 7)).toEqual({ whopl_biz_1: 3, stripel_2: 2, stripel_3: 2 });
+  });
+
+  it('priority_cap: venda que não CABE no teto já vai para a próxima', () => {
+    const first = acc('stripel_1', { config: { priority: 1, daily_cap_usd_cents: 10000 }, stats: { todayUsdCents: 9500 } });
+    const second = acc('stripel_2', { config: { priority: 2 } });
+    const ctx = { amountUsdCents: 1000 };
+    const eligible = [first, second].filter(a => ineligibility(a, ctx, 0.75) === null);
+    expect(selectAccount('priority_cap', eligible, ctx)?.id).toBe('stripel_2');
+    // Venda pequena ainda cabe.
+    const small = { amountUsdCents: 400 };
+    expect(selectAccount('priority_cap', [first, second].filter(a => ineligibility(a, small, 0.75) === null), small)?.id).toBe('stripel_1');
+  });
+
+  it('score: proporcional ao score, não tudo para a melhor', () => {
+    const good = acc('stripel_good', { config: { priority: 1 }, stats: { score: 80 } });
+    const bad = acc('stripel_bad', { config: { priority: 2 }, stats: { score: 20 } });
+    // Bilhetes: [0, 80) → good, [80, 100) → bad.
+    expect(selectAccount('score', [good, bad], {}, () => 0.1)?.id).toBe('stripel_good');
+    expect(selectAccount('score', [good, bad], {}, () => 0.79)?.id).toBe('stripel_good');
+    expect(selectAccount('score', [good, bad], {}, () => 0.81)?.id).toBe('stripel_bad');
+
+    // Sorteio uniforme em 100 passos: 80/20.
+    let i = 0;
+    const counts = simulate('score', [good, bad], 100, 1000, () => (i++ % 100) / 100);
+    expect(counts).toEqual({ stripel_good: 80, stripel_bad: 20 });
+  });
+
+  it('sem conta elegível, nenhuma escolha', () => {
+    expect(selectAccount('orders_split', [], {})).toBeNull();
+  });
+});
+
+describe('score', () => {
+  it('prior neutro sem amostra mínima', () => {
+    expect(scoreOf({ approved7d: 5, failed7d: 2, disputes7d: 3 }, 0.75)).toBe(NEUTRAL_SCORE);
+  });
+
+  it('70% aprovação + 30% saúde de disputa', () => {
+    // 90% de aprovação e nenhuma disputa: 0,7×0,9 + 0,3×1 = 0,93.
+    expect(scoreOf({ approved7d: 90, failed7d: 10, disputes7d: 0 }, 0.75)).toBe(93);
+    // 100% de aprovação e 0,5% de disputa com limite 0,75%: saúde 1/3 → 0,7 + 0,1 = 80.
+    expect(scoreOf({ approved7d: 200, failed7d: 0, disputes7d: 1 }, 0.75)).toBe(80);
+    // Disputa acima do limite zera só a parte de disputa; nunca abaixo de 1.
+    expect(scoreOf({ approved7d: 20, failed7d: 0, disputes7d: 10 }, 0.75)).toBe(70);
+    expect(scoreOf({ approved7d: 0, failed7d: 40, disputes7d: 0 }, 0.75)).toBe(30);
+  });
+});
+
+describe('estatística de 7 dias', () => {
+  it('aprovadas, recusadas, faturamento, estornos e disputas (status ou metadata)', () => {
+    const stats = computeStats(
+      [
+        { provider_account_id: 'stripel_a', status: 'approved', amount_usd_gross_cents: 1000 },
+        { provider_account_id: 'stripel_a', status: 'approved', amount_usd_gross_cents: '500', stripe_dispute: { id: 'dp_1' } },
+        { provider_account_id: 'stripel_a', status: 'refunded', amount_usd_gross_cents: 300 },
+        { provider_account_id: 'stripel_a', status: 'chargeback', amount_usd_gross_cents: 200 },
+        { provider_account_id: 'stripel_a', status: 'failed', amount_usd_gross_cents: 999 },
+        { provider_account_id: 'stripel_a', status: 'pending', amount_usd_gross_cents: 999 },
+        { provider_account_id: 'outra', status: 'approved', amount_usd_gross_cents: 999 },
+      ],
+      ['stripel_a', 'stripel_b'],
+      new Map([['stripel_a', { volume: 1500, paidCount: 2 }]]),
+      0.75,
+    );
+    expect(stats.get('stripel_a')).toMatchObject({
+      orders7d: 6,
+      approved7d: 4,
+      failed7d: 1,
+      approvalRate: 0.8,
+      revenueUsdCents7d: 2000,
+      refunds7d: 1,
+      disputes7d: 2,
+      disputeRate: 0.5,
+      todayOrders: 2,
+      todayUsdCents: 1500,
+      score: NEUTRAL_SCORE,
+    });
+    expect(stats.get('stripel_b')).toMatchObject({ orders7d: 0, approvalRate: null, disputeRate: null });
+  });
+});
+
+describe('filtros e tetos', () => {
+  it('país, moeda e faixa de valor (USD)', () => {
+    const a = acc('stripel_a', {
+      config: { countries: ['BR', 'PT'], currencies: ['BRL'], min_ticket_usd_cents: 500, max_ticket_usd_cents: 50000 },
+    });
+    expect(ineligibility(a, { country: 'br', currency: 'brl', amountUsdCents: 1000 }, 0.75)).toBeNull();
+    expect(ineligibility(a, { country: 'US' }, 0.75)).toBe('country');
+    expect(ineligibility(a, { currency: 'USD' }, 0.75)).toBe('currency');
+    expect(ineligibility(a, { amountUsdCents: 100 }, 0.75)).toBe('ticket');
+    expect(ineligibility(a, { amountUsdCents: 60000 }, 0.75)).toBe('ticket');
+    // Na escolha da sessão o país/valor ainda podem ser desconhecidos: não barram.
+    expect(ineligibility(a, {}, 0.75)).toBeNull();
+  });
+
+  it('teto de pedidos e de USD do dia', () => {
+    const orders = acc('stripel_a', { config: { daily_cap_orders: 3 }, stats: { todayOrders: 3 } });
+    expect(ineligibility(orders, {}, 0.75)).toBe('cap_orders');
+    const usd = acc('stripel_b', { config: { daily_cap_usd_cents: 10000 }, stats: { todayUsdCents: 10000 } });
+    expect(ineligibility(usd, {}, 0.75)).toBe('cap_usd');
+    // O mesmo pedido (sticky) ignora o teto: recusa + nova tentativa não troca de conta.
+    expect(ineligibility(usd, {}, 0.75, { ignoreCaps: true })).toBeNull();
+  });
+
+  it('conta sem credencial pronta não recebe', () => {
+    expect(ineligibility(acc('stripel_a', { chargeable: false }), {}, 0.75)).toBe('not_chargeable');
+  });
+});
+
+describe('pausas', () => {
+  it('manual', () => {
+    const a = acc('stripel_a', { config: { paused_at: '2026-09-28T10:00:00Z', pause_reason: 'manual' } });
+    expect(ineligibility(a, {}, 0.75)).toBe('paused_manual');
+  });
+
+  it('disputas acima do limite pausam só com a amostra mínima de aprovadas', () => {
+    const small = acc('stripel_a', { stats: { approved7d: MIN_SAMPLE - 1, disputes7d: 5 } });
+    expect(disputeLimitExceeded(small.stats, 0.75)).toBe(false);
+    expect(ineligibility(small, {}, 0.75)).toBeNull();
+
+    const sample = acc('stripel_b', { stats: { approved7d: MIN_SAMPLE, disputes7d: 1 } }); // 5%
+    expect(ineligibility(sample, {}, 0.75)).toBe('paused_disputes');
+    // O limite é por seller (CRM): com 6%, 5% passa.
+    expect(ineligibility(sample, {}, 6)).toBeNull();
+    // Exatamente no limite não pausa (só ACIMA).
+    expect(disputeLimitExceeded({ approved7d: 400, disputes7d: 3 }, 0.75)).toBe(false);
+    expect(disputeLimitExceeded({ approved7d: 400, disputes7d: 4 }, 0.75)).toBe(true);
+  });
+
+  it('breaker: aberto em memória ou pausa gravada dentro do cooldown; volta sozinha', () => {
+    const now = Date.parse('2026-09-28T12:00:00Z');
+    expect(ineligibility(acc('stripel_a', { breakerOpen: true }), {}, 0.75, { now })).toBe('paused_errors');
+
+    const recent = acc('stripel_b', { config: { paused_at: new Date(now - 60_000).toISOString(), pause_reason: 'errors' } });
+    expect(activePause(recent, 0.75, now)).toBe('errors');
+    const old = acc('stripel_c', { config: { paused_at: new Date(now - BREAKER_COOLDOWN_MS - 1).toISOString(), pause_reason: 'errors' } });
+    expect(activePause(old, 0.75, now)).toBeNull();
+  });
+});
+
+describe('falha técnica × recusa (breaker)', () => {
+  it('quem classifica manda', () => {
+    expect(isTechnicalFailure({ data: { accountLevel: true } })).toBe(true);
+    expect(isTechnicalFailure({ data: { accountLevel: false } })).toBe(false);
+  });
+
+  it('recusa do cartão na Whop não é técnica', () => {
+    expect(isTechnicalFailure({ failureCode: 'insufficient_funds', providerTransactionId: 'pay_1', data: { decline_code: 'insufficient_funds' } })).toBe(false);
+    expect(isTechnicalFailure({ failureMessage: 'Pagamento recusado.', data: { decline_code: 'do_not_honor' } })).toBe(false);
+  });
+
+  it('HTTP 5xx, 401/403, 429 e timeout são técnicos; 400 comum não', () => {
+    expect(isTechnicalFailure({ failureMessage: 'Whop HTTP 503', data: {} })).toBe(true);
+    expect(isTechnicalFailure({ failureMessage: 'x', data: { http_status: 401 } })).toBe(true);
+    expect(isTechnicalFailure({ failureMessage: 'TIMEOUT_10000ms' })).toBe(true);
+    expect(isTechnicalFailure({ failureMessage: 'Whop HTTP 400', data: {} })).toBe(false);
+  });
+});
+
+describe('taxa de roteamento', () => {
+  it('comissão = bruto × (commission_pct + routing_fee_pct)', () => {
+    expect(ownAccountCommissionUsdCents(10000, 3, 0.8)).toBe(380);
+    expect(ownAccountCommissionUsdCents(12345, 5, 0.8)).toBe(Math.round((12345 * 5.8) / 100));
+  });
+
+  it('desligado (taxa 0) dá exatamente o valor de antes', () => {
+    for (const gross of [0, 1, 99, 12345, 999999]) {
+      for (const pct of [0, 3, 4.5]) {
+        expect(ownAccountCommissionUsdCents(gross, pct, 0)).toBe(Math.round((gross * pct) / 100));
+      }
+    }
+  });
+});
+
+describe('desligar o roteamento', () => {
+  it('fica a de maior prioridade de cada provedor, e só uma entre Whop e Stripe', () => {
+    const kept = keptOnDisable([
+      { id: 'whopl_biz_1', provider: 'whop', priority: 5 },
+      { id: 'whopa_x', provider: 'whop', priority: 1 },
+      { id: 'stripel_a', provider: 'stripe', priority: 2 },
+      { id: 'stripel_b', provider: 'stripe', priority: 9 },
+      { id: 'paypall_a', provider: 'paypal', priority: 50 },
+      { id: 'paypall_b', provider: 'paypal', priority: 3 },
+    ]);
+    // Whop extra nunca fica (fora do roteamento a Whop é a principal).
+    expect([...kept].sort()).toEqual(['paypall_b', 'stripel_a']);
+  });
+});
+
+describe('edição da conta', () => {
+  const base = defaultAccountConfig('stripel_a', 's-1', 'stripe');
+
+  it('normaliza e valida os campos', () => {
+    const patch = parseAccountPatch(
+      { label: ' Stripe EUA ', weight: 60, priority: 2, dailyCapUsdCents: 500000, countries: 'us, br', currencies: ['usd'], paused: true },
+      base,
+      '2026-09-28T12:00:00Z',
+    );
+    expect(patch).toEqual({
+      label: 'Stripe EUA',
+      weight: 60,
+      priority: 2,
+      daily_cap_usd_cents: 500000,
+      countries: ['US', 'BR'],
+      currencies: ['USD'],
+      paused_at: '2026-09-28T12:00:00Z',
+      pause_reason: 'manual',
+    });
+    expect(parseAccountPatch({ paused: false, dailyCapOrders: null }, base, 'x')).toEqual({ paused_at: null, pause_reason: null, daily_cap_orders: null });
+  });
+
+  it('recusa valor inválido e faixa invertida', () => {
+    expect(() => parseAccountPatch({ weight: -1 }, base, 'x')).toThrow('weight');
+    expect(() => parseAccountPatch({ priority: 0 }, base, 'x')).toThrow('priority');
+    expect(() => parseAccountPatch({ minTicketUsdCents: 900, maxTicketUsdCents: 100 }, base, 'x')).toThrow('invertida');
+    expect(() => parseAccountPatch({ countries: ['BRA'] }, base, 'x')).toThrow('País');
+  });
+});
+
+describe('status.externalProvider com o roteamento', () => {
+  it('ganha routing { enabled, feePct } e providers.*.accounts', () => {
+    const { combineExternalProviderView } = require('../seller-provider/seller-provider-accounts');
+    const whop = { allowed: true, connected: true, provider: 'whop', accountName: 'Loja', commissionPct: 3, charging: true, walletReady: true, attention: null };
+    const stripe = { id: 'x', seller_id: 's-1', provider: 'stripe', status: 'active', mode: 'live', account_ref: 'acct_1', display_name: 'Stripe', public_key: 'pk', secret_enc: 's' };
+    const view = combineExternalProviderView(whop, { stripe, paypal: null }, {
+      counts: { whop: 3, stripe: 5, paypal: 0 },
+      routing: { enabled: true, feePct: 0.8 },
+    });
+    expect(view.routing).toEqual({ enabled: true, feePct: 0.8 });
+    expect(view.providers.whop.accounts).toBe(3);
+    expect(view.providers.stripe.accounts).toBe(5);
+    expect(view.providers.paypal).toBeNull();
+    // Sem extras (chamada antiga): o formato de antes, sem `routing` nem `accounts`.
+    const legacy = combineExternalProviderView(whop, { stripe, paypal: null });
+    expect(legacy.routing).toBeUndefined();
+    expect(legacy.providers.stripe.accounts).toBeUndefined();
+  });
+});

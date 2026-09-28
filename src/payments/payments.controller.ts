@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post, Req, UseGuards, Headers, Param, HttpCode, HttpStatus } from '@nestjs/common';
+import { Body, Controller, Get, Post, Query, Req, UseGuards, Headers, Param, HttpCode, HttpStatus } from '@nestjs/common';
 import { PaymentService } from './payments.service';
 import { CreatePaymentDto } from './create-payment.dto';
 import { CreateMbwayDto } from './create-mbway.dto';
@@ -72,10 +72,19 @@ export class PaymentController {
 
   // Config de pagamento do seller p/ o checkout do comprador (fluxo unificado).
   // Autenticado com a sk_live_ do seller (o checkout guarda essa key na ativação).
+  //
+  // Roteamento de contas: `?routingKey=<id da checkout session>` escolhe (ou
+  // reaproveita) a conta desta sessão e devolve a credencial pública dela +
+  // `routing`. `country`/`currency` opcionais aplicam os filtros das contas.
   @Get('config')
   @UseGuards(ApiKeyGuard)
-  async getConfig(@Req() req: Request) {
-    return this.paymentService.getPaymentConfig(req.sellerId as string);
+  async getConfig(
+    @Req() req: Request,
+    @Query('routingKey') routingKey?: string,
+    @Query('country') country?: string,
+    @Query('currency') currency?: string,
+  ) {
+    return this.paymentService.getPaymentConfig(req.sellerId as string, { routingKey, country, currency });
   }
 
   // Reserva a conta Clip ANTES de o formulário de cartão ser montado.

@@ -17,6 +17,7 @@ import {
   isOwnProviderAccountId,
   isPaypalOwnAccountId,
   isStripeOwnAccountId,
+  isWhopExtraAccountId,
   toPaypalValue,
 } from '../orchestrator/seller-provider/seller-provider-accounts'
 import { SellerProviderAccountsService } from '../orchestrator/seller-provider/seller-provider-accounts.service'
@@ -845,7 +846,8 @@ export class WebhookService {
     // Conta própria do seller: o webhook dela traz TODAS as vendas dele,
     // inclusive as que não passaram pela Koopfy. Sem transação nossa, ignora —
     // reentregar para sempre um evento que não é nosso só gera ruído.
-    if (!tx && isLinkedProviderAccountId(accountId)) {
+    // (Vale também para as Whop extras do roteamento, `whopa_…`.)
+    if (!tx && (isLinkedProviderAccountId(accountId) || isWhopExtraAccountId(accountId))) {
       return { ignored: true, reason: 'venda fora da Koopfy' }
     }
     if (!tx) {

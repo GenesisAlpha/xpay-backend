@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException, Optional } from '@nestjs/common';
 import { supabase } from '../../lib/supabase.client';
 import { CryptoService } from '../../crypto/crypto.service';
 import { ProviderAccountConfig } from '../provider-accounts.config';
@@ -16,11 +16,13 @@ import {
   toLinkedProviderAccountId,
   whopAccountIdFromLinkedProviderAccountId,
 } from './whop-linked';
-import { ownProviderConflict } from '../seller-provider/seller-provider-accounts';
+import { ownProviderConflict, toWhopExtraAccountId } from '../seller-provider/seller-provider-accounts';
 import {
+  SellerProviderAccountsService,
   sellerChargesOnAnyOwnAccount,
   sellerHasOwnStripe,
 } from '../seller-provider/seller-provider-accounts.service';
+import { saveRoutingLabel, sellerRoutingEnabled } from '../routing/routing-store';
 
 // ============================================================================
 // CONTA WHOP PRÓPRIA DO SELLER (modo conexão)
@@ -69,7 +71,12 @@ export const WALLET_SCOPES = [
 
 @Injectable()
 export class WhopLinkedAccountsService {
-  constructor(private readonly crypto: CryptoService) {}
+  constructor(
+    private readonly crypto: CryptoService,
+    // Contas Whop EXTRAS (roteamento ligado) moram em seller_provider_accounts.
+    // Opcional só para os testes que montam o serviço à mão.
+    @Optional() private readonly sellerProviders?: SellerProviderAccountsService,
+  ) {}
 
   private cache = new Map<string, { row: WhopLinkedAccountRow | null; at: number }>();
 
@@ -368,7 +375,7 @@ export class WhopLinkedAccountsService {
    * Liga a conta do seller: valida a chave contra a Whop (quem é a company),
    * recusa conta que já é filha da Koopfy ou de outro seller, e guarda cifrada.
    */
-  async connect(sellerId: string, apiKey: string, actor: string | null = null) {
+  async connect(sellerId: string, apiKey: string, actor: string | null = null, opts: { label?: string | null } = {}) {
     const key = String(apiKey ?? '').trim();
     if (!key) throw new BadRequestException('Informe a chave de API da sua conta Whop.');
 
@@ -384,9 +391,14 @@ export class WhopLinkedAccountsService {
       if (!current) throw new BadRequestException('Não foi possível preparar a conexão agora. Tente de novo.');
     }
 
-    // Whop e Stripe cobram cartão: só uma conta própria de cartão por vez.
-    const conflict = ownProviderConflict('whop', { whop: false, stripe: await sellerHasOwnStripe(sellerId) });
-    if (conflict) throw new ConflictException(conflict);
+    // Roteamento ligado: Whop e Stripe convivem, e uma Whop além da principal
+    // vira conta EXTRA (`whopa_…`). Desligado: só uma conta própria de cartão.
+    const routing = await sellerRoutingEnabled(sellerId);
+    if (!routing) {
+      // Whop e Stripe cobram cartão: só uma conta própria de cartão por vez.
+      const conflict = ownProviderConflict('whop', { whop: false, stripe: await sellerHasOwnStripe(sellerId) });
+      if (conflict) throw new ConflictException(conflict);
+    }
 
     const company = await this.readCompany(key);
     if (!company.id.startsWith('biz_')) {
@@ -400,6 +412,15 @@ export class WhopLinkedAccountsService {
       .maybeSingle();
     if (child) {
       throw new ConflictException('Esta conta já é uma conta conectada criada pela Koopfy.');
+    }
+
+    // Já tem a principal conectada e esta chave é de OUTRA company: com o
+    // roteamento, entra como conta extra — a principal (carteira, saque,
+    // vendas antigas) continua intacta.
+    const principalConnected = Boolean(current.whop_account_id && current.api_key)
+      && (current.status === 'active' || current.status === 'invalid');
+    if (routing && principalConnected && current.whop_account_id !== company.id) {
+      return this.connectExtra(sellerId, key, company, actor, opts.label ?? null);
     }
 
     const { data: other } = await supabase
@@ -459,10 +480,64 @@ export class WhopLinkedAccountsService {
     }
 
     this.cache.delete(sellerId);
+    await saveRoutingLabel({ sellerId, accountId, provider: 'whop', label: opts.label });
     await this.prepareExternalOnlySeller(sellerId);
     await this.log(sellerId, actor, 'whop_linked.connected', {
       whop_account_id: company.id,
       company_title: company.title,
+      webhook_id: webhook.id,
+    });
+    return this.publicView(await this.getRow(sellerId));
+  }
+
+  /**
+   * Conta Whop EXTRA (roteamento ligado): mesma validação e mesmo webhook da
+   * principal, apontando para `/webhook/whop/whopa_<id>` com o segredo dela.
+   * A mesma company não entra duas vezes (nem como principal de outro seller).
+   */
+  private async connectExtra(
+    sellerId: string,
+    key: string,
+    company: { id: string; title: string | null; apiUrl: string },
+    actor: string | null,
+    label: string | null,
+  ) {
+    if (!this.sellerProviders) throw new BadRequestException('Contas extras indisponíveis agora. Tente de novo.');
+
+    const { data: otherPrincipal } = await supabase
+      .from(TABLE)
+      .select('seller_id')
+      .eq('whop_account_id', company.id)
+      .neq('seller_id', sellerId)
+      .maybeSingle();
+    if (otherPrincipal) throw new ConflictException('Esta conta Whop já está conectada em outra conta Koopfy.');
+    await this.sellerProviders.assertNotTakenByOther(
+      sellerId, 'whop', company.id, 'Esta conta Whop já está conectada em outra conta Koopfy.',
+    );
+
+    // Reconexão da mesma company reaproveita a linha (id do roteador e webhook).
+    const existing = (await this.sellerProviders.listRows(sellerId))
+      .find(row => row.provider === 'whop' && row.account_ref === company.id);
+    const rowId = existing?.id ?? randomUUID();
+    const accountId = toWhopExtraAccountId(rowId);
+    const webhook = await this.registerWebhook(key, company.apiUrl, company.id, accountId);
+
+    await this.sellerProviders.saveWhopExtra(sellerId, {
+      id: rowId,
+      account_ref: company.id,
+      display_name: company.title ? String(company.title).slice(0, 120) : null,
+      // O biz_ é público (o Whop Elements monta com ele no navegador).
+      public_key: company.id,
+      secret_enc: this.crypto.encrypt(key),
+      api_url: company.apiUrl,
+      webhook_id: webhook.id,
+      webhook_secret_enc: webhook.secret ? this.crypto.encrypt(webhook.secret) : null,
+    }, actor);
+    await saveRoutingLabel({ sellerId, accountId, provider: 'whop', label });
+
+    await this.log(sellerId, actor, 'whop_linked.extra_connected', {
+      account_id: accountId,
+      whop_account_id: company.id,
       webhook_id: webhook.id,
     });
     return this.publicView(await this.getRow(sellerId));

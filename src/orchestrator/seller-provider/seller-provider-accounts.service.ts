@@ -13,19 +13,24 @@ import {
   paypalCall,
   paypalTokens,
 } from '../paypal/paypal-api';
+import { saveRoutingLabel, sellerRoutingEnabled } from '../routing/routing-store';
 import {
   OwnProvider,
   SellerProviderAccountRow,
   SellerProviderKind,
+  SellerProviderRowKind,
   chooseOwnSaleProvider,
   isPaypalOwnAccountId,
   isStripeOwnAccountId,
+  isWhopExtraAccountId,
   normalizeCommissionPct,
+  ownAccountIdOfRow,
   ownProviderConflict,
   providerChargeBlocker,
   rowIdFromOwnAccountId,
   toPaypalOwnAccountId,
   toStripeOwnAccountId,
+  toWhopExtraAccountId,
   validatePaypalCredentials,
   validateStripeKeys,
 } from './seller-provider-accounts';
@@ -44,6 +49,8 @@ const TABLE = 'seller_provider_accounts';
 const LINKED_TABLE = 'whop_linked_accounts';
 
 const STRIPE_API_URL = 'https://api.stripe.com';
+// Duplicado de whop-accounts.service de propósito (ciclo de import, ver whop-linked.service).
+const WHOP_API_URL = 'https://api.whop.com';
 
 /** Eventos do webhook criado na conta Stripe do seller. */
 export const STRIPE_OWN_WEBHOOK_EVENTS = [
@@ -68,7 +75,7 @@ function payPublicUrl(): string {
 }
 
 export function ownAccountWebhookUrl(accountId: string): string {
-  const kind = isPaypalOwnAccountId(accountId) ? 'paypal' : 'stripe';
+  const kind = isPaypalOwnAccountId(accountId) ? 'paypal' : isWhopExtraAccountId(accountId) ? 'whop' : 'stripe';
   return `${payPublicUrl()}/webhook/${kind}/${accountId}`;
 }
 
@@ -83,7 +90,14 @@ export class SellerProviderAccountsService {
   paypalTokenCache: PaypalTokenCache = paypalTokens;
 
   private cache = new Map<string, { row: SellerProviderAccountRow | null; at: number }>();
+  private listCache = new Map<string, { rows: SellerProviderAccountRow[]; at: number }>();
 
+  /**
+   * A conta "que vale" do provedor — a única com o roteamento desligado.
+   * Com o roteamento há várias linhas por provedor: vale a ativa, depois a
+   * de chave recusada (o painel precisa avisar), depois guardada/desligada
+   * (a reconexão reaproveita o id e o webhook de vendas antigas continua).
+   */
   async getRow(sellerId: string, provider: SellerProviderKind): Promise<SellerProviderAccountRow | null> {
     const key = `${sellerId}:${provider}`;
     const cached = this.cache.get(key);
@@ -93,20 +107,39 @@ export class SellerProviderAccountsService {
       .from(TABLE)
       .select('*')
       .eq('seller_id', sellerId)
-      .eq('provider', provider)
-      .maybeSingle();
+      .eq('provider', provider);
     if (error) {
       // Tabela ausente (migration pendente) não pode derrubar a cobrança.
       console.error('[SellerProviders] leitura da conta:', error.message);
       return null;
     }
-    const row = (data as SellerProviderAccountRow) ?? null;
+    const row = primaryRow((Array.isArray(data) ? data : []) as SellerProviderAccountRow[]);
     this.cache.set(key, { row, at: Date.now() });
     return row;
   }
 
-  private forget(sellerId: string, provider: SellerProviderKind) {
-    this.cache.delete(`${sellerId}:${provider}`);
+  /** Todas as contas do seller aqui (Stripe, PayPal e Whop extras), inclusive desligadas. */
+  async listRows(sellerId: string): Promise<SellerProviderAccountRow[]> {
+    const cached = this.listCache.get(sellerId);
+    if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.rows;
+    const { data, error } = await supabase.from(TABLE).select('*').eq('seller_id', sellerId);
+    if (error) {
+      console.error('[SellerProviders] leitura das contas:', error.message);
+      return [];
+    }
+    const rows = (Array.isArray(data) ? data : []) as SellerProviderAccountRow[];
+    this.listCache.set(sellerId, { rows, at: Date.now() });
+    return rows;
+  }
+
+  forgetSeller(sellerId: string) {
+    this.cache.delete(`${sellerId}:stripe`);
+    this.cache.delete(`${sellerId}:paypal`);
+    this.listCache.delete(sellerId);
+  }
+
+  private forget(sellerId: string, _provider?: SellerProviderRowKind) {
+    this.forgetSeller(sellerId);
   }
 
   async getRowById(rowId: string): Promise<SellerProviderAccountRow | null> {
@@ -126,6 +159,14 @@ export class SellerProviderAccountsService {
     return { stripe, paypal };
   }
 
+  /** Quantas contas conectadas (ativas ou com chave recusada) por provedor aqui. */
+  async connectedCounts(sellerId: string): Promise<{ whop: number; stripe: number; paypal: number }> {
+    const rows = await this.listRows(sellerId);
+    const count = (provider: SellerProviderRowKind) =>
+      rows.filter(row => row.provider === provider && (row.status === 'active' || row.status === 'invalid')).length;
+    return { whop: count('whop'), stripe: count('stripe'), paypal: count('paypal') };
+  }
+
   // ─── Conectar ──────────────────────────────────────────────────────────
 
   /**
@@ -133,7 +174,11 @@ export class SellerProviderAccountsService {
    * chave (GET /v1/account), recusa conta da Koopfy ou de outro seller, cria o
    * webhook na conta dele e guarda tudo cifrado.
    */
-  async connectStripe(sellerId: string, input: { secretKey?: string; publishableKey?: string }, actor: string | null = null) {
+  async connectStripe(
+    sellerId: string,
+    input: { secretKey?: string; publishableKey?: string; label?: string | null },
+    actor: string | null = null,
+  ) {
     let mode: 'live' | 'test';
     try {
       mode = validateStripeKeys(String(input?.secretKey ?? ''), String(input?.publishableKey ?? '')).mode;
@@ -143,7 +188,10 @@ export class SellerProviderAccountsService {
     const secretKey = String(input.secretKey).trim();
     const publishableKey = String(input.publishableKey).trim();
 
-    await this.assertMayConnect(sellerId, 'stripe');
+    // Roteamento ligado: Whop e Stripe convivem (o roteador escolhe por
+    // sessão) e cada conexão ADICIONA uma conta em vez de trocar a atual.
+    const routing = await sellerRoutingEnabled(sellerId);
+    await this.assertMayConnect(sellerId, 'stripe', { routing });
 
     const account = await this.stripeRequest(secretKey, 'GET', '/v1/account').catch((err: any) => {
       if (err?.httpStatus === 401 || err?.httpStatus === 403) {
@@ -167,8 +215,7 @@ export class SellerProviderAccountsService {
 
     await this.assertNotTakenByOther(sellerId, 'stripe', accountRef, 'Esta conta Stripe já está conectada em outra conta Koopfy.');
 
-    const current = await this.getRow(sellerId, 'stripe');
-    const rowId = current?.id ?? randomUUID();
+    const rowId = await this.rowIdForConnection(sellerId, 'stripe', routing, row => row.account_ref === accountRef);
     const accountId = toStripeOwnAccountId(rowId);
     const webhook = await this.registerStripeWebhook(secretKey, accountId);
 
@@ -186,11 +233,12 @@ export class SellerProviderAccountsService {
       secret_enc: this.crypto.encrypt(secretKey),
       webhook_id: webhook.id,
       webhook_secret_enc: webhook.secret ? this.crypto.encrypt(webhook.secret) : null,
-    }, actor);
+    }, actor, { routing });
+    await saveRoutingLabel({ sellerId, accountId, provider: 'stripe', label: input?.label });
 
     await this.prepareExternalOnlySeller(sellerId, STRIPE_DEFAULT_METHODS);
-    await this.log(sellerId, actor, 'seller_provider.stripe_connected', { account_ref: accountRef, mode, webhook_id: webhook.id });
-    return this.getRow(sellerId, 'stripe');
+    await this.log(sellerId, actor, 'seller_provider.stripe_connected', { account_ref: accountRef, mode, webhook_id: webhook.id, routing });
+    return routing ? this.getRowById(rowId) : this.getRow(sellerId, 'stripe');
   }
 
   /**
@@ -199,7 +247,7 @@ export class SellerProviderAccountsService {
    */
   async connectPaypal(
     sellerId: string,
-    input: { clientId?: string; clientSecret?: string; mode?: string },
+    input: { clientId?: string; clientSecret?: string; mode?: string; label?: string | null },
     actor: string | null = null,
   ) {
     let creds: { clientId: string; clientSecret: string; mode: 'live' | 'test' };
@@ -209,11 +257,11 @@ export class SellerProviderAccountsService {
       throw new BadRequestException(err.message);
     }
 
-    await this.assertMayConnect(sellerId, 'paypal');
+    const routing = await sellerRoutingEnabled(sellerId);
+    await this.assertMayConnect(sellerId, 'paypal', { routing });
     await this.assertNotTakenByOther(sellerId, 'paypal', null, 'Este app do PayPal já está conectado em outra conta Koopfy.', creds.clientId);
 
-    const current = await this.getRow(sellerId, 'paypal');
-    const rowId = current?.id ?? randomUUID();
+    const rowId = await this.rowIdForConnection(sellerId, 'paypal', routing, row => row.public_key === creds.clientId);
     const accountId = toPaypalOwnAccountId(rowId);
     const paypal: PaypalCredentials = { cacheKey: accountId, ...creds };
 
@@ -241,11 +289,32 @@ export class SellerProviderAccountsService {
       secret_enc: this.crypto.encrypt(creds.clientSecret),
       webhook_id: webhookId,
       webhook_secret_enc: null,
-    }, actor);
+    }, actor, { routing });
+    await saveRoutingLabel({ sellerId, accountId, provider: 'paypal', label: input?.label });
 
     await this.prepareExternalOnlySeller(sellerId, []);
-    await this.log(sellerId, actor, 'seller_provider.paypal_connected', { app_id: appId, mode: creds.mode, webhook_id: webhookId });
-    return this.getRow(sellerId, 'paypal');
+    await this.log(sellerId, actor, 'seller_provider.paypal_connected', { app_id: appId, mode: creds.mode, webhook_id: webhookId, routing });
+    return routing ? this.getRowById(rowId) : this.getRow(sellerId, 'paypal');
+  }
+
+  /**
+   * Id da linha que a conexão vai ocupar. A mesma conta externa (mesmo
+   * acct_/client id) sempre volta para a linha dela — é o que mantém o id do
+   * roteador e o webhook das vendas antigas. Fora isso: com o roteamento
+   * ligado é uma conta NOVA; desligado, troca a conta que vale hoje (como
+   * sempre foi — uma por provedor).
+   */
+  private async rowIdForConnection(
+    sellerId: string,
+    provider: SellerProviderKind,
+    routing: boolean,
+    sameAccount: (row: SellerProviderAccountRow) => boolean,
+  ): Promise<string> {
+    const rows = (await this.listRows(sellerId)).filter(row => row.provider === provider);
+    const same = rows.find(sameAccount);
+    if (same) return same.id;
+    if (routing) return randomUUID();
+    return (await this.getRow(sellerId, provider))?.id ?? randomUUID();
   }
 
   /**
@@ -258,13 +327,32 @@ export class SellerProviderAccountsService {
     if (!row || row.status === 'disabled') {
       throw new NotFoundException(`Nenhuma conta ${provider === 'stripe' ? 'Stripe' : 'PayPal'} conectada.`);
     }
+    await this.disableRow(row, actor);
+    return this.getRow(sellerId, provider);
+  }
 
+  /**
+   * Desliga UMA conta específica (`stripel_…`, `paypall_…` ou `whopa_…`) —
+   * com o roteamento o seller tem várias do mesmo provedor. Conta de outro
+   * seller responde "não encontrada", nunca "proibido": não confirma que o id existe.
+   */
+  async disconnectById(sellerId: string, accountId: string, actor: string | null = null) {
+    const rowId = rowIdFromOwnAccountId(accountId);
+    const row = rowId ? await this.getRowById(rowId) : null;
+    if (!row || row.seller_id !== sellerId || row.status === 'disabled' || ownAccountIdOfRow(row) !== accountId) {
+      throw new NotFoundException('Conta não encontrada ou já desconectada.');
+    }
+    await this.disableRow(row, actor);
+    return { id: accountId, disconnected: true };
+  }
+
+  private async disableRow(row: SellerProviderAccountRow, actor: string | null) {
     const secret = this.decryptOrNull(row.secret_enc);
     if (secret && row.webhook_id) {
       try {
-        if (provider === 'stripe') {
+        if (row.provider === 'stripe') {
           await this.stripeRequest(secret, 'DELETE', `/v1/webhook_endpoints/${encodeURIComponent(row.webhook_id)}`);
-        } else {
+        } else if (row.provider === 'paypal') {
           await paypalCall(
             this.paypalCredsOf(row, secret),
             'DELETE',
@@ -274,9 +362,14 @@ export class SellerProviderAccountsService {
             this.paypalTokenCache,
             this.fetchImpl,
           );
+        } else {
+          await this.fetchImpl(`${row.api_url ?? WHOP_API_URL}/api/v1/webhooks/${encodeURIComponent(row.webhook_id)}`, {
+            method: 'DELETE',
+            headers: { Authorization: `Bearer ${secret}`, Accept: 'application/json' },
+          });
         }
       } catch (err: any) {
-        console.error(`[SellerProviders] webhook ${provider} de ${sellerId} não removido:`, err?.message);
+        console.error(`[SellerProviders] webhook ${row.provider} de ${row.seller_id} não removido:`, err?.message);
       }
     }
 
@@ -286,14 +379,43 @@ export class SellerProviderAccountsService {
       .eq('id', row.id);
     if (error) throw new BadRequestException(`Não foi possível desligar a conexão: ${error.message}`);
 
-    this.forget(sellerId, provider);
-    await this.log(sellerId, actor, `seller_provider.${provider}_disconnected`, {});
-    return this.getRow(sellerId, provider);
+    this.forget(row.seller_id, row.provider);
+    await this.log(row.seller_id, actor, `seller_provider.${row.provider}_disconnected`, { account_id: ownAccountIdOfRow(row) });
+  }
+
+  /**
+   * Com o roteamento desligado vale uma conta por provedor: ao conectar (ou
+   * reconectar) uma, as outras ativas do mesmo provedor vão para 'standby'
+   * (guardadas — voltam quando o roteamento for ligado de novo).
+   */
+  private async standbyOthers(sellerId: string, provider: SellerProviderRowKind, keepId: string) {
+    const others = (await this.listRows(sellerId))
+      .filter(row => row.provider === provider && row.id !== keepId && (row.status === 'active' || row.status === 'invalid'));
+    for (const row of others) {
+      const { error } = await supabase
+        .from(TABLE)
+        .update({ status: 'standby', updated_at: new Date().toISOString() })
+        .eq('id', row.id);
+      if (error) console.error(`[SellerProviders] conta ${row.id} não guardada:`, error.message);
+    }
+    if (others.length) this.forgetSeller(sellerId);
+  }
+
+  /** Muda o status de várias linhas (ligar/desligar o roteamento). */
+  async setRowsStatus(sellerId: string, ids: string[], status: 'active' | 'standby') {
+    for (const id of ids) {
+      const { error } = await supabase
+        .from(TABLE)
+        .update({ status, updated_at: new Date().toISOString() })
+        .eq('id', id);
+      if (error) console.error(`[SellerProviders] status ${status} da conta ${id}:`, error.message);
+    }
+    this.forgetSeller(sellerId);
   }
 
   // ─── Roteador ──────────────────────────────────────────────────────────
 
-  /** Conta do roteador (`stripel_…`/`paypall_…`), SEM filtro de status: webhook de conta desligada ainda chega. */
+  /** Conta do roteador (`stripel_…`/`paypall_…`/`whopa_…`), SEM filtro de status: webhook de conta desligada ainda chega. */
   async getProviderAccountById(id: string): Promise<ProviderAccountConfig | null> {
     const rowId = rowIdFromOwnAccountId(id);
     if (!rowId) return null;
@@ -301,9 +423,7 @@ export class SellerProviderAccountsService {
     if (!row) return null;
     // Prefixo e provedor da linha têm que bater: `stripel_` de uma linha PayPal
     // seria a conta errada validando o evento.
-    if ((isStripeOwnAccountId(id) && row.provider !== 'stripe') || (isPaypalOwnAccountId(id) && row.provider !== 'paypal')) {
-      return null;
-    }
+    if (ownAccountIdOfRow(row) !== id) return null;
     return this.toProviderAccount(row);
   }
 
@@ -314,10 +434,37 @@ export class SellerProviderAccountsService {
     return this.toProviderAccount(row);
   }
 
+  /** Conta de uma linha já lida (o roteamento carrega todas de uma vez). */
+  accountFromRow(row: SellerProviderAccountRow): ProviderAccountConfig | null {
+    return this.toProviderAccount(row);
+  }
+
   private toProviderAccount(row: SellerProviderAccountRow): ProviderAccountConfig | null {
     const secret = this.decryptOrNull(row.secret_enc);
     if (!secret || !row.public_key) return null;
     const status = row.status === 'active' ? 'active' : 'inactive';
+
+    if (row.provider === 'whop') {
+      // Whop EXTRA: mesma forma da principal (whop-linked.service), para o
+      // WhopProvider cobrar sem application fee e o webhook validar com o
+      // segredo DESTA conta.
+      return {
+        id: toWhopExtraAccountId(row.id),
+        provider: 'whop',
+        status,
+        weight: 1,
+        supported_methods: ['all'],
+        api_url: row.api_url ?? WHOP_API_URL,
+        apiKey: secret,
+        config: {
+          company_id: row.account_ref,
+          linked: true,
+          seller_id: row.seller_id,
+          webhook_secret: this.decryptOrNull(row.webhook_secret_enc),
+          label: row.display_name,
+        },
+      };
+    }
 
     if (row.provider === 'stripe') {
       return {
@@ -394,7 +541,7 @@ export class SellerProviderAccountsService {
    * Quem pode conectar: o modo não foi cortado no CRM e a combinação é válida
    * (Whop × Stripe exclusivas; PayPal combina com qualquer uma).
    */
-  private async assertMayConnect(sellerId: string, provider: SellerProviderKind) {
+  private async assertMayConnect(sellerId: string, provider: SellerProviderKind, opts: { routing?: boolean } = {}) {
     const { data: linked } = await supabase
       .from(LINKED_TABLE)
       .select('status, whop_account_id, api_key, last_error')
@@ -403,6 +550,8 @@ export class SellerProviderAccountsService {
     if ((linked as any)?.status === 'disabled') {
       throw new BadRequestException('O modo conta externa foi desativado para esta conta. Fale com o atendimento da Koopfy.');
     }
+    // Roteamento ligado: Whop e Stripe convivem — o roteador escolhe por sessão.
+    if (opts.routing) return;
     const conflict = ownProviderConflict(provider, {
       whop: whopLinkedOccupiesCard(linked as any),
       stripe: false,
@@ -410,9 +559,9 @@ export class SellerProviderAccountsService {
     if (conflict) throw new ConflictException(conflict);
   }
 
-  private async assertNotTakenByOther(
+  async assertNotTakenByOther(
     sellerId: string,
-    provider: SellerProviderKind,
+    provider: SellerProviderRowKind,
     accountRef: string | null,
     message: string,
     publicKey?: string,
@@ -430,9 +579,10 @@ export class SellerProviderAccountsService {
 
   private async save(
     sellerId: string,
-    provider: SellerProviderKind,
+    provider: SellerProviderRowKind,
     fields: Partial<SellerProviderAccountRow> & { id: string },
     actor: string | null,
+    opts: { routing?: boolean } = {},
   ) {
     const now = new Date().toISOString();
     const { error } = await supabase.from(TABLE).upsert(
@@ -446,13 +596,24 @@ export class SellerProviderAccountsService {
         created_by: actor,
         updated_at: now,
       },
-      { onConflict: 'seller_id,provider' },
+      // Por id: com o roteamento há várias linhas por provedor.
+      { onConflict: 'id' },
     );
     if (error) {
       console.error(`[SellerProviders] gravação da conta ${provider}:`, error.message);
       throw new BadRequestException('Não foi possível salvar a conexão agora. Tente novamente.');
     }
     this.forget(sellerId, provider);
+    if (!opts.routing) await this.standbyOthers(sellerId, provider, fields.id);
+  }
+
+  /** Grava uma conta Whop EXTRA (a validação e o webhook são do WhopLinkedAccountsService). */
+  async saveWhopExtra(
+    sellerId: string,
+    fields: Partial<SellerProviderAccountRow> & { id: string },
+    actor: string | null,
+  ) {
+    await this.save(sellerId, 'whop', { ...fields, mode: 'live' }, actor, { routing: true });
   }
 
   /**
@@ -636,10 +797,12 @@ async function loadLinkedRow(sellerId: string): Promise<any | null> {
 /** Quais contas próprias estão cobrando agora. */
 export async function ownAccountsCharging(sellerId: string): Promise<{ whop: boolean; stripe: boolean; paypal: boolean; commissionPct: number }> {
   const [linked, rows] = await Promise.all([loadLinkedRow(sellerId), loadSellerProviderRows(sellerId)]);
-  const charging = (provider: SellerProviderKind) =>
+  const charging = (provider: SellerProviderRowKind) =>
     rows.some(row => row.provider === provider && providerChargeBlocker(row) === null);
   return {
-    whop: Boolean(linked) && linkedChargeBlocker(linked as WhopLinkedAccountRow) === null,
+    // Whop extra (roteamento) também conta: fora do roteamento ela fica em
+    // 'standby' e não cobra, então só pesa com o roteamento ligado.
+    whop: (Boolean(linked) && linkedChargeBlocker(linked as WhopLinkedAccountRow) === null) || charging('whop'),
     stripe: charging('stripe'),
     paypal: charging('paypal'),
     commissionPct: normalizeCommissionPct(linked?.commission_pct),
@@ -682,12 +845,24 @@ export async function sellerChargesOnAnyOwnAccount(sellerId: string): Promise<bo
 
 /** Stripe própria conectada? A Whop própria não pode ligar junto. */
 export async function sellerHasOwnStripe(sellerId: string): Promise<boolean> {
+  // Lista, não maybeSingle: com o roteamento pode haver várias linhas Stripe.
   const { data, error } = await supabase
     .from(TABLE)
     .select('status, secret_enc')
     .eq('seller_id', sellerId)
-    .eq('provider', 'stripe')
-    .maybeSingle();
+    .eq('provider', 'stripe');
   if (error) return false;
-  return stripeOwnOccupiesCard(data as any);
+  return (Array.isArray(data) ? data : []).some(row => stripeOwnOccupiesCard(row as any));
+}
+
+/**
+ * A linha que vale entre as várias do mesmo provedor: ativa, depois chave
+ * recusada, depois guardada, depois desligada; empate = a mais recente.
+ */
+export function primaryRow(rows: SellerProviderAccountRow[]): SellerProviderAccountRow | null {
+  const rank: Record<string, number> = { active: 0, invalid: 1, standby: 2, disabled: 3 };
+  const sorted = [...rows].sort((a, b) =>
+    (rank[a.status] ?? 4) - (rank[b.status] ?? 4)
+    || String(b.updated_at ?? '').localeCompare(String(a.updated_at ?? '')));
+  return sorted[0] ?? null;
 }

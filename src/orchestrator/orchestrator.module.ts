@@ -15,6 +15,7 @@ import { StripeEfwService } from './stripe/stripe-efw.service';
 import { AffiliateRiskService } from './stripe/affiliate-risk.service';
 import { CryptoModule } from '../crypto/crypto.module';
 import { SellerProviderAccountsService } from './seller-provider/seller-provider-accounts.service';
+import { SellerRoutingService } from './routing/seller-routing.service';
 
 @Module({
   imports: [CryptoModule], // 🔥 precisa pra decrypt
@@ -38,6 +39,8 @@ import { SellerProviderAccountsService } from './seller-provider/seller-provider
     WhopLinkedAccountsService,
     // Stripe e PayPal próprios do seller (provedor externo).
     SellerProviderAccountsService,
+    // Roteamento de contas próprias (várias Whop/Stripe/PayPal por seller).
+    SellerRoutingService,
     StripeAccountsService,
     StripeRiskService,
     StripeEfwService,
@@ -74,6 +77,9 @@ import { SellerProviderAccountsService } from './seller-provider/seller-provider
     // SellerProviderAccountsService: o painel conecta/desliga Stripe e PayPal
     // próprios, e o webhook resolve os ids 'stripel_…'/'paypall_…'.
     SellerProviderAccountsService,
+    // SellerRoutingService: o pagamento escolhe a conta da sessão, o painel e
+    // o CRM configuram o roteamento.
+    SellerRoutingService,
     StripeAccountsService,
     StripeRiskService,
     StripeEfwService,

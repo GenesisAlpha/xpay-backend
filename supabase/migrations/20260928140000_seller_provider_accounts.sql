@@ -13,34 +13,45 @@
 --
 -- Os ids no roteador/webhook são `stripel_<id>` e `paypall_<id>`.
 --
+-- Roteamento de contas (2026-09-28): com o roteamento ligado o seller tem
+-- VÁRIAS contas por provedor. As contas Whop EXTRAS também moram aqui
+-- (provider 'whop', id `whopa_<id>`, webhook `/webhook/whop/whopa_<id>`); a Whop
+-- principal continua em whop_linked_accounts (carteira e saque são só dela).
+-- 'standby' = conta guardada enquanto o roteamento está desligado (volta a
+-- 'active' quando o seller liga de novo). A mesma conta externa não entra
+-- duas vezes para o mesmo seller: unique (seller_id, provider, account_ref).
+--
 -- Segredos (secret_enc, webhook_secret_enc) são cifrados com CRYPTO_MASTER_KEY
 -- (CryptoService), igual a whop_linked_accounts. Só cria tabelas. Idempotente.
 
 create table if not exists public.seller_provider_accounts (
   id uuid primary key default gen_random_uuid(),
   seller_id uuid not null references public.seller_profiles (id) on delete cascade,
-  provider text not null check (provider in ('stripe', 'paypal')),
-  status text not null default 'active' check (status in ('active', 'invalid', 'disabled')),
+  provider text not null check (provider in ('stripe', 'paypal', 'whop')),
+  status text not null default 'active' check (status in ('active', 'invalid', 'disabled', 'standby')),
   -- Stripe em modo de teste (sk_test_) / PayPal sandbox = 'test'.
   mode text not null default 'live' check (mode in ('live', 'test')),
-  -- Stripe acct_… / PayPal app id (quando dá para ler com a credencial).
+  -- Stripe acct_… / PayPal app id (quando dá para ler com a credencial) /
+  -- Whop biz_… (conta extra).
   account_ref text,
   -- Nome da conta para o painel.
   display_name text,
-  -- Stripe pk_… / PayPal client_id: públicos, vão para o navegador.
+  -- Stripe pk_… / PayPal client_id / Whop biz_…: públicos, vão para o navegador.
   public_key text,
-  -- Stripe sk_/rk_ / PayPal client_secret — cifrado.
+  -- Stripe sk_/rk_ / PayPal client_secret / chave de API da Whop — cifrado.
   secret_enc text,
+  -- Só Whop: base da API usada na conexão (a mesma da conta principal).
+  api_url text,
   -- Stripe we_… / PayPal webhook id (o PayPal usa na verificação da assinatura).
   webhook_id text,
-  -- Stripe whsec_ (cifrado). O PayPal não usa.
+  -- Stripe whsec_ / segredo do webhook da Whop (cifrados). O PayPal não usa.
   webhook_secret_enc text,
   last_error text,
   last_checked_at timestamptz,
   created_by text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
-  unique (seller_id, provider)
+  unique (seller_id, provider, account_ref)
 );
 
 comment on table public.seller_provider_accounts is
@@ -48,6 +59,9 @@ comment on table public.seller_provider_accounts is
 
 create index if not exists seller_provider_accounts_account_ref_idx
   on public.seller_provider_accounts (provider, account_ref);
+
+create index if not exists seller_provider_accounts_seller_idx
+  on public.seller_provider_accounts (seller_id, provider);
 
 alter table public.seller_provider_accounts enable row level security;
 

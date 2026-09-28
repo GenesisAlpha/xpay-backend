@@ -12,7 +12,8 @@ import { StripeProvider } from '../providers/stripe.provider';
 import { ClipProvider } from '../providers/clip.provider';
 import { PaypalProvider } from '../providers/paypal.provider';
 import { SellerProviderAccountsService } from '../seller-provider/seller-provider-accounts.service';
-import { OwnProvider, isPaypalOwnAccountId } from '../seller-provider/seller-provider-accounts';
+import { OwnProvider, isOwnProviderAccountId, isPaypalOwnAccountId } from '../seller-provider/seller-provider-accounts';
+import { isTechnicalFailure } from '../routing/seller-routing';
 import { WhopAccountsService } from '../whop/whop-accounts.service';
 import { StripeAccountsService } from '../stripe/stripe-accounts.service';
 import { ClipAccountsService } from '../clip/clip-accounts.service';
@@ -254,6 +255,32 @@ export class AccountRouterService implements OnModuleInit {
 
     return result;
   }
+
+  /**
+   * Métricas do dia (volume em centavos de USD e vendas pagas) de várias
+   * contas, com o mesmo cache do balanceamento. O roteamento de contas
+   * próprias lê daqui os tetos e a divisão do dia.
+   */
+  async getDailyMetrics(ids: string[]): Promise<Map<string, { volume: number; paidCount: number }>> {
+    if (!ids.length) return new Map();
+    return this.hydrateMany(ids);
+  }
+
+  /**
+   * Circuit breaker aberto para a conta? Leitura pura (não fecha o breaker
+   * vencido como o isHealthy faz): o roteamento consulta em toda escolha.
+   */
+  accountBreakerOpen(id: string): boolean {
+    const h = this.getHealth(id);
+    return h.consecutiveFails >= this.MAX_CONSECUTIVE_FAILS && Date.now() - h.lastFailAt <= this.COOLDOWN_MS;
+  }
+
+  /**
+   * Avisado quando uma conta PRÓPRIA do seller abre o breaker (erros técnicos
+   * seguidos). O roteamento grava a pausa 'errors' para as outras instâncias
+   * e o painel verem — sem depender deste processo em memória.
+   */
+  onOwnAccountBreakerOpen?: (accountId: string) => void;
 
   private getHealth(id: string): HealthMetric {
     return (
@@ -694,10 +721,16 @@ export class AccountRouterService implements OnModuleInit {
         10000,
       );
 
+      // Conta PRÓPRIA do seller: só erro TÉCNICO conta para o breaker (ver
+      // isTechnicalFailure). A Whop não classifica, e o padrão "tudo é da
+      // conta" abriria o breaker com três cartões recusados — e o roteamento
+      // mandaria o próximo cartão para outra conta, o padrão de card testing.
+      const ownAccount = isOwnProviderAccountId(account.id);
       if (result.success) {
         this.resetHealth(account.id);
-      } else if (this.isAccountLevelFailure(result)) {
+      } else if (ownAccount ? isTechnicalFailure(result) : this.isAccountLevelFailure(result)) {
         this.markSoftFailure(account.id);
+        if (ownAccount) this.notifyOwnBreaker(account.id);
       } else {
         // Recusa do EMISSOR não é falha da conta. Sem esta distinção, três
         // cartões sem limite em sequência abriam o circuit breaker e tiravam
@@ -712,7 +745,17 @@ export class AccountRouterService implements OnModuleInit {
       return { ...result, accountId: account.id };
     } catch (err) {
       this.markHardFailure(account.id);
+      if (isOwnProviderAccountId(account.id)) this.notifyOwnBreaker(account.id);
       throw err;
+    }
+  }
+
+  private notifyOwnBreaker(id: string) {
+    if (!this.onOwnAccountBreakerOpen || !this.accountBreakerOpen(id)) return;
+    try {
+      this.onOwnAccountBreakerOpen(id);
+    } catch (err: any) {
+      console.error(`[AccountRouter] aviso de breaker da conta ${id}:`, err?.message);
     }
   }
 
