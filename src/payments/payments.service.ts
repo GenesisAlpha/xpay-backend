@@ -231,6 +231,12 @@ export class PaymentService {
                 message: 'Não aceitamos transações nesta moeda para este método de pagamento. Selecione outra moeda.',
             })
         }
+        // Slash: o instrumento (cartão, Apple Pay, Google Pay) é escolhido
+        // dentro do formulário deles. O método que vem do checkout é o que
+        // estava selecionado na tela (pode ser Pix, se o seller tiver marcado) —
+        // e um método que a conta Slash não atende tiraria a conta do roteamento.
+        if (this.normalizeProviderName(seller?.provider_default) === 'slash') dto.method = 'card'
+
         // Slash só faz cobrança avulsa: sem cartão salvo, a assinatura morreria
         // no primeiro ciclo depois de o comprador pagar a entrada.
         if (this.normalizeProviderName(seller?.provider_default) === 'slash'

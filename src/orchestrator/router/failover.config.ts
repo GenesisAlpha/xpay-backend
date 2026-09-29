@@ -59,12 +59,20 @@ export function failoverChainFor(method?: string): ProviderName[] {
 // já foi tentado. Se o preferido não está na cadeia do método (configuração
 // incoerente), ele ainda é tentado primeiro — a preferência explícita do seller
 // ganha do mapa.
+// Providers SEM failover: o checkout monta o formulário DELES com o segredo que
+// volta do pay. Cair em outro PSP devolveria um segredo que o formulário não
+// entende (ex.: client_secret da Stripe no Payment Element da Slash) — melhor
+// falhar com "sem conta" do que cobrar por um caminho que o front não conclui.
+export const NO_FAILOVER_PROVIDERS = new Set<ProviderName>(['slash']);
+
 export function buildFailoverOrder(args: {
   preferred?: string | null;
   method?: string;
 }): ProviderName[] {
   const chain = failoverChainFor(args.method);
   const preferred = args.preferred?.toLowerCase() as ProviderName | undefined;
+
+  if (preferred && NO_FAILOVER_PROVIDERS.has(preferred)) return [preferred];
 
   if (!preferred) return chain.slice(0, FAILOVER_MAX_HOPS + 1);
 
