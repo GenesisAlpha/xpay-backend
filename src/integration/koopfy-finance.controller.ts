@@ -24,6 +24,12 @@ export class KoopfyFinanceController {
     return this.finance.getOverview(req.sellerCtx, period);
   }
 
+  /** Taxas por transação ({ ids: string[] }), para o lucro do Analytics. */
+  @Post('transaction-fees')
+  transactionFees(@Req() req: any, @Body() body: { ids?: unknown }) {
+    return this.finance.transactionFees(req.sellerCtx, body?.ids);
+  }
+
   @Get('transactions')
   transactions(@Req() req: any, @Query() query: Record<string, unknown>) {
     return this.finance.listTransactions(req.sellerCtx, query);

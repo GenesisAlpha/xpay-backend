@@ -18,6 +18,8 @@ import { RequestPayoutDto } from '../dashboard/dto/request-payout.dto';
 import { SellerCtx } from './cross-service-jwt.guard';
 import { AnticipationService } from '../wallets/anticipation.service';
 import { normalizeFinanceListQuery } from './koopfy-finance-query';
+import { feesFromRows, normalizeFeeIds } from './transaction-fees';
+import { supabase } from '../lib/supabase.client';
 import { SellerPayoutAccountService } from '../payouts/seller-payout-account.service';
 import { PayoutOrchestratorService } from '../payouts/payout-orchestrator.service';
 
@@ -202,6 +204,24 @@ export class KoopfyFinanceService {
       recentActivity: result.recentActivity,
       recurring: result.recurring,
     };
+  }
+
+  /**
+   * Taxa da Koopfy em cada transação (USD), para o lucro do Analytics. Só
+   * leitura e só das transações do próprio seller: vale também com a conta
+   * em análise (o lucro não pode sumir enquanto o cadastro é aprovado).
+   */
+  async transactionFees(ctx: SellerCtx, rawIds: unknown) {
+    if (!ctx.seller) return { currency: 'USD', fees: [] };
+    const ids = normalizeFeeIds(rawIds);
+    if (!ids.length) return { currency: 'USD', fees: [] };
+    const { data, error } = await supabase
+      .from('transactions')
+      .select('id, fee')
+      .eq('seller_id', ctx.seller.id)
+      .in('id', ids);
+    if (error) throw new BadRequestException('Não foi possível ler as taxas.');
+    return { currency: 'USD', fees: feesFromRows((data ?? []) as Array<{ id: string; fee: number | string | null }>) };
   }
 
   async listTransactions(ctx: SellerCtx, raw: Record<string, unknown>) {
