@@ -1,4 +1,4 @@
-import { Controller, Post, Req, Headers, Param } from '@nestjs/common';
+import { Body, Controller, Post, Req, Headers, Param, HttpCode, HttpStatus } from '@nestjs/common';
 import { WebhookService } from './webhook.service';
 import { WhopConnectedWebhookService } from './whop-connected-webhook.service';
 
@@ -153,5 +153,19 @@ export class WebhookController {
             : JSON.stringify(req.body ?? {});
 
         return this.webhookService.handleStripeWebhook(accountId, raw, headers);
+    }
+
+    // PAYPAL — conta do próprio seller, também no PATH (`paypall_<id>`): cada
+    // app tem o seu webhook_id, e é ele que o PayPal usa para verificar a
+    // assinatura (verify-webhook-signature). O corpo segue como JSON: a
+    // verificação é pela API do PayPal, não por HMAC local sobre os bytes.
+    @Post('paypal/:accountId')
+    @HttpCode(HttpStatus.OK)
+    async handlePaypalWebhook(
+        @Param('accountId') accountId: string,
+        @Body() body: any,
+        @Headers() headers: Record<string, string>,
+    ) {
+        return this.webhookService.handlePaypalWebhook(accountId, body ?? {}, headers);
     }
 }

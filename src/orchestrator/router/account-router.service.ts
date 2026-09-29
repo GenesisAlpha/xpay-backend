@@ -1,4 +1,4 @@
-import { Injectable, OnModuleInit } from '@nestjs/common';
+import { Injectable, OnModuleInit, Optional } from '@nestjs/common';
 import { PaymentContext } from '../payment-context.interface';
 import { supabase } from '../../lib/supabase.client';
 import { CryptoService } from '../../crypto/crypto.service';
@@ -10,6 +10,10 @@ import { RoxPayProvider } from '../providers/rox-pay.provider';
 import { WhopProvider } from '../providers/whop.provider';
 import { StripeProvider } from '../providers/stripe.provider';
 import { ClipProvider } from '../providers/clip.provider';
+import { PaypalProvider } from '../providers/paypal.provider';
+import { SellerProviderAccountsService } from '../seller-provider/seller-provider-accounts.service';
+import { OwnProvider, isOwnProviderAccountId, isPaypalOwnAccountId } from '../seller-provider/seller-provider-accounts';
+import { isTechnicalFailure } from '../routing/seller-routing';
 import { WhopAccountsService } from '../whop/whop-accounts.service';
 import { StripeAccountsService } from '../stripe/stripe-accounts.service';
 import { ClipAccountsService } from '../clip/clip-accounts.service';
@@ -128,6 +132,9 @@ export class AccountRouterService implements OnModuleInit {
     private readonly stripeAccounts: StripeAccountsService,
     private readonly stripeRisk: StripeRiskService,
     private readonly clipAccounts: ClipAccountsService,
+    // Stripe e PayPal PRÓPRIOS do seller (provedor externo): ids 'stripel_…' e
+    // 'paypall_…'. Opcional só para os testes que montam o router à mão.
+    @Optional() private readonly sellerProviders?: SellerProviderAccountsService,
   ) { }
 
   private daily: Map<string, DailyMetric> = new Map();
@@ -249,6 +256,32 @@ export class AccountRouterService implements OnModuleInit {
     return result;
   }
 
+  /**
+   * Métricas do dia (volume em centavos de USD e vendas pagas) de várias
+   * contas, com o mesmo cache do balanceamento. O roteamento de contas
+   * próprias lê daqui os tetos e a divisão do dia.
+   */
+  async getDailyMetrics(ids: string[]): Promise<Map<string, { volume: number; paidCount: number }>> {
+    if (!ids.length) return new Map();
+    return this.hydrateMany(ids);
+  }
+
+  /**
+   * Circuit breaker aberto para a conta? Leitura pura (não fecha o breaker
+   * vencido como o isHealthy faz): o roteamento consulta em toda escolha.
+   */
+  accountBreakerOpen(id: string): boolean {
+    const h = this.getHealth(id);
+    return h.consecutiveFails >= this.MAX_CONSECUTIVE_FAILS && Date.now() - h.lastFailAt <= this.COOLDOWN_MS;
+  }
+
+  /**
+   * Avisado quando uma conta PRÓPRIA do seller abre o breaker (erros técnicos
+   * seguidos). O roteamento grava a pausa 'errors' para as outras instâncias
+   * e o painel verem — sem depender deste processo em memória.
+   */
+  onOwnAccountBreakerOpen?: (accountId: string) => void;
+
   private getHealth(id: string): HealthMetric {
     return (
       this.health.get(id) ?? {
@@ -286,6 +319,9 @@ export class AccountRouterService implements OnModuleInit {
         // resolvida ANTES de o formulário de cartão existir — não há decisão de
         // roteamento a tomar no momento da cobrança.
         return new ClipProvider();
+      case 'paypal':
+        // Só conta PayPal do próprio seller: a Koopfy não tem pool PayPal.
+        return new PaypalProvider();
       default:
         throw new Error(`Unknown provider: "${provider}"`);
     }
@@ -345,6 +381,13 @@ export class AccountRouterService implements OnModuleInit {
   async resolveAccountById(id: string): Promise<ProviderAccount | null> {
     const fromConfig = getProviderAccountById(id);
     if (fromConfig) return fromConfig as unknown as ProviderAccount;
+
+    // PayPal do seller ('paypall_…'). A Stripe do seller ('stripel_…') passa
+    // pelo StripeAccountsService.getById, que delega pelo prefixo.
+    if (isPaypalOwnAccountId(id)) {
+      const own = this.sellerProviders ? await this.sellerProviders.getProviderAccountById(id) : null;
+      return (own as unknown as ProviderAccount) ?? null;
+    }
 
     const fromWhop = await this.whopAccounts.getById(id);
     if (fromWhop) return fromWhop as unknown as ProviderAccount;
@@ -678,10 +721,16 @@ export class AccountRouterService implements OnModuleInit {
         10000,
       );
 
+      // Conta PRÓPRIA do seller: só erro TÉCNICO conta para o breaker (ver
+      // isTechnicalFailure). A Whop não classifica, e o padrão "tudo é da
+      // conta" abriria o breaker com três cartões recusados — e o roteamento
+      // mandaria o próximo cartão para outra conta, o padrão de card testing.
+      const ownAccount = isOwnProviderAccountId(account.id);
       if (result.success) {
         this.resetHealth(account.id);
-      } else if (this.isAccountLevelFailure(result)) {
+      } else if (ownAccount ? isTechnicalFailure(result) : this.isAccountLevelFailure(result)) {
         this.markSoftFailure(account.id);
+        if (ownAccount) this.notifyOwnBreaker(account.id);
       } else {
         // Recusa do EMISSOR não é falha da conta. Sem esta distinção, três
         // cartões sem limite em sequência abriam o circuit breaker e tiravam
@@ -696,7 +745,17 @@ export class AccountRouterService implements OnModuleInit {
       return { ...result, accountId: account.id };
     } catch (err) {
       this.markHardFailure(account.id);
+      if (isOwnProviderAccountId(account.id)) this.notifyOwnBreaker(account.id);
       throw err;
+    }
+  }
+
+  private notifyOwnBreaker(id: string) {
+    if (!this.onOwnAccountBreakerOpen || !this.accountBreakerOpen(id)) return;
+    try {
+      this.onOwnAccountBreakerOpen(id);
+    } catch (err: any) {
+      console.error(`[AccountRouter] aviso de breaker da conta ${id}:`, err?.message);
     }
   }
 
@@ -837,6 +896,17 @@ export class AccountRouterService implements OnModuleInit {
     // pedido JÁ tem conta — ver resolveStickyAccountId.
     orderRef?: string | null;
   }): Promise<ProviderAccount | null> {
+    // ── Stripe/PayPal PRÓPRIOS do seller (provedor externo) ──
+    // Mesma regra da Whop própria abaixo: a venda nasce e fica na conta dele,
+    // sem pool e sem sticky. PayPal não tem pool da Koopfy — sem conta dele,
+    // não há para onde mandar.
+    if (args.provider.toLowerCase() === 'stripe' || args.provider.toLowerCase() === 'paypal') {
+      const kind = args.provider.toLowerCase() as 'stripe' | 'paypal';
+      const own = this.sellerProviders ? await this.sellerProviders.getChargeableAccount(args.sellerId, kind) : null;
+      if (own) return own as unknown as ProviderAccount;
+      if (kind === 'paypal') return null;
+    }
+
     // ── Whop em modo conectado ──
     // Seller com conta conectada ativa cobra SÓ nela: nem sticky, nem pool.
     // Com a conta fora do ar, o WhopConnectService decide: 'master' (fallback
@@ -932,6 +1002,37 @@ export class AccountRouterService implements OnModuleInit {
       });
 
     return ranked[0].acc;
+  }
+
+  // ─────────────────────────────────────────────
+  // 🎯 CONTA PRÓPRIA — resolveOwnRoute
+  //
+  // Venda decidida como da conta do seller (Whop, Stripe ou PayPal dele) não
+  // passa por failover nem sticky: cair no pool da Koopfy seria cobrar SEM a
+  // taxa (a venda foi calculada como da conta dele) e creditar uma carteira
+  // que não recebeu nada. Sem a conta dele pronta, o pagamento para aqui.
+  // ─────────────────────────────────────────────
+
+  async resolveOwnRoute(sellerId: string, provider: OwnProvider): Promise<{
+    account: ProviderAccount;
+    provider: string;
+    degraded: boolean;
+    attempted: string[];
+  } | null> {
+    const account = await this.getOwnAccount(sellerId, provider);
+    if (!account) {
+      console.error(`[AccountRouter] conta ${provider} própria do seller ${sellerId} indisponível — sem fallback para o pool`);
+      return null;
+    }
+    return { account, provider, degraded: false, attempted: [provider] };
+  }
+
+  /** Conta própria do seller pronta para cobrar, ou null — sem log (consulta de config). */
+  async getOwnAccount(sellerId: string, provider: OwnProvider): Promise<ProviderAccount | null> {
+    const account = provider === 'whop'
+      ? await this.whopAccounts.getSellerLinkedAccount(sellerId)
+      : this.sellerProviders ? await this.sellerProviders.getChargeableAccount(sellerId, provider) : null;
+    return (account as unknown as ProviderAccount) ?? null;
   }
 
   // ─────────────────────────────────────────────

@@ -7,7 +7,7 @@
 // Credenciais (API keys) ficam em variáveis de ambiente — nunca commitar chave.
 // ============================================================================
 
-export type ProviderName = 'setinel_gate' | 'approvebly' | 'coinflow' | 'simulator' | 'rox_pay' | 'whop' | 'stripe' | 'clip';
+export type ProviderName = 'setinel_gate' | 'approvebly' | 'coinflow' | 'simulator' | 'rox_pay' | 'whop' | 'stripe' | 'clip' | 'paypal';
 
 // ⚠️ Nem toda conta vive aqui. Dois pools são DINÂMICOS e vêm de tabela:
 //

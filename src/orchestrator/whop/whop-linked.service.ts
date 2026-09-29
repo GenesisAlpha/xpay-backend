@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException, Optional } from '@nestjs/common';
 import { supabase } from '../../lib/supabase.client';
 import { CryptoService } from '../../crypto/crypto.service';
 import { ProviderAccountConfig } from '../provider-accounts.config';
@@ -16,6 +16,13 @@ import {
   toLinkedProviderAccountId,
   whopAccountIdFromLinkedProviderAccountId,
 } from './whop-linked';
+import { ownProviderConflict, toWhopExtraAccountId } from '../seller-provider/seller-provider-accounts';
+import {
+  SellerProviderAccountsService,
+  sellerChargesOnAnyOwnAccount,
+  sellerHasOwnStripe,
+} from '../seller-provider/seller-provider-accounts.service';
+import { saveRoutingLabel, sellerRoutingEnabled } from '../routing/routing-store';
 
 // ============================================================================
 // CONTA WHOP PRÓPRIA DO SELLER (modo conexão)
@@ -64,7 +71,12 @@ export const WALLET_SCOPES = [
 
 @Injectable()
 export class WhopLinkedAccountsService {
-  constructor(private readonly crypto: CryptoService) {}
+  constructor(
+    private readonly crypto: CryptoService,
+    // Contas Whop EXTRAS (roteamento ligado) moram em seller_provider_accounts.
+    // Opcional só para os testes que montam o serviço à mão.
+    @Optional() private readonly sellerProviders?: SellerProviderAccountsService,
+  ) {}
 
   private cache = new Map<string, { row: WhopLinkedAccountRow | null; at: number }>();
 
@@ -89,19 +101,26 @@ export class WhopLinkedAccountsService {
   }
 
   /**
-   * Libera (ou corta) o modo conta externa para o seller. Só depois disso o
-   * painel dele mostra "Conecte seu provedor externo" — quem conecta é ele.
+   * Libera (ou corta) o modo conta externa para o seller. Desde 2026-09-28 ele
+   * vem liberado para todos (decisão do dono): sem registro = liberado, e o
+   * CRM só serve para CORTAR ('disabled') ou religar quem foi cortado.
    */
   async allow(sellerId: string, enabled: boolean, actor: string | null = null) {
     const row = await this.getRow(sellerId);
     const now = new Date().toISOString();
 
     if (!enabled) {
-      if (!row) return this.publicView(null);
-      const { error } = await supabase
-        .from(TABLE)
-        .update({ status: 'disabled', updated_at: now })
-        .eq('seller_id', sellerId);
+      // Sem registro o modo vale liberado: cortar precisa gravar o bloqueio.
+      const { error } = await supabase.from(TABLE).upsert(
+        {
+          seller_id: sellerId,
+          status: 'disabled',
+          commission_pct: Number(row?.commission_pct ?? DEFAULT_LINKED_COMMISSION_PCT),
+          updated_at: now,
+          ...(row ? {} : { created_by: actor }),
+        },
+        { onConflict: 'seller_id' },
+      );
       if (error) throw new BadRequestException(`Não foi possível cortar o modo conta externa: ${error.message}`);
       this.cache.delete(sellerId);
       await this.log(sellerId, actor, 'whop_linked.mode_disabled', {});
@@ -356,15 +375,29 @@ export class WhopLinkedAccountsService {
    * Liga a conta do seller: valida a chave contra a Whop (quem é a company),
    * recusa conta que já é filha da Koopfy ou de outro seller, e guarda cifrada.
    */
-  async connect(sellerId: string, apiKey: string, actor: string | null = null) {
+  async connect(sellerId: string, apiKey: string, actor: string | null = null, opts: { label?: string | null } = {}) {
     const key = String(apiKey ?? '').trim();
     if (!key) throw new BadRequestException('Informe a chave de API da sua conta Whop.');
 
-    // O modo conta externa é liberado pela equipe, a pedido do seller. Sem
-    // liberação, ninguém conecta uma conta de fora sozinho.
-    const current = await this.getRow(sellerId);
-    if (!current || current.status === 'disabled') {
-      throw new BadRequestException('O modo conta externa não está liberado para esta conta. Fale com o atendimento da Koopfy.');
+    // Liberado para todos; só quem a equipe cortou no CRM ('disabled') não
+    // conecta. Primeira conexão cria o registro, como a liberação do CRM fazia.
+    let current = await this.getRow(sellerId);
+    if (current?.status === 'disabled') {
+      throw new BadRequestException('O modo conta externa foi desativado para esta conta. Fale com o atendimento da Koopfy.');
+    }
+    if (!current) {
+      await this.allow(sellerId, true, actor);
+      current = await this.getRow(sellerId);
+      if (!current) throw new BadRequestException('Não foi possível preparar a conexão agora. Tente de novo.');
+    }
+
+    // Roteamento ligado: Whop e Stripe convivem, e uma Whop além da principal
+    // vira conta EXTRA (`whopa_…`). Desligado: só uma conta própria de cartão.
+    const routing = await sellerRoutingEnabled(sellerId);
+    if (!routing) {
+      // Whop e Stripe cobram cartão: só uma conta própria de cartão por vez.
+      const conflict = ownProviderConflict('whop', { whop: false, stripe: await sellerHasOwnStripe(sellerId) });
+      if (conflict) throw new ConflictException(conflict);
     }
 
     const company = await this.readCompany(key);
@@ -379,6 +412,15 @@ export class WhopLinkedAccountsService {
       .maybeSingle();
     if (child) {
       throw new ConflictException('Esta conta já é uma conta conectada criada pela Koopfy.');
+    }
+
+    // Já tem a principal conectada e esta chave é de OUTRA company: com o
+    // roteamento, entra como conta extra — a principal (carteira, saque,
+    // vendas antigas) continua intacta.
+    const principalConnected = Boolean(current.whop_account_id && current.api_key)
+      && (current.status === 'active' || current.status === 'invalid');
+    if (routing && principalConnected && current.whop_account_id !== company.id) {
+      return this.connectExtra(sellerId, key, company, actor, opts.label ?? null);
     }
 
     const { data: other } = await supabase
@@ -396,14 +438,11 @@ export class WhopLinkedAccountsService {
     const accountId = toLinkedProviderAccountId(company.id);
     const webhook = await this.registerWebhook(key, company.apiUrl, company.id, accountId);
 
-    // Como a Koopfy recebe: afiliada da conta dele, com rev-share do percentual
-    // combinado. Falhar aqui NÃO derruba a conexão — a venda já sai, e o CRM
-    // mostra que a comissão ficou pendente para o time resolver.
+    // Como a Koopfy recebe (desde 2026-09-28): a comissão (commission_pct, do
+    // CRM ou 3%) de cada venda vira débito em dólar e é cobrada no cartão que
+    // o seller salvou na Whop da Koopfy (checkout: billing_debits + cron). Não
+    // há mais afiliado nem rev-share na conta dele.
     const commissionPct = Number(current.commission_pct ?? DEFAULT_LINKED_COMMISSION_PCT);
-    const affiliate = await this.setupAffiliate(key, company.apiUrl, company.id, commissionPct).catch((err: any) => {
-      console.error(`[WhopLinked] afiliado na conta ${company.id}:`, err?.message);
-      return { id: null, code: null, overrideId: null, error: String(err?.message ?? err).slice(0, 300) };
-    });
 
     // A chave serve para o financeiro do painel (saldo e saque)? Vale saber
     // agora, na tela em que ele ainda tem a chave na mão, e não depois, quando
@@ -427,12 +466,9 @@ export class WhopLinkedAccountsService {
         webhook_id: webhook.id,
         webhook_secret: webhook.secret ? this.crypto.encrypt(webhook.secret) : null,
         commission_pct: commissionPct,
-        affiliate_id: affiliate.id,
-        affiliate_code: affiliate.code,
-        affiliate_override_id: affiliate.overrideId,
         status: 'active',
         last_checked_at: now,
-        last_error: (affiliate as any).error ?? null,
+        last_error: null,
         created_by: actor,
         updated_at: now,
       },
@@ -444,10 +480,64 @@ export class WhopLinkedAccountsService {
     }
 
     this.cache.delete(sellerId);
+    await saveRoutingLabel({ sellerId, accountId, provider: 'whop', label: opts.label });
     await this.prepareExternalOnlySeller(sellerId);
     await this.log(sellerId, actor, 'whop_linked.connected', {
       whop_account_id: company.id,
       company_title: company.title,
+      webhook_id: webhook.id,
+    });
+    return this.publicView(await this.getRow(sellerId));
+  }
+
+  /**
+   * Conta Whop EXTRA (roteamento ligado): mesma validação e mesmo webhook da
+   * principal, apontando para `/webhook/whop/whopa_<id>` com o segredo dela.
+   * A mesma company não entra duas vezes (nem como principal de outro seller).
+   */
+  private async connectExtra(
+    sellerId: string,
+    key: string,
+    company: { id: string; title: string | null; apiUrl: string },
+    actor: string | null,
+    label: string | null,
+  ) {
+    if (!this.sellerProviders) throw new BadRequestException('Contas extras indisponíveis agora. Tente de novo.');
+
+    const { data: otherPrincipal } = await supabase
+      .from(TABLE)
+      .select('seller_id')
+      .eq('whop_account_id', company.id)
+      .neq('seller_id', sellerId)
+      .maybeSingle();
+    if (otherPrincipal) throw new ConflictException('Esta conta Whop já está conectada em outra conta Koopfy.');
+    await this.sellerProviders.assertNotTakenByOther(
+      sellerId, 'whop', company.id, 'Esta conta Whop já está conectada em outra conta Koopfy.',
+    );
+
+    // Reconexão da mesma company reaproveita a linha (id do roteador e webhook).
+    const existing = (await this.sellerProviders.listRows(sellerId))
+      .find(row => row.provider === 'whop' && row.account_ref === company.id);
+    const rowId = existing?.id ?? randomUUID();
+    const accountId = toWhopExtraAccountId(rowId);
+    const webhook = await this.registerWebhook(key, company.apiUrl, company.id, accountId);
+
+    await this.sellerProviders.saveWhopExtra(sellerId, {
+      id: rowId,
+      account_ref: company.id,
+      display_name: company.title ? String(company.title).slice(0, 120) : null,
+      // O biz_ é público (o Whop Elements monta com ele no navegador).
+      public_key: company.id,
+      secret_enc: this.crypto.encrypt(key),
+      api_url: company.apiUrl,
+      webhook_id: webhook.id,
+      webhook_secret_enc: webhook.secret ? this.crypto.encrypt(webhook.secret) : null,
+    }, actor);
+    await saveRoutingLabel({ sellerId, accountId, provider: 'whop', label });
+
+    await this.log(sellerId, actor, 'whop_linked.extra_connected', {
+      account_id: accountId,
+      whop_account_id: company.id,
       webhook_id: webhook.id,
     });
     return this.publicView(await this.getRow(sellerId));
@@ -477,14 +567,26 @@ export class WhopLinkedAccountsService {
     if (error) console.error(`[WhopLinked] provider do seller ${sellerId}:`, error.message);
   }
 
-  /** Desliga a conexão. As vendas voltam a sair pela conta da Koopfy. */
-  async disconnect(sellerId: string, reason: string, actor: string | null = null) {
+  /**
+   * Desliga a conexão. As vendas voltam a sair pela conta da Koopfy.
+   *
+   * Pelo próprio seller (`bySeller`) a conta volta a 'allowed': o modo segue
+   * liberado e ele pode conectar de novo — ou trocar pela Stripe. 'disabled'
+   * é o corte do CRM, que esconde a opção e trava a reconexão. As chaves
+   * ficam: reembolso e disputa de vendas antigas ainda chegam pelo webhook.
+   */
+  async disconnect(sellerId: string, reason: string, actor: string | null = null, opts: { bySeller?: boolean } = {}) {
     const row = await this.getRow(sellerId);
     if (!row) throw new NotFoundException('Seller sem conta Whop própria conectada.');
 
     const { error } = await supabase
       .from(TABLE)
-      .update({ status: 'disabled', last_error: reason || null, updated_at: new Date().toISOString(), created_by: actor ?? row.created_by })
+      .update({
+        status: opts.bySeller ? 'allowed' : 'disabled',
+        last_error: reason || null,
+        updated_at: new Date().toISOString(),
+        created_by: actor ?? row.created_by,
+      })
       .eq('seller_id', sellerId);
     if (error) throw new BadRequestException(`Não foi possível desligar a conexão: ${error.message}`);
 
@@ -493,33 +595,26 @@ export class WhopLinkedAccountsService {
     return this.publicView(await this.getRow(sellerId));
   }
 
-  /** Comissão da Koopfy nessa conta (cobrada como afiliado na Whop). */
+  /** Comissão da Koopfy nessa conta: vira débito em dólar cobrado no cartão do seller. */
   async setCommission(sellerId: string, commissionPct: number, actor: string | null = null) {
     const pct = Number(commissionPct);
     if (!Number.isFinite(pct) || pct < 0 || pct > 25) {
       throw new BadRequestException('Comissão deve ficar entre 0% e 25%.');
     }
 
+    // O percentual vale para qualquer conta própria (Whop, Stripe ou PayPal) e
+    // mora aqui desde a Whop. Seller sem conexão Whop ainda ganha o registro
+    // ('allowed' = liberado, sem conta Whop): é onde o pay lê a comissão.
+    // Vale a partir da próxima venda: o pay grava o percentual em cada
+    // transação (metadata.own_account) e o checkout cobra por ele.
     const row = await this.getRow(sellerId);
-    if (!row) throw new NotFoundException('Seller sem conta Whop própria conectada.');
-
-    // O percentual que vale é o que está na Whop: sem atualizar a rev-share, o
-    // número mudaria só na nossa tela e a comissão continuaria a antiga.
-    const patch: Record<string, any> = { commission_pct: pct, updated_at: new Date().toISOString() };
-    const apiKey = this.reveal(row);
-    if (row.affiliate_id && apiKey) {
-      try {
-        const override = await this.createOverride(apiKey, row.api_url ?? WHOP_API_URL_DEFAULT, row.affiliate_id, pct);
-        patch.affiliate_override_id = override?.id ?? row.affiliate_override_id;
-        patch.last_error = null;
-      } catch (err: any) {
-        throw new BadRequestException(`A Whop recusou a nova comissão: ${err?.message ?? err}`);
-      }
-    } else {
-      patch.last_error = 'comissão salva só na Koopfy: a conta dele ainda não tem afiliado configurado';
-    }
-
-    const { error } = await supabase.from(TABLE).update(patch).eq('seller_id', sellerId);
+    const now = new Date().toISOString();
+    const { error } = row
+      ? await supabase.from(TABLE).update({ commission_pct: pct, updated_at: now }).eq('seller_id', sellerId)
+      : await supabase.from(TABLE).upsert(
+        { seller_id: sellerId, status: 'allowed', commission_pct: pct, created_by: actor, updated_at: now },
+        { onConflict: 'seller_id' },
+      );
     if (error) throw new BadRequestException(`Não foi possível salvar a comissão: ${error.message}`);
 
     this.cache.delete(sellerId);
@@ -543,11 +638,14 @@ export class WhopLinkedAccountsService {
 
   /** O que o painel e o CRM podem ver: nunca a chave. */
   publicView(row: WhopLinkedAccountRow | null) {
-    if (!row) return { allowed: false as const, connected: false as const };
+    // Sem registro = liberado (ninguém cortou): o painel mostra "conecte seu provedor".
+    if (!row) return { allowed: true as const, connected: false as const };
     return {
-      // Liberado pela equipe: o painel do seller mostra "conecte seu provedor".
+      // Só 'disabled' (cortado no CRM) esconde a opção.
       allowed: row.status !== 'disabled',
-      connected: Boolean(row.whop_account_id && row.api_key),
+      // 'allowed' com chave = o seller desconectou (a chave fica para os
+      // webhooks de vendas antigas): para o painel, não está conectada.
+      connected: Boolean(row.whop_account_id && row.api_key) && row.status !== 'allowed',
       whopAccountId: row.whop_account_id,
       companyTitle: row.company_title,
       status: row.status,
@@ -596,8 +694,6 @@ export class WhopLinkedAccountsService {
         // carteira da Koopfy (o dinheiro é do seller).
         linked: true,
         seller_id: row.seller_id,
-        // Vai em cada checkout: é o que atribui a venda à Koopfy e paga a comissão.
-        affiliate_code: row.affiliate_code ?? undefined,
         // Segredo do webhook que criamos na conta dele, para validar o evento.
         webhook_secret: row.webhook_secret ? this.decryptOrNull(row.webhook_secret) : undefined,
       },
@@ -620,56 +716,6 @@ export class WhopLinkedAccountsService {
     } catch {
       return undefined;
     }
-  }
-
-  /**
-   * Como a Koopfy recebe: vira afiliada da conta dele e ganha uma rev-share do
-   * percentual combinado. O `affiliate_code` viaja em cada checkout que
-   * criamos — as vendas que ele fizer por fora não entram na comissão.
-   *
-   * A Whop credita no saldo da conta Koopfy e estorna sozinha no reembolso.
-   */
-  private async setupAffiliate(apiKey: string, apiUrl: string, companyId: string, commissionPct: number) {
-    const identifier = process.env.KOOPFY_WHOP_AFFILIATE?.trim();
-    if (!identifier) {
-      throw new Error('KOOPFY_WHOP_AFFILIATE ausente: sem ele a Koopfy não vira afiliada e a comissão não é cobrada.');
-    }
-    // Afiliado na Whop é sempre uma PESSOA (username, e-mail, user_… ou Discord).
-    // Com um biz_ a Whop recusa e a comissão passaria a não ser cobrada em
-    // silêncio — melhor falhar aqui, dizendo o que está errado.
-    if (identifier.startsWith('biz_')) {
-      throw new Error(
-        `KOOPFY_WHOP_AFFILIATE está com um id de empresa (${identifier}): use o usuário dono da conta `
-        + '(e-mail, username ou user_…), porque a comissão de afiliado é creditada a uma pessoa.',
-      );
-    }
-
-    const affiliate = await this.whopPost(apiKey, apiUrl, '/api/v1/affiliates', {
-      account_id: companyId,
-      user_identifier: identifier,
-    });
-    const id = String(affiliate?.id ?? '').trim();
-    if (!id) throw new Error('A Whop não devolveu o afiliado criado.');
-
-    // O código que atribui a venda é o USERNAME do afiliado (é o `?a=<username>`
-    // dos links da Whop). A resposta não tem `affiliate_code`: sem isto o
-    // checkout sairia sem afiliado e a comissão nunca seria cobrada.
-    const code = String(affiliate?.user?.username ?? '').trim();
-    if (!code) throw new Error('A Whop não devolveu o username do afiliado: sem ele a venda não é atribuída à Koopfy.');
-
-    const override = await this.createOverride(apiKey, apiUrl, id, commissionPct);
-    return { id, code, overrideId: override?.id ?? null };
-  }
-
-  /** Rev-share da conta toda: vale para qualquer produto dele vendido pela Koopfy. */
-  private createOverride(apiKey: string, apiUrl: string, affiliateId: string, commissionPct: number) {
-    return this.whopPost(apiKey, apiUrl, `/api/v1/affiliates/${encodeURIComponent(affiliateId)}/overrides`, {
-      override_type: 'rev_share',
-      commission_type: 'percentage',
-      commission_value: commissionPct,
-      // Sobre o líquido, depois das taxas da Whop — o que sobra de verdade.
-      revenue_basis: 'post_fees',
-    });
   }
 
   private async whopGet(apiKey: string, apiUrl: string, path: string) {
@@ -772,6 +818,23 @@ export class WhopLinkedAccountsService {
  * Atalho para o caminho da venda: o seller cobra na conta dele? Sem DI porque
  * o serviço de pagamentos monta as taxas antes de resolver a conta no router.
  */
+/**
+ * Comissão da Koopfy (%) quando o seller cobra na conta Whop PRÓPRIA dele;
+ * null quando a venda não sai por lá. Percentual do CRM ou 3%.
+ */
+export async function ownWhopAccountCommissionPct(sellerId: string): Promise<number | null> {
+  const { data } = await supabase
+    .from(TABLE)
+    .select('status, whop_account_id, last_error, commission_pct')
+    .eq('seller_id', sellerId)
+    .maybeSingle();
+  if (!data || linkedChargeBlocker(data as WhopLinkedAccountRow) !== null) return null;
+  // null/ausente = padrão (Number(null) seria 0% e a Koopfy não cobraria nada).
+  const raw = (data as any).commission_pct;
+  const pct = raw === null || raw === undefined || raw === '' ? NaN : Number(raw);
+  return Number.isFinite(pct) && pct >= 0 ? pct : DEFAULT_LINKED_COMMISSION_PCT;
+}
+
 export async function sellerChargesOnOwnWhopAccount(sellerId: string): Promise<boolean> {
   const { data } = await supabase
     .from(TABLE)
@@ -784,7 +847,7 @@ export async function sellerChargesOnOwnWhopAccount(sellerId: string): Promise<b
 
 /**
  * Seller que pode cobrar e ativar o checkout: aprovado pela Koopfy, ou ainda
- * sem aprovação mas cobrando na conta Whop PRÓPRIA dele.
+ * sem aprovação mas cobrando numa conta PRÓPRIA dele (Whop, Stripe ou PayPal).
  *
  * No modo conta externa a liberação no CRM faz as vezes da aprovação: quem faz
  * o KYC da empresa é a Whop, e o dinheiro nunca passa pela Koopfy. Por isso a
@@ -796,5 +859,5 @@ export async function sellerMayOperate(seller: { id: string; status?: string | n
   if (!seller) return false;
   if (seller.status === 'active') return true;
   if (seller.status !== 'pending_review') return false;
-  return sellerChargesOnOwnWhopAccount(seller.id);
+  return sellerChargesOnAnyOwnAccount(seller.id);
 }

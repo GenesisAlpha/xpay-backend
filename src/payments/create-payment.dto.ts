@@ -90,6 +90,8 @@ export class CreatePaymentDto {
         'eps', 'p24', 'swish', 'twint', 'blik', 'mobile_pay', 'klarna', 'spei',
         // Whop Elements: o PaymentElement também oferece cripto.
         'crypto',
+        // PayPal na conta do próprio seller (botões do PayPal no checkout).
+        'paypal',
     ])
     method!: string;
 

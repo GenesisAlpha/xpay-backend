@@ -4,7 +4,7 @@ import { SellerBillingService } from '../seller-billing/seller-billing.service'
 import { whopDeclineCode } from '../orchestrator/providers/whop.provider'
 import { whopCardOf } from './whop-card'
 import { isWhopInitiatedRefund, refundFeeCents } from './refund-fee'
-import { Injectable } from '@nestjs/common'
+import { Injectable, Optional } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
 import { WalletService } from '../wallets/wallet.service'
 import { AccountRouterService } from '../orchestrator/router/account-router.service'
@@ -12,6 +12,15 @@ import { getProviderAccountById } from '../orchestrator/provider-accounts.config
 import { RoxPayProvider } from '../orchestrator/providers/rox-pay.provider'
 import { WhopAccountsService } from '../orchestrator/whop/whop-accounts.service'
 import { isLinkedProviderAccountId } from '../orchestrator/whop/whop-linked'
+import {
+  fromPaypalValue,
+  isOwnProviderAccountId,
+  isPaypalOwnAccountId,
+  isStripeOwnAccountId,
+  isWhopExtraAccountId,
+  toPaypalValue,
+} from '../orchestrator/seller-provider/seller-provider-accounts'
+import { SellerProviderAccountsService } from '../orchestrator/seller-provider/seller-provider-accounts.service'
 import { StripeAccountsService } from '../orchestrator/stripe/stripe-accounts.service'
 import { StripeRiskService } from '../orchestrator/stripe/stripe-risk.service'
 import { StripeEfwService } from '../orchestrator/stripe/stripe-efw.service'
@@ -145,6 +154,9 @@ export class WebhookService {
     private readonly currencyService: CurrencyService,
     private readonly payoutHandler: WhopPayoutWebhookService,
     private readonly sellerBilling: SellerBillingService,
+    // PayPal do próprio seller: resolve a conta 'paypall_…' e verifica a
+    // assinatura do evento com a credencial dela.
+    @Optional() private readonly sellerProviders?: SellerProviderAccountsService,
   ) { }
 
   // opts.skipDispatch: pula o postback ao seller (usado na aprovação SÍNCRONA do
@@ -213,11 +225,12 @@ export class WebhookService {
 
       // 1) Crédito pendente na wallet (com external_fee se houver)
       //
-      // Conta Whop própria do seller: o dinheiro entrou na conta DELE. Creditar
-      // aqui criaria saldo que a Koopfy não tem como pagar no saque.
-      if (isLinkedProviderAccountId(tx.provider_account_id)) {
+      // Conta PRÓPRIA do seller (Whop, Stripe ou PayPal dele): o dinheiro
+      // entrou na conta DELE. Creditar aqui criaria saldo que a Koopfy não tem
+      // como pagar no saque.
+      if (isOwnProviderAccountId(tx.provider_account_id)) {
         console.log(
-          `[WebhookService] venda ${tx.id} na conta Whop do próprio seller `
+          `[WebhookService] venda ${tx.id} na conta do próprio seller `
           + `(${tx.provider_account_id}) — sem crédito na carteira da Koopfy.`,
         )
       } else {
@@ -833,7 +846,8 @@ export class WebhookService {
     // Conta própria do seller: o webhook dela traz TODAS as vendas dele,
     // inclusive as que não passaram pela Koopfy. Sem transação nossa, ignora —
     // reentregar para sempre um evento que não é nosso só gera ruído.
-    if (!tx && isLinkedProviderAccountId(accountId)) {
+    // (Vale também para as Whop extras do roteamento, `whopa_…`.)
+    if (!tx && (isLinkedProviderAccountId(accountId) || isWhopExtraAccountId(accountId))) {
       return { ignored: true, reason: 'venda fora da Koopfy' }
     }
     if (!tx) {
@@ -1616,7 +1630,17 @@ export class WebhookService {
     const object = event?.data?.object ?? {}
 
     // ── 4. Eventos de RISCO — não mexem em transação, alimentam o governador ──
+    // Conta PRÓPRIA do seller: não é titular do pool, não há quarentena nem
+    // governador a alimentar. Da disputa, só o aviso ao checkout.
     if (STRIPE_RISK_EVENTS.has(eventType)) {
+      if (isStripeOwnAccountId(accountId)) {
+        if (!eventType.startsWith('charge.dispute')) return { ignored: true, reason: 'conta própria' }
+        const tx = await this.resolveStripeTx(object)
+        const owned = tx ? this.ownStripeTxCheck(accountId, tx, object) : 'none'
+        if (owned !== 'ok') return { ignored: true, reason: 'disputa fora da Koopfy' }
+        await this.recordStripeDispute(tx!.id, eventType, object)
+        return { received: true, disputed: true }
+      }
       return this.processStripeRiskEvent(accountId, eventType, object)
     }
 
@@ -1628,6 +1652,28 @@ export class WebhookService {
 
     // ── 5. Resolve a transação ──
     const tx = await this.resolveStripeTx(object)
+
+    // Conta PRÓPRIA do seller: o webhook traz TODAS as vendas dele, inclusive
+    // as de fora da Koopfy — e quem assina é ele. Só vale evento de transação
+    // que NÓS mandamos para ESTA conta, com ESTE intent: senão um intent criado
+    // à mão na conta dele, com o nosso metadata, aprovaria um pedido sem pagar.
+    if (isStripeOwnAccountId(accountId)) {
+      const owned = tx ? this.ownStripeTxCheck(accountId, tx, object) : 'none'
+      if (owned === 'none') return { ignored: true, reason: 'venda fora da Koopfy' }
+      if (owned === 'retry') {
+        // A gravação da conta/intent na transação é assíncrona no createPayment:
+        // 5xx faz a Stripe reentregar quando a linha já estiver completa.
+        throw new Error(`Stripe: transação ${tx!.id} ainda sem conta/intent gravados (${accountId})`)
+      }
+      if (owned === 'mismatch') {
+        console.error(
+          `[WebhookService] 🚨 Stripe: evento da conta própria ${accountId} aponta para a transação ${tx!.id}, `
+          + 'que não é desta conta/intent — ignorado.',
+        )
+        return { ignored: true, reason: 'transação de outra conta' }
+      }
+    }
+
     if (!tx) {
       console.error(
         '[WebhookService] Stripe: PAGAMENTO ÓRFÃO — nenhuma transação casou.',
@@ -1643,8 +1689,9 @@ export class WebhookService {
     if (mapped === 'REFUNDED') {
       // Reembolso conta como sinal de risco também: taxa de reembolso alta é o
       // que a Stripe olha ANTES de a disputa aparecer — e é o único indicador
-      // em que agir cedo realmente muda o desfecho.
-      await this.stripeRisk.recordRiskEvent({
+      // em que agir cedo realmente muda o desfecho. (Conta própria não entra
+      // no governador do pool.)
+      if (!isStripeOwnAccountId(accountId)) await this.stripeRisk.recordRiskEvent({
         id: `rf_${object?.id ?? tx.id}`,
         accountId,
         kind: 'refund',
@@ -1714,30 +1761,7 @@ export class WebhookService {
       // checkout confere em GET /payments/:id/status) e avisa o checkout, que
       // registra o chargeback no pedido e alerta o vendedor e a plataforma.
       // Antes a disputa Stripe só ia pro log — ninguém juntava evidência a tempo.
-      if (txId) {
-        const { data: disputedTx } = await supabase
-          .from('transactions').select('*').eq('id', String(txId)).maybeSingle();
-        if (disputedTx) {
-          const dueBy = object?.evidence_details?.due_by;
-          const dispute = {
-            id: String(object?.id ?? ''),
-            source: 'stripe',
-            status: String(object?.status ?? (eventType === 'charge.dispute.created' ? 'needs_response' : 'updated')),
-            reason: object?.reason ?? null,
-            due_by: typeof dueBy === 'number' ? new Date(dueBy * 1000).toISOString() : (dueBy ?? null),
-            amount: Number.isFinite(Number(object?.amount)) ? Number(object.amount) / 100 : null,
-            currency: object?.currency ? String(object.currency).toUpperCase() : null,
-            updated_at: new Date().toISOString(),
-          };
-          const metadata = { ...(disputedTx.metadata ?? {}), stripe_dispute: dispute };
-          await supabase.from('transactions').update({ metadata }).eq('id', disputedTx.id);
-          await this.dispatchToAll({ ...disputedTx, metadata }, 'payment.disputed', {
-            transactionId: disputedTx.id,
-            status: disputedTx.status,
-            dispute,
-          }).catch((e: any) => console.error('[WebhookService] dispatch payment.disputed (stripe):', e?.message));
-        }
-      }
+      if (txId) await this.recordStripeDispute(String(txId), eventType, object)
 
       // A conta é onde o sintoma aparece; o afiliado é onde está a causa.
       // Reavaliar na hora porque a decisão de cortar depende de ver a tendência
@@ -1841,6 +1865,222 @@ export class WebhookService {
     return { received: true }
   }
 
+  // Grava a disputa na transação (é o que o checkout confere em
+  // GET /payments/:id/status) e avisa o checkout com payment.disputed.
+  private async recordStripeDispute(txId: string, eventType: string, object: any) {
+    const { data: disputedTx } = await supabase
+      .from('transactions').select('*').eq('id', txId).maybeSingle();
+    if (!disputedTx) return
+    const dueBy = object?.evidence_details?.due_by;
+    const dispute = {
+      id: String(object?.id ?? ''),
+      source: 'stripe',
+      status: String(object?.status ?? (eventType === 'charge.dispute.created' ? 'needs_response' : 'updated')),
+      reason: object?.reason ?? null,
+      due_by: typeof dueBy === 'number' ? new Date(dueBy * 1000).toISOString() : (dueBy ?? null),
+      amount: Number.isFinite(Number(object?.amount)) ? Number(object.amount) / 100 : null,
+      currency: object?.currency ? String(object.currency).toUpperCase() : null,
+      updated_at: new Date().toISOString(),
+    };
+    const metadata = { ...(disputedTx.metadata ?? {}), stripe_dispute: dispute };
+    await supabase.from('transactions').update({ metadata }).eq('id', disputedTx.id);
+    await this.dispatchToAll({ ...disputedTx, metadata }, 'payment.disputed', {
+      transactionId: disputedTx.id,
+      status: disputedTx.status,
+      dispute,
+    }).catch((e: any) => console.error('[WebhookService] dispatch payment.disputed (stripe):', e?.message));
+  }
+
+  /**
+   * O evento da conta Stripe PRÓPRIA é de uma transação que mandamos para ela?
+   *   ok       → a transação é desta conta e do mesmo intent;
+   *   retry    → casou pelo metadata, mas a conta/intent ainda não foi gravada;
+   *   mismatch → a transação é de outra conta ou de outro intent;
+   *   none     → nenhuma transação nossa (venda dele fora da Koopfy).
+   */
+  private ownStripeTxCheck(
+    accountId: string,
+    tx: { id: string; provider_account_id?: string | null; provider_transaction_id?: string | null },
+    object: any,
+  ): 'ok' | 'retry' | 'mismatch' | 'none' {
+    if (!tx.provider_account_id || !tx.provider_transaction_id) return 'retry'
+    if (tx.provider_account_id !== accountId) return 'mismatch'
+    const intentId = typeof object?.payment_intent === 'string'
+      ? object.payment_intent
+      : (object?.payment_intent?.id ?? (String(object?.id ?? '').startsWith('pi_') ? object.id : null))
+    if (intentId && intentId !== tx.provider_transaction_id) return 'mismatch'
+    return 'ok'
+  }
+
+  // ─── PAYPAL (conta do próprio seller) ─────────────────────────────────────
+  //
+  // A conta vai no PATH (`/webhook/paypal/paypall_<id>`), como na Stripe: cada
+  // app do seller tem o seu webhook_id, e é com ele que o PayPal verifica a
+  // assinatura. Sem verificação SUCCESS nada é processado.
+  //
+  // A captura normalmente já aprovou pelo POST /payments/:id/paypal/capture;
+  // aqui chegam a captura pendente que concluiu, a recusa, o reembolso e a
+  // disputa. Tudo pelos mesmos caminhos idempotentes dos outros provedores.
+
+  async handlePaypalWebhook(accountId: string, event: any, headers: Record<string, any> = {}) {
+    if (!isPaypalOwnAccountId(accountId) || !this.sellerProviders) {
+      return { ignored: true, reason: 'unknown account' }
+    }
+    const account = await this.sellerProviders.getProviderAccountById(accountId)
+    if (!account) {
+      console.warn('[WebhookService] PayPal: conta desconhecida no path:', accountId)
+      return { ignored: true, reason: 'unknown account' }
+    }
+
+    const eventType = String(event?.event_type ?? '')
+    const eventId = String(event?.id ?? '')
+
+    // THROW, não 2xx, em assinatura inválida ou verificação indisponível: o
+    // PayPal reentrega por dias, o que dá janela para corrigir sem perder a
+    // venda. Evento forjado só custa retentativas ruidosas.
+    const verified = await this.sellerProviders.verifyPaypalWebhook(account, headers, event)
+    if (!verified) {
+      console.error(`[WebhookService] PayPal: ASSINATURA NÃO VERIFICADA em ${accountId} (${eventType} ${eventId})`)
+      throw new Error(`PayPal: assinatura não verificada em ${accountId}`)
+    }
+    console.log('[PayPal webhook]', accountId, eventType, eventId)
+
+    if (eventId) {
+      const { error: dedupeError } = await supabase
+        .from('paypal_webhook_events')
+        .insert({ event_id: eventId, account_id: accountId, event_type: eventType })
+      if (dedupeError) {
+        if ((dedupeError as any).code === '23505') return { alreadyProcessed: true }
+        // Tabela ausente: os caminhos abaixo já são idempotentes, segue.
+        console.error('[WebhookService] PayPal dedupe insert error:', dedupeError.message)
+      }
+    }
+
+    try {
+      return await this.processPaypalEvent(accountId, eventType, event?.resource ?? {})
+    } catch (err) {
+      if (eventId) await supabase.from('paypal_webhook_events').delete().eq('event_id', eventId)
+      throw err
+    }
+  }
+
+  private async processPaypalEvent(accountId: string, eventType: string, resource: any) {
+    const tx = await this.resolvePaypalTx(eventType, resource)
+    // O app dele recebe também as vendas de fora da Koopfy: sem transação
+    // nossa, ou de outra conta, não é conosco.
+    if (!tx) return { ignored: true, reason: 'venda fora da Koopfy' }
+    if (!tx.provider_account_id) {
+      // A conta é gravada de forma assíncrona no createPayment: 5xx faz o
+      // PayPal reentregar quando a linha já estiver completa.
+      throw new Error(`PayPal: transação ${tx.id} ainda sem conta gravada (${accountId})`)
+    }
+    if (tx.provider_account_id !== accountId) {
+      console.error(`[WebhookService] 🚨 PayPal: evento de ${accountId} aponta para ${tx.id}, que é de outra conta — ignorado.`)
+      return { ignored: true, reason: 'transação de outra conta' }
+    }
+
+    if (eventType === 'PAYMENT.CAPTURE.COMPLETED' || eventType === 'PAYMENT.CAPTURE.DENIED') {
+      const orderId = resource?.supplementary_data?.related_ids?.order_id ?? null
+      if (orderId && tx.provider_transaction_id && orderId !== tx.provider_transaction_id) {
+        console.error(`[WebhookService] 🚨 PayPal: captura da order ${orderId} não é a order de ${tx.id} — ignorado.`)
+        return { ignored: true, reason: 'order de outra transação' }
+      }
+      await this.rememberPaypalCapture(tx, resource?.id ?? null)
+
+      if (eventType === 'PAYMENT.CAPTURE.DENIED') {
+        return this.handleWebhookProvider({
+          reference: tx.id,
+          status: 'FAILED',
+          type: 'TRANSACTION',
+          failure_code: 'PAYPAL_CAPTURE_DENIED',
+          failure_message: resource?.status_details?.reason ?? 'O PayPal recusou o pagamento.',
+        })
+      }
+
+      // Nunca aprova valor ou moeda diferentes do pedido: fica pendente, com
+      // alarme, para conciliação — aprovar a transação errada é pior.
+      const currency = String(resource?.amount?.currency_code ?? '').toUpperCase()
+      const expected = fromPaypalValue(toPaypalValue(tx.amount, tx.currency))
+      const received = fromPaypalValue(resource?.amount?.value ?? NaN)
+      if (currency !== String(tx.currency).toUpperCase() || received !== expected) {
+        console.error(
+          `[WebhookService] 🚨 PayPal: VALOR DIVERGENTE em ${tx.id} — esperado ${toPaypalValue(tx.amount, tx.currency)} `
+          + `${tx.currency}, capturado ${resource?.amount?.value ?? '?'} ${currency || '?'}. Não aprovado.`,
+        )
+        return { ignored: true, reason: 'valor divergente' }
+      }
+      return this.handleWebhookProvider({ reference: tx.id, status: 'PAID', type: 'TRANSACTION' })
+    }
+
+    if (eventType === 'PAYMENT.CAPTURE.REFUNDED') {
+      return this.refundTransaction(tx.id)
+    }
+
+    if (eventType === 'CUSTOMER.DISPUTE.CREATED') {
+      const dispute = {
+        id: String(resource?.dispute_id ?? ''),
+        source: 'paypal',
+        status: String(resource?.status ?? 'OPEN').toLowerCase(),
+        reason: resource?.reason ?? null,
+        due_by: resource?.seller_response_due_date ?? null,
+        amount: Number.isFinite(Number(resource?.dispute_amount?.value)) ? Number(resource.dispute_amount.value) : null,
+        currency: resource?.dispute_amount?.currency_code ?? null,
+        updated_at: new Date().toISOString(),
+      }
+      const { data: disputedTx } = await supabase.from('transactions').select('*').eq('id', tx.id).maybeSingle()
+      if (!disputedTx) return { ignored: true, reason: 'transaction not found' }
+      const metadata = { ...(disputedTx.metadata ?? {}), paypal_dispute: dispute }
+      await supabase.from('transactions').update({ metadata }).eq('id', disputedTx.id)
+      await this.dispatchToAll({ ...disputedTx, metadata }, 'payment.disputed', {
+        transactionId: disputedTx.id,
+        status: disputedTx.status,
+        dispute,
+      }).catch((e: any) => console.error('[WebhookService] dispatch payment.disputed (paypal):', e?.message))
+      return { received: true, disputed: true }
+    }
+
+    return { ignored: true, reason: 'unmapped event' }
+  }
+
+  /**
+   * Transação do evento. `custom_id` (= transactions.id, posto na order) é o
+   * fio primário; reembolso e disputa nem sempre o trazem, e aí vale o id da
+   * captura que guardamos na aprovação.
+   */
+  private async resolvePaypalTx(eventType: string, resource: any): Promise<any | null> {
+    const columns = 'id, amount, currency, seller_id, provider_account_id, provider_transaction_id, metadata'
+    const disputed = Array.isArray(resource?.disputed_transactions) ? resource.disputed_transactions[0] : null
+    const customId = resource?.custom_id ?? disputed?.custom ?? disputed?.custom_id ?? null
+    if (customId && /^[0-9a-f-]{36}$/i.test(String(customId))) {
+      const { data } = await supabase.from('transactions').select(columns).eq('id', String(customId)).maybeSingle()
+      if (data) return data
+    }
+
+    // Reembolso: a captura é o link `up`. Disputa: seller_transaction_id.
+    const upLink = Array.isArray(resource?.links)
+      ? resource.links.find((link: any) => link?.rel === 'up' && /\/captures\//.test(String(link?.href ?? '')))
+      : null
+    const captureId = eventType === 'PAYMENT.CAPTURE.REFUNDED'
+      ? (upLink ? String(upLink.href).split('/captures/')[1]?.split(/[/?]/)[0] : null)
+      : eventType === 'CUSTOMER.DISPUTE.CREATED'
+        ? disputed?.seller_transaction_id ?? null
+        : resource?.id ?? null
+    if (captureId) {
+      const { data } = await supabase.from('transactions').select(columns)
+        .eq('metadata->>paypal_capture_id', String(captureId)).maybeSingle()
+      if (data) return data
+    }
+    return null
+  }
+
+  private async rememberPaypalCapture(tx: any, captureId: string | null) {
+    if (!captureId || tx.metadata?.paypal_capture_id === captureId) return
+    const metadata = { ...(tx.metadata ?? {}), paypal_capture_id: captureId }
+    const { error } = await supabase.from('transactions').update({ metadata }).eq('id', tx.id)
+    if (error) console.error('[WebhookService] PayPal: captura não guardada:', error.message)
+    tx.metadata = metadata
+  }
+
   // ─────────────────────────────────────────────
   // Resolve transactions.id a partir do objeto da Stripe.
   //
@@ -1849,12 +2089,17 @@ export class WebhookService {
   // eventos de Charge, por exemplo, nem sempre carregam o metadata do intent.
   // ─────────────────────────────────────────────
 
-  private async resolveStripeTx(object: any): Promise<{ id: string; amount?: number; currency?: string; seller_id?: string } | null> {
+  private async resolveStripeTx(object: any): Promise<{
+    id: string; amount?: number; currency?: string; seller_id?: string;
+    provider_account_id?: string | null; provider_transaction_id?: string | null
+  } | null> {
     // 1) PRIMÁRIO — nosso transactions.id, ida e volta pelo metadata.
     const txId = object?.metadata?.koopfy_transaction_id
     if (txId) {
       const { data } = await supabase
-        .from('transactions').select('id, amount, currency, seller_id').eq('id', String(txId)).maybeSingle()
+        .from('transactions')
+        .select('id, amount, currency, seller_id, provider_account_id, provider_transaction_id')
+        .eq('id', String(txId)).maybeSingle()
       if (data) return data
     }
 
@@ -1865,7 +2110,7 @@ export class WebhookService {
 
     if (intentId) {
       const { data } = await supabase
-        .from('transactions').select('id, amount, currency')
+        .from('transactions').select('id, amount, currency, provider_account_id, provider_transaction_id')
         .eq('provider_transaction_id', String(intentId)).maybeSingle()
       if (data) return data
     }

@@ -1,6 +1,7 @@
 import Stripe from 'stripe';
 import { ChargeResponse, RetrieveResponse } from './provider.types';
 import { StripeRiskService } from '../stripe/stripe-risk.service';
+import { maskedPlanTitle } from './whop-plan-title';
 
 // ============================================================================
 // STRIPE — Payment Intents, uma conta (um titular) por cobrança
@@ -139,7 +140,7 @@ export class StripeProvider {
 
           ...(ctx.customer_email ? { receipt_email: ctx.customer_email } : {}),
 
-          description: this.buildDescription(ctx),
+          description: this.buildDescription(ctx, cfg),
 
           // ⚠️ O FIO DA RECONCILIAÇÃO. Volta no webhook. Não remova campos.
           metadata: {
@@ -351,7 +352,14 @@ export class StripeProvider {
     return String(value).replace(/[<>\\"']/g, '').trim().slice(0, 22);
   }
 
-  private buildDescription(ctx: any): string {
+  private buildDescription(ctx: any, cfg: any = {}): string {
+    // Conta do PRÓPRIO seller: o catálogo não sai da Koopfy (política de
+    // 2026-09-16, ver whop-plan-title.ts). Vai `<Loja> · #<pedido>`.
+    if (cfg?.linked) {
+      const metadata = ctx.metadata ?? {};
+      const orderRef = metadata.order_number ?? metadata.orderId ?? ctx.external_reference ?? ctx.transactionId;
+      return maskedPlanTitle(metadata.store_name ?? metadata.storeName ?? null, String(orderRef ?? ''), 350);
+    }
     const parts = [ctx.product_name, ctx.offer_name, ctx.external_reference]
       .filter(Boolean)
       .map(String);

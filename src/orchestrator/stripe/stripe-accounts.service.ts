@@ -1,7 +1,9 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
 import { supabase } from '../../lib/supabase.client';
 import { CryptoService } from '../../crypto/crypto.service';
 import { ProviderAccountConfig } from '../provider-accounts.config';
+import { SellerProviderAccountsService } from '../seller-provider/seller-provider-accounts.service';
+import { isStripeOwnAccountId } from '../seller-provider/seller-provider-accounts';
 
 // ============================================================================
 // STRIPE ACCOUNTS — pool dinâmico (tabela `stripe_accounts`)
@@ -118,7 +120,12 @@ const SELECT_COLUMNS =
 
 @Injectable()
 export class StripeAccountsService {
-  constructor(private readonly crypto: CryptoService) { }
+  constructor(
+    private readonly crypto: CryptoService,
+    // Stripe PRÓPRIA do seller ('stripel_…'): mora em seller_provider_accounts,
+    // não no pool. Opcional só para os testes que montam o serviço à mão.
+    @Optional() private readonly sellerProviders?: SellerProviderAccountsService,
+  ) { }
 
   private cache: ProviderAccountConfig[] | null = null;
   private hydratedAt = 0;
@@ -200,6 +207,12 @@ export class StripeAccountsService {
   // ─────────────────────────────────────────────
 
   async getById(id: string): Promise<ProviderAccountConfig | null> {
+    // Conta do seller: a chave e o whsec_ são dele, guardados cifrados. O
+    // webhook /webhook/stripe/stripel_<id> valida com o segredo DESTA conta.
+    if (isStripeOwnAccountId(id)) {
+      return this.sellerProviders ? this.sellerProviders.getProviderAccountById(id) : null;
+    }
+
     const cached = this.cache?.find(a => a.id === id);
     if (cached && Date.now() - this.hydratedAt < this.CACHE_TTL_MS) return cached;
 

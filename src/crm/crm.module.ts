@@ -55,6 +55,7 @@ import { OrchestratorModule } from '../orchestrator/orchestrator.module'
 import { WebhookModule } from '../webhooks/webhook.module'
 import { WhopConnectController, WhopRfiReviewsController } from './whop-connect.controller'
 import { WhopLinkedController } from './whop-linked.controller'
+import { SellerRoutingCrmController } from './seller-routing.controller'
 import { ActivationRequestsController } from './activation-requests.controller'
 import { ActivationModule } from '../activation/activation.module'
 import { AffiliatesModule } from '../affiliates/affiliates.module'
@@ -99,7 +100,7 @@ import { KoopfyIntegrationModule } from '../integration/koopfy-integration.modul
   // OrchestratorModule).
   // CrmCheckoutController: sellers e lojas do checkout (só leitura, via canal
   // interno).
-  controllers: [CrmController, CrmAdminController, CrmCheckoutController, CrmTicketsController, WhopConnectController, WhopRfiReviewsController, WhopLinkedController, ActivationRequestsController, AffiliateCrmController],
+  controllers: [CrmController, CrmAdminController, CrmCheckoutController, CrmTicketsController, WhopConnectController, WhopRfiReviewsController, WhopLinkedController, SellerRoutingCrmController, ActivationRequestsController, AffiliateCrmController],
   providers:   [CrmService, CrmAdminService, CrmCheckoutService, CrmAuthGuard, StorageService],
   exports:     [CrmService, CrmAdminService, CrmCheckoutService],
 })

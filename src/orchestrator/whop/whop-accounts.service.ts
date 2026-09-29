@@ -6,6 +6,8 @@ import { ConnectedRouting, WhopConnectService } from './whop-connect.service';
 import { isConnectedProviderAccountId } from './whop-connected';
 import { isLinkedProviderAccountId } from './whop-linked';
 import { WhopLinkedAccountsService } from './whop-linked.service';
+import { isWhopExtraAccountId } from '../seller-provider/seller-provider-accounts';
+import { SellerProviderAccountsService } from '../seller-provider/seller-provider-accounts.service';
 
 // ============================================================================
 // WHOP ACCOUNTS — pool dinâmico (tabela `whop_accounts`)
@@ -71,6 +73,8 @@ export class WhopAccountsService {
     @Optional() private readonly connected?: WhopConnectService,
     // Conta Whop própria do seller (modo conexão): resolve os ids 'whopl_…'.
     @Optional() private readonly linked?: WhopLinkedAccountsService,
+    // Contas Whop EXTRAS do seller (roteamento): resolve os ids 'whopa_…'.
+    @Optional() private readonly sellerProviders?: SellerProviderAccountsService,
   ) { }
 
   private cache: ProviderAccountConfig[] | null = null;
@@ -141,6 +145,12 @@ export class WhopAccountsService {
     // Conta própria do seller ('whopl_<biz>'): a chave é dele, guardada cifrada.
     if (isLinkedProviderAccountId(id)) {
       return this.linked ? this.linked.getProviderAccountById(id) : null;
+    }
+
+    // Conta Whop EXTRA do seller ('whopa_<id>', roteamento de contas): mesma
+    // chave cifrada e webhook próprio, em seller_provider_accounts.
+    if (isWhopExtraAccountId(id)) {
+      return this.sellerProviders ? this.sellerProviders.getProviderAccountById(id) : null;
     }
 
     const cached = this.cache?.find(a => a.id === id);

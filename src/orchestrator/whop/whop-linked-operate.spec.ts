@@ -19,7 +19,7 @@ jest.mock('../../lib/supabase.client', () => ({
 }))
 jest.mock('../../crypto/crypto.service', () => ({ CryptoService: class { } }))
 
-import { sellerMayOperate } from './whop-linked.service'
+import { ownWhopAccountCommissionPct, sellerMayOperate } from './whop-linked.service'
 
 beforeEach(() => {
   for (const key of Object.keys(linkedRows)) delete linkedRows[key]
@@ -61,34 +61,20 @@ describe('sellerMayOperate', () => {
   })
 })
 
-describe('afiliado da Koopfy na conta do seller', () => {
-  const { WhopLinkedAccountsService } = jest.requireActual('./whop-linked.service')
-
-  afterEach(() => { delete process.env.KOOPFY_WHOP_AFFILIATE })
-
-  // Resposta de POST /api/v1/affiliates como a doc da Whop descreve: sem
-  // `affiliate_code`; o código de atribuição é o username do afiliado.
-  const whop = (affiliate: any) => jest.fn(async (url: string) => ({
-    ok: true,
-    status: 200,
-    json: async () => (String(url).endsWith('/overrides') ? { id: 'ovr_1' } : affiliate),
-  }))
-
-  it('usa o username do afiliado como código de atribuição', async () => {
-    process.env.KOOPFY_WHOP_AFFILIATE = 'lucas@koopfy.com'
-    global.fetch = whop({ id: 'aff_1', status: 'active', user: { id: 'user_1', username: 'koopfy' } }) as any
-    const service = new WhopLinkedAccountsService({} as any)
-
-    const result = await (service as any).setupAffiliate('chave', 'https://api.whop.com', 'biz_1', 3)
-
-    expect(result).toEqual({ id: 'aff_1', code: 'koopfy', overrideId: 'ovr_1' })
+describe('ownWhopAccountCommissionPct', () => {
+  it('conta dele cobrando: vale o percentual do CRM', async () => {
+    linkedRows['s-1'] = { ...conectada, commission_pct: 4.5 }
+    expect(await ownWhopAccountCommissionPct('s-1')).toBe(4.5)
   })
 
-  it('sem username falha em vez de conectar sem comissão', async () => {
-    process.env.KOOPFY_WHOP_AFFILIATE = 'lucas@koopfy.com'
-    global.fetch = whop({ id: 'aff_1', user: { id: 'user_1' } }) as any
-    const service = new WhopLinkedAccountsService({} as any)
+  it('sem percentual gravado: 3%', async () => {
+    linkedRows['s-1'] = { ...conectada, commission_pct: null }
+    expect(await ownWhopAccountCommissionPct('s-1')).toBe(3)
+  })
 
-    await expect((service as any).setupAffiliate('chave', 'https://api.whop.com', 'biz_1', 3)).rejects.toThrow(/username/)
+  it('venda que não sai pela conta dele não tem comissão de conta própria', async () => {
+    expect(await ownWhopAccountCommissionPct('s-1')).toBeNull()
+    linkedRows['s-1'] = { status: 'allowed', whop_account_id: null, last_error: null, commission_pct: 3 }
+    expect(await ownWhopAccountCommissionPct('s-1')).toBeNull()
   })
 })

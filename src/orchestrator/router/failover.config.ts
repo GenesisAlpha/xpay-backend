@@ -33,6 +33,8 @@ export const FAILOVER_CHAIN: Record<string, ProviderName[]> = {
   boleto:     ['approvebly'],
   mbway:      ['setinel_gate'],
   crypto:     ['coinflow', 'whop'],
+  // Só a conta PayPal do próprio seller atende: sem ela, o método não existe.
+  paypal:     ['paypal'],
 };
 
 // Usada quando o método não está no mapa (ou não veio). Deliberadamente curta:
