@@ -14,6 +14,7 @@ import { PaypalProvider } from '../providers/paypal.provider';
 import { SellerProviderAccountsService } from '../seller-provider/seller-provider-accounts.service';
 import { OwnProvider, isOwnProviderAccountId, isPaypalOwnAccountId } from '../seller-provider/seller-provider-accounts';
 import { isTechnicalFailure } from '../routing/seller-routing';
+import { SlashProvider } from '../providers/slash.provider';
 import { WhopAccountsService } from '../whop/whop-accounts.service';
 import { StripeAccountsService } from '../stripe/stripe-accounts.service';
 import { ClipAccountsService } from '../clip/clip-accounts.service';
@@ -322,6 +323,8 @@ export class AccountRouterService implements OnModuleInit {
       case 'paypal':
         // Só conta PayPal do próprio seller: a Koopfy não tem pool PayPal.
         return new PaypalProvider();
+      case 'slash':
+        return new SlashProvider();
       default:
         throw new Error(`Unknown provider: "${provider}"`);
     }

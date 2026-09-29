@@ -7,7 +7,7 @@
 // Credenciais (API keys) ficam em variáveis de ambiente — nunca commitar chave.
 // ============================================================================
 
-export type ProviderName = 'setinel_gate' | 'approvebly' | 'coinflow' | 'simulator' | 'rox_pay' | 'whop' | 'stripe' | 'clip' | 'paypal';
+export type ProviderName = 'setinel_gate' | 'approvebly' | 'coinflow' | 'simulator' | 'rox_pay' | 'whop' | 'stripe' | 'clip' | 'paypal' | 'slash';
 
 // ⚠️ Nem toda conta vive aqui. Dois pools são DINÂMICOS e vêm de tabela:
 //
@@ -126,6 +126,26 @@ export const PROVIDER_ACCOUNTS: ProviderAccountConfig[] = [
     config: {
       company_id: process.env.ROX_PAY_COMPANY_ID,
       webhook_secret: process.env.ROX_PAY_WEBHOOK_SECRET,
+    },
+  },
+  {
+    id: 'slash_main',
+    provider: 'slash',
+    // Sem chave no ambiente a conta fica fora do pool: o router responde "sem
+    // conta" em vez de criar uma transação que falha na API.
+    status: process.env.SLASH_API_KEY ? 'active' : 'inactive',
+    weight: 1,
+    // Payment Elements: cartão + as carteiras que a conta tiver habilitadas
+    // (aparecem dentro do mesmo formulário). Moedas: só USD e EUR — travado em
+    // payments.service.ts antes de criar a transação.
+    supported_methods: ['card', 'apple_pay', 'google_pay'],
+    country: process.env.SLASH_SETTLEMENT_COUNTRY ?? 'US',
+    api_url: process.env.SLASH_API_URL ?? 'https://api.slash.com',
+    // Chave da ENTIDADE (Settings → API management da entidade), a do quickstart.
+    // Com chave de USUÁRIO, preencha também SLASH_LEGAL_ENTITY_ID (x-legal-entity).
+    apiKey: process.env.SLASH_API_KEY,
+    config: {
+      legal_entity_id: process.env.SLASH_LEGAL_ENTITY_ID,
     },
   },
   // TESTE — aprova tudo de forma fictícia (demo/underwriting). Sem credenciais.

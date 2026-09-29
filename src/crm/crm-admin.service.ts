@@ -8,6 +8,8 @@ import { providerCostCents, saleProfitCents } from '../orchestrator/fees/provide
 import { notifySellerPayout, type PayoutEmailInfo } from '../utils/seller-mail'
 import { WhopConnectedPayoutService } from '../orchestrator/whop/whop-connected-payout.service'
 import { isWhopConnectedPayout } from '../orchestrator/whop/whop-connected-payout'
+import { getProviderAccountById } from '../orchestrator/provider-accounts.config'
+import { SlashProvider } from '../orchestrator/providers/slash.provider'
 
 // Linha do ledger (debit_payout) → dados do e-mail de saque. O destino fica em
 // metadata.destination (camelCase), igual ao que o CRM exibe.
@@ -1481,6 +1483,14 @@ export class CrmAdminService {
       throw new BadRequestException('Valor inválido')
     }
 
+    // Slash: o estorno sai de verdade pela API. A contabilidade (status,
+    // saldo, reserva, postback ao checkout) NÃO é feita aqui: entra quando o
+    // webhook payments.refund.updated confirmar — o mesmo caminho de um estorno
+    // feito no painel da Slash. Fazer as duas coisas debitaria o seller duas vezes.
+    if (tx.provider === 'slash') {
+      return this.refundOnSlash(ctx, tx, amountCents, dto.reason)
+    }
+
     // ⚠️ TODO: Aqui precisa chamar o provider real (Stripe/Viva/SIBS) para
     // executar o refund. Por enquanto só registramos no banco.
 
@@ -1523,6 +1533,58 @@ export class CrmAdminService {
     })
 
     return { message: 'Reembolso registrado' }
+  }
+
+  private async refundOnSlash(ctx: AdminContext, tx: any, amountUsdCents: number, reason: string) {
+    if (!tx.provider_transaction_id) {
+      throw new BadRequestException('Transação sem payment intent da Slash — estorne pelo painel da Slash.')
+    }
+    const account = getProviderAccountById(tx.provider_account_id ?? 'slash_main') ?? getProviderAccountById('slash_main')
+    if (!account?.apiKey) throw new BadRequestException('Slash não configurada (SLASH_API_KEY).')
+
+    // O CRM fala em USD; a Slash estorna na moeda da venda. Valor cheio vai
+    // exato; parcial, na proporção do bruto.
+    const grossUsd = Number(tx.amount_usd_gross_cents)
+    const amountMinor = amountUsdCents >= grossUsd
+      ? Number(tx.amount)
+      : Math.round(Number(tx.amount) * amountUsdCents / grossUsd)
+
+    const result = await new SlashProvider().refund({
+      providerConfig: account,
+      providerTransactionId: tx.provider_transaction_id,
+      amountMinor,
+      // Clique repetido no mesmo valor devolve o mesmo reembolso em vez de
+      // estornar duas vezes.
+      idempotencyKey: `koopfy_rf_${tx.id}_${amountMinor}`,
+    })
+    if (!result.success) throw new BadRequestException(result.message ?? 'A Slash recusou o reembolso.')
+
+    await supabase.from('transactions').update({
+      metadata: {
+        ...(tx.metadata ?? {}),
+        refund_reason: reason,
+        refund_requested_minor: amountMinor,
+        refund_requested_by: ctx.managerId,
+        refund_requested_at: new Date().toISOString(),
+        slash_refund_id: result.refundId ?? null,
+      },
+    }).eq('id', tx.id)
+
+    await this.audit(ctx, 'transaction.refund_requested', 'transaction', tx.id, {
+      provider: 'slash',
+      amount_minor: amountMinor,
+      currency: tx.currency,
+      amount_usd_cents: amountUsdCents,
+      refund_id: result.refundId ?? null,
+      reason,
+      seller_id: tx.seller_id,
+    })
+
+    return {
+      message: 'Reembolso enviado à Slash. O saldo do seller é ajustado quando a Slash confirmar.',
+      refund_id: result.refundId ?? null,
+      status: result.status ?? 'pending',
+    }
   }
 
   // ════════════════════════════════════════════════════════════════════════

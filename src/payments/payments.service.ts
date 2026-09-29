@@ -28,6 +28,7 @@ import { AffiliateCommissionService } from '../affiliates/affiliate-commission.s
 import { StorageService } from '../lib/storage.service'
 import { WhopProvider, type WhopMembershipState } from '../orchestrator/providers/whop.provider'
 import { customerSubscriptionView, isSubscriptionTransaction } from './customer-subscription'
+import { SLASH_CURRENCIES } from '../orchestrator/providers/slash.provider'
 
 export interface ExternalFeeInput {
     recipient_id: string
@@ -124,7 +125,9 @@ export class PaymentService {
     // Checkout embedado: o comprador ainda NÃO inseriu dados de pagamento quando
     // respondemos — só abrimos o iframe. O checkout usa esse sinal pra adiar a
     // criação do pedido até haver engajamento real (ver processSplitAwarePayment).
-    private static readonly HOSTED_AWAITING_PROVIDERS = new Set(['rox_pay', 'whop'])
+    // Slash entra aqui pelo mesmo motivo: o intent é criado quando o comprador
+    // chega ao pagamento, antes de ele digitar o cartão.
+    private static readonly HOSTED_AWAITING_PROVIDERS = new Set(['rox_pay', 'whop', 'slash'])
 
     // ─── createPayment ────────────────────────────────────────────────────────
 
@@ -232,6 +235,24 @@ export class PaymentService {
             throw new BadRequestException({
                 code: 'CURRENCY_NOT_SUPPORTED',
                 message: 'Não aceitamos transações nesta moeda para este método de pagamento. Selecione outra moeda.',
+            })
+        }
+
+        // Slash: a API só aceita USD e EUR.
+        if (this.normalizeProviderName(seller?.provider_default) === 'slash'
+            && !SLASH_CURRENCIES.has(String(currency).toUpperCase())) {
+            throw new BadRequestException({
+                code: 'CURRENCY_NOT_SUPPORTED',
+                message: 'Não aceitamos transações nesta moeda para este método de pagamento. Selecione outra moeda.',
+            })
+        }
+        // Slash só faz cobrança avulsa: sem cartão salvo, a assinatura morreria
+        // no primeiro ciclo depois de o comprador pagar a entrada.
+        if (this.normalizeProviderName(seller?.provider_default) === 'slash'
+            && isSubscriptionTransaction(dto.metadata)) {
+            throw new BadRequestException({
+                code: 'SUBSCRIPTION_NOT_SUPPORTED',
+                message: 'Assinaturas não estão disponíveis neste meio de pagamento.',
             })
         }
 
@@ -374,6 +395,36 @@ export class PaymentService {
                     return this.formatResponse(existing)
                 }
                 transaction = existing
+
+                // Slash: o checkout cria o intent quando o comprador chega ao
+                // pagamento e refaz a chamada quando o total ou os dados mudam
+                // (frete, cupom, nome corrigido). A chave de idempotência é a do
+                // pedido, então a transação é a mesma — e precisa refletir o
+                // valor que o intent novo vai cobrar. Sem isto a transação ficava
+                // com o valor da primeira chamada e o crédito do seller sairia
+                // errado.
+                if (this.normalizeProviderName(seller?.provider_default) === 'slash'
+                    && ['pending', 'requires_action'].includes(existing.status)) {
+                    const { data: refreshed, error: refreshError } = await supabase
+                        .from('transactions')
+                        .update({
+                            amount, currency,
+                            amount_usd_net_cents: netUSDcents,
+                            amount_usd_gross_cents: grossUSDcents,
+                            fx_fee_cents: fxFeeUSDcents,
+                            fx_rate: fxFinalRate,
+                            customer_name: dto.customer?.name ?? existing.customer_name,
+                            customer_email: dto.customer?.email ?? existing.customer_email,
+                            customer_phone: dto.customer?.phone || existing.customer_phone,
+                            customer_country: dto.billing_address?.country ?? dto.customer?.country ?? existing.customer_country,
+                            metadata: dto.metadata ?? existing.metadata ?? {},
+                        })
+                        .eq('id', existing.id)
+                        .in('status', ['pending', 'requires_action'])
+                        .select().maybeSingle()
+                    if (refreshError) console.error('[PaymentService] Slash: transação não atualizada:', refreshError.message)
+                    if (refreshed) transaction = refreshed
+                }
             }
         }
 
@@ -1816,6 +1867,11 @@ export class PaymentService {
                     // receber { reservation_id, public_key }.
                     routeUrl: '/payments/clip/route',
                 }
+            case 'slash':
+                // Payment Elements da Slash (@slashfi/elements-react). Não há
+                // chave pública: o formulário monta com o clientSecret que volta
+                // de createPayment, um por intent.
+                return { provider, cardFlow: 'slash' as const }
             case 'simulator':
                 // Form LOCAL de cartão (número/validade/cvv) — sem redirect/elements.
                 return { provider, cardFlow: 'local' as const }
