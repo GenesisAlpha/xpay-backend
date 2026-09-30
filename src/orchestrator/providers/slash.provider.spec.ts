@@ -114,3 +114,17 @@ describe('mapSlashIntentStatus', () => {
     expect(mapSlashIntentStatus('whatever')).toBe('unknown')
   })
 })
+
+describe('failover da Slash', () => {
+  // Import tardio para não misturar com os mocks de fetch acima.
+  const { buildFailoverOrder } = require('../router/failover.config')
+
+  it('seller Slash não cai em outro PSP', () => {
+    expect(buildFailoverOrder({ preferred: 'slash', method: 'card' })).toEqual(['slash'])
+    expect(buildFailoverOrder({ preferred: 'slash', method: 'pix' })).toEqual(['slash'])
+  })
+
+  it('os demais seguem com a cadeia', () => {
+    expect(buildFailoverOrder({ preferred: 'stripe', method: 'card' }).length).toBeGreaterThan(1)
+  })
+})
