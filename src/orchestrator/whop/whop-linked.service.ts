@@ -626,11 +626,12 @@ export class WhopLinkedAccountsService {
   private async log(sellerId: string, managerId: string | null, action: string, payload: Record<string, any>) {
     const { error } = await supabase.from('crm_action_log').insert({
       seller_id: sellerId,
-      manager_id: managerId,
+      // `manager_id` é do gestor do CRM; seller e sistema vão no payload.
+      manager_id: managerId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(managerId) ? managerId : null,
       action,
       resource_type: 'seller',
       resource_id: sellerId,
-      payload,
+      payload: { ...payload, actor: managerId },
       created_at: new Date().toISOString(),
     });
     if (error) console.error(`[WhopLinked] ação ${action} não registrada:`, error.message);

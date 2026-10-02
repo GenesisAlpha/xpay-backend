@@ -136,8 +136,19 @@ export class KoopfyIntegrationController {
   // Guard leve: quem ainda não tem conta no pay também conecta (a conta nasce aqui).
   @Post('external-provider/connect')
   @UseGuards(CrossServiceTokenGuard)
-  connectExternalProvider(@Req() req: any, @Body() body: { apiKey?: string; label?: string }) {
-    return this.svc.connectExternalProvider(req.tokenEmail, req.accountSellerId ?? null, String(body?.apiKey ?? ''), body?.label ?? null);
+  connectExternalProvider(
+    @Req() req: any,
+    @Body() body: { apiKey?: string; label?: string; multiAccount?: boolean; acceptFee?: boolean; replace?: boolean },
+  ) {
+    // multiAccount/acceptFee/replace: o que fazer com a conta que já recebe —
+    // ver KoopfyIntegrationService.prepareConnection.
+    return this.svc.connectExternalProvider(
+      req.tokenEmail,
+      req.accountSellerId ?? null,
+      String(body?.apiKey ?? ''),
+      body?.label ?? null,
+      { multiAccount: body?.multiAccount, acceptFee: body?.acceptFee, replace: body?.replace },
+    );
   }
 
   // Stripe e PayPal do próprio seller (mesmo guard leve e mesma criação de conta
@@ -145,7 +156,10 @@ export class KoopfyIntegrationController {
   // Resposta: a mesma visão de status.externalProvider (com `providers`).
   @Post('external-provider/stripe/connect')
   @UseGuards(CrossServiceTokenGuard)
-  connectStripe(@Req() req: any, @Body() body: { secretKey?: string; publishableKey?: string; label?: string }) {
+  connectStripe(
+    @Req() req: any,
+    @Body() body: { secretKey?: string; publishableKey?: string; label?: string; multiAccount?: boolean; acceptFee?: boolean; replace?: boolean },
+  ) {
     return this.svc.connectOwnProvider(req.tokenEmail, req.accountSellerId ?? null, 'stripe', body ?? {});
   }
 
@@ -157,7 +171,10 @@ export class KoopfyIntegrationController {
 
   @Post('external-provider/paypal/connect')
   @UseGuards(CrossServiceTokenGuard)
-  connectPaypal(@Req() req: any, @Body() body: { clientId?: string; clientSecret?: string; mode?: 'live' | 'test'; label?: string }) {
+  connectPaypal(
+    @Req() req: any,
+    @Body() body: { clientId?: string; clientSecret?: string; mode?: 'live' | 'test'; label?: string; multiAccount?: boolean; acceptFee?: boolean; replace?: boolean },
+  ) {
     return this.svc.connectOwnProvider(req.tokenEmail, req.accountSellerId ?? null, 'paypal', body ?? {});
   }
 
@@ -200,6 +217,36 @@ export class KoopfyIntegrationController {
   @UseGuards(CrossServiceJwtGuard)
   updateRoutingAccount(@Req() req: any, @Param('accountId') accountId: string, @Body() body: any) {
     return this.svc.updateRoutingAccount(req.sellerCtx, accountId, body ?? {});
+  }
+
+  // O que mudou nas contas e no roteamento (conexões, ajustes, pausas, saques).
+  @Get('routing/history')
+  @UseGuards(CrossServiceJwtGuard)
+  routingHistory(@Req() req: any, @Query('limit') limit?: string) {
+    return this.svc.routingHistory(req.sellerCtx, limit);
+  }
+
+  // Financeiro de TODAS as contas próprias (Whop principal e extras, Stripe e
+  // PayPal): cada conta com o saldo dela e o total por moeda.
+  @Get('external-provider/finance')
+  @UseGuards(CrossServiceJwtGuard)
+  externalFinance(@Req() req: any) {
+    return this.svc.externalFinanceOverview(req.sellerCtx);
+  }
+
+  // Carteira de UMA conta: saldo, destinos do saque, histórico e agenda.
+  @Get('external-provider/accounts/:accountId/wallet')
+  @UseGuards(CrossServiceJwtGuard)
+  externalAccountWallet(@Req() req: any, @Param('accountId') accountId: string) {
+    return this.svc.externalAccountWallet(req.sellerCtx, accountId);
+  }
+
+  // Body: { amountCents, currency, payoutMethodId? }. Resposta: a carteira atualizada.
+  @Post('external-provider/accounts/:accountId/withdrawals')
+  @UseGuards(CrossServiceJwtGuard)
+  @HttpCode(HttpStatus.OK)
+  externalAccountWithdraw(@Req() req: any, @Param('accountId') accountId: string, @Body() body: any) {
+    return this.svc.externalAccountWithdraw(req.sellerCtx, accountId, body ?? {});
   }
 
   // Financeiro da conta externa: saldo, contas bancárias e saques, lidos da

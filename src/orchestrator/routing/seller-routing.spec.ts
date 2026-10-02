@@ -20,6 +20,7 @@ import {
   parseAccountPatch,
   scoreOf,
   selectAccount,
+  connectionChoice,
 } from './seller-routing';
 
 type Partial2 = {
@@ -334,3 +335,26 @@ describe('status.externalProvider com o roteamento', () => {
     expect(legacy.providers.stripe.accounts).toBeUndefined();
   });
 });
+
+describe('conectar mais uma conta', () => {
+  it('roteamento ligado: a conta nova sempre entra', () => {
+    expect(connectionChoice({ routingEnabled: true, occupying: 3 })).toBe('proceed')
+  })
+
+  it('primeira conta do grupo: conecta sem perguntar nada', () => {
+    expect(connectionChoice({ routingEnabled: false, occupying: 0 })).toBe('proceed')
+  })
+
+  it('já há conta recebendo e o seller não disse o que quer: o painel pergunta', () => {
+    expect(connectionChoice({ routingEnabled: false, occupying: 1 })).toBe('ask')
+  })
+
+  it('"usar várias contas" liga o roteamento; "trocar" segue como antes', () => {
+    expect(connectionChoice({ routingEnabled: false, occupying: 1, multiAccount: true })).toBe('enable')
+    // Na primeira conta também: é a opção oferecida já na conexão.
+    expect(connectionChoice({ routingEnabled: false, occupying: 0, multiAccount: true })).toBe('enable')
+    expect(connectionChoice({ routingEnabled: false, occupying: 1, replace: true })).toBe('proceed')
+    // Só `true` vale: valor solto no corpo não liga taxa nenhuma.
+    expect(connectionChoice({ routingEnabled: false, occupying: 1, multiAccount: 'true' })).toBe('ask')
+  })
+})

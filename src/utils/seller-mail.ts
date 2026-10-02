@@ -892,3 +892,125 @@ export async function notifySellerVerification(
     return false;
   }
 }
+
+// ── Roteamento de contas: conta pausada ───────────────────────────────────
+
+export interface RoutingPauseEmailInfo {
+  /** Nome que o seller reconhece (apelido, senão o nome da conta no provedor). */
+  accountName: string;
+  provider: string;
+  disputes: number;
+  approved: number;
+  limitPct: number;
+  /** Contas do mesmo grupo que continuam recebendo. */
+  remaining: number;
+}
+
+const ROUTING_PAUSE_COPY: Record<Lang, {
+  subject: (name: string) => string; badge: string; title: string; intro: (name: string) => string;
+  why: string; disputes: string; limit: string; next: string;
+  stillSelling: (n: number) => string; noneLeft: string; cta: string; footer: string;
+}> = {
+  pt: {
+    subject: (name) => `Conta ${name} pausada no roteamento`,
+    badge: 'Conta pausada',
+    title: 'Uma conta saiu do roteamento',
+    intro: (name) => `A conta ${name} passou do limite de disputas e parou de receber vendas novas. As vendas já feitas nela não mudam.`,
+    why: 'Por que pausou',
+    disputes: 'Disputas em 7 dias',
+    limit: 'Limite',
+    next: 'O que acontece agora',
+    stillSelling: (n) => n === 1 ? 'A outra conta do grupo continua recebendo as vendas.' : `As outras ${n} contas do grupo continuam recebendo as vendas.`,
+    noneLeft: 'Não há outra conta recebendo neste grupo: o checkout fica sem essa forma de pagamento até uma conta voltar. Conecte outra conta ou resolva as disputas.',
+    cta: 'Abrir o roteamento',
+    footer: 'A conta volta sozinha quando a taxa de disputas ficar abaixo do limite.',
+  },
+  es: {
+    subject: (name) => `Cuenta ${name} pausada en el enrutamiento`,
+    badge: 'Cuenta pausada',
+    title: 'Una cuenta salió del enrutamiento',
+    intro: (name) => `La cuenta ${name} superó el límite de disputas y dejó de recibir ventas nuevas. Las ventas ya hechas en ella no cambian.`,
+    why: 'Por qué se pausó',
+    disputes: 'Disputas en 7 días',
+    limit: 'Límite',
+    next: 'Qué pasa ahora',
+    stillSelling: (n) => n === 1 ? 'La otra cuenta del grupo sigue recibiendo las ventas.' : `Las otras ${n} cuentas del grupo siguen recibiendo las ventas.`,
+    noneLeft: 'No hay otra cuenta recibiendo en este grupo: el checkout queda sin esa forma de pago hasta que una cuenta vuelva. Conecta otra cuenta o resuelve las disputas.',
+    cta: 'Abrir el enrutamiento',
+    footer: 'La cuenta vuelve sola cuando la tasa de disputas quede por debajo del límite.',
+  },
+  en: {
+    subject: (name) => `Account ${name} paused in routing`,
+    badge: 'Account paused',
+    title: 'An account left the routing',
+    intro: (name) => `The account ${name} went over the dispute limit and stopped receiving new sales. Sales already made on it don't change.`,
+    why: 'Why it was paused',
+    disputes: 'Disputes in 7 days',
+    limit: 'Limit',
+    next: 'What happens now',
+    stillSelling: (n) => n === 1 ? 'The other account in the group keeps receiving sales.' : `The other ${n} accounts in the group keep receiving sales.`,
+    noneLeft: 'No other account is receiving in this group: the checkout loses this payment method until an account comes back. Connect another account or resolve the disputes.',
+    cta: 'Open routing',
+    footer: 'The account comes back on its own when the dispute rate drops below the limit.',
+  },
+};
+
+/**
+ * Avisa o seller que uma conta dele foi pausada por disputas. Sem isto ele só
+ * descobre abrindo a tela — e, se era a única conta do grupo, descobre pelas
+ * vendas que pararam. Nunca lança: o aviso não pode atrapalhar o roteamento.
+ */
+export async function notifySellerRoutingPause(
+  sellerId: string | null | undefined,
+  info: RoutingPauseEmailInfo,
+): Promise<void> {
+  try {
+    const apiKey = process.env.SENDGRID_API_KEY;
+    if (!apiKey || !sellerId) {
+      if (!apiKey) console.warn('[SellerMail] routing pause: SENDGRID_API_KEY ausente — e-mail não enviado.');
+      return;
+    }
+    const { data: seller } = await supabase
+      .from('seller_profiles').select('email, name, country').eq('id', sellerId).maybeSingle();
+    if (!seller?.email) {
+      console.warn(`[SellerMail] routing pause: seller ${sellerId} sem e-mail.`);
+      return;
+    }
+
+    const lang = languageFor(seller.country);
+    const c = ROUTING_PAUSE_COPY[lang];
+    const dashboard = (process.env.SELLER_DASHBOARD_URL ?? 'https://app.koopfy.com').replace(/\/+$/, '');
+    const rate = info.approved > 0 ? (info.disputes / info.approved) * 100 : 0;
+    const html = renderEmail({
+      lang,
+      tone: 'warning',
+      preheader: c.intro(info.accountName),
+      badge: c.badge,
+      title: c.title,
+      intro: c.intro(info.accountName),
+      sections: [
+        section(c.why, kvRows([
+          [c.disputes, `${info.disputes} / ${info.approved} (${percent(rate, lang)})`],
+          [c.limit, percent(info.limitPct, lang)],
+        ])),
+        section(c.next, callout(info.remaining > 0 ? 'info' : 'danger', escapeHtml(info.remaining > 0 ? c.stillSelling(info.remaining) : c.noneLeft))),
+      ],
+      primary: { label: c.cta, href: `${dashboard}/checkout/routing` },
+      footerNote: c.footer,
+      prefsUrl: `${dashboard}/settings/notifications`,
+    });
+
+    sgMail.setApiKey(apiKey);
+    await sgMail.send({
+      to: seller.email,
+      from: {
+        email: process.env.SENDGRID_FROM_EMAIL ?? process.env.PLATFORM_FROM_EMAIL ?? 'no-reply@koopfy.com',
+        name: process.env.SENDGRID_FROM_NAME ?? 'Koopfy',
+      },
+      subject: c.subject(info.accountName),
+      html,
+    });
+  } catch (error: any) {
+    console.error(`[SellerMail] routing pause (seller ${sellerId}) falhou:`, error?.response?.body ?? error?.message ?? error);
+  }
+}

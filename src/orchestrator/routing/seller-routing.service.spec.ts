@@ -10,6 +10,7 @@ function matches(row: any, filters: Array<[string, string, any]>) {
     if (op === 'eq') return row[column] === value
     if (op === 'neq') return row[column] !== value
     if (op === 'in') return (value as any[]).includes(row[column])
+    if (op === 'prefix') return (value as string[]).some(prefix => String(row[column]).startsWith(prefix))
     return true
   })
 }
@@ -25,6 +26,13 @@ jest.mock('../../lib/supabase.client', () => ({
         neq: (column: string, value: any) => { filters.push(['neq', column, value]); return builder },
         in: (column: string, value: any[]) => { filters.push(['in', column, value]); return builder },
         gte: () => builder,
+        // Histórico: `or('action.like.routing.%,…')` filtra pelos prefixos.
+        or: (expr: string) => {
+          const prefixes = expr.split(',').map(part => part.replace(/^action\.like\./, '').replace(/%$/, ''))
+          filters.push(['prefix', 'action', prefixes])
+          return builder
+        },
+        order: () => builder,
         limit: () => builder,
         maybeSingle: async () => ({ data: rows()[0] ?? null, error: null }),
         then: (resolve: any) => resolve({ data: rows(), error: null }),
@@ -337,5 +345,55 @@ describe('CRM', () => {
   it('padrão da taxa vem do env', async () => {
     process.env.ROUTING_FEE_PCT_DEFAULT = '1.5'
     expect((await build().settings(SELLER)).feePct).toBe(1.5)
+  })
+})
+
+describe('histórico e aviso de pausa', () => {
+  beforeEach(() => { for (const key of Object.keys(tables)) delete tables[key] })
+
+  it('o que o seller muda fica no histórico, com quem fez — e só os campos que ele pode ver', async () => {
+    tables.seller_provider_accounts = [providerRow('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'stripe')]
+    const svc = build()
+    await svc.update(SELLER, { enabled: true, acceptFee: true, cardStrategy: 'score' }, 'seller:u-1')
+    const stripeId = 'stripel_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    await svc.updateAccount(SELLER, stripeId, { weight: 70, label: 'Principal' }, 'seller:u-1')
+    // Linha de outra área do CRM e de outro seller: não aparecem.
+    tables.crm_action_log.push({ seller_id: SELLER, action: 'seller.approved', payload: {}, created_at: '2026-09-01T00:00:00Z' })
+    tables.crm_action_log.push({ seller_id: 'outro', action: 'routing.settings_changed', payload: {}, created_at: '2026-09-01T00:00:00Z' })
+
+    const { events } = await svc.history(SELLER)
+    expect(events.map(event => event.action).sort()).toEqual(['routing.account_changed', 'routing.settings_changed'])
+    const changed = events.find(event => event.action === 'routing.account_changed')!
+    expect(changed).toMatchObject({ actor: 'seller', accountId: stripeId, accountName: 'Principal', details: { weight: 70, label: 'Principal' } })
+    // O ator vai no payload: manager_id é só do gestor do CRM.
+    expect(tables.crm_action_log[0]).toMatchObject({ manager_id: null, payload: expect.objectContaining({ actor: 'seller:u-1' }) })
+    expect(JSON.stringify(events)).not.toContain('u-1')
+  })
+
+  it('conta pausada por disputas: entra no histórico e o seller é avisado UMA vez, sabendo quantas contas sobraram', async () => {
+    tables.seller_provider_accounts = [
+      providerRow('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'stripe'),
+      providerRow('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 'stripe'),
+    ]
+    enableRouting()
+    const risky = 'stripel_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    tables.transactions = [
+      ...Array.from({ length: 30 }, () => ({ seller_id: SELLER, provider_account_id: risky, status: 'approved', amount_usd_gross_cents: 5000 })),
+      { seller_id: SELLER, provider_account_id: risky, status: 'chargeback', amount_usd_gross_cents: 5000, stripe_dispute: { id: 'dp_1' } },
+    ]
+    const svc = build()
+    const notices: any[] = []
+    svc.notifyPause = async (sellerId, info) => { notices.push({ sellerId, ...info }) }
+
+    await svc.resolveForConfig(SELLER, 'sess-1')
+    await svc.resolveForConfig(SELLER, 'sess-2')
+    await new Promise(resolve => setImmediate(resolve))
+
+    expect(notices).toHaveLength(1)
+    expect(notices[0]).toMatchObject({ sellerId: SELLER, provider: 'stripe', disputes: 1, remaining: 1 })
+    const logged = tables.crm_action_log.filter(row => row.action === 'routing.account_auto_paused')
+    expect(logged).toHaveLength(1)
+    expect(logged[0].payload).toMatchObject({ account_id: risky, reason: 'disputes', actor: 'system' })
+    expect((await svc.history(SELLER)).events[0]).toMatchObject({ action: 'routing.account_auto_paused', actor: 'system', accountId: risky })
   })
 })

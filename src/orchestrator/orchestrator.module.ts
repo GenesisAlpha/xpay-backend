@@ -16,6 +16,7 @@ import { AffiliateRiskService } from './stripe/affiliate-risk.service';
 import { CryptoModule } from '../crypto/crypto.module';
 import { SellerProviderAccountsService } from './seller-provider/seller-provider-accounts.service';
 import { SellerRoutingService } from './routing/seller-routing.service';
+import { OwnAccountFinanceService } from './own-finance/own-account-finance.service';
 
 @Module({
   imports: [CryptoModule], // 🔥 precisa pra decrypt
@@ -41,6 +42,8 @@ import { SellerRoutingService } from './routing/seller-routing.service';
     SellerProviderAccountsService,
     // Roteamento de contas próprias (várias Whop/Stripe/PayPal por seller).
     SellerRoutingService,
+    // Financeiro das contas próprias: saldo, saque e histórico por conta.
+    OwnAccountFinanceService,
     StripeAccountsService,
     StripeRiskService,
     StripeEfwService,
@@ -80,6 +83,8 @@ import { SellerRoutingService } from './routing/seller-routing.service';
     // SellerRoutingService: o pagamento escolhe a conta da sessão, o painel e
     // o CRM configuram o roteamento.
     SellerRoutingService,
+    // OwnAccountFinanceService: o painel lê saldo e pede saque de cada conta.
+    OwnAccountFinanceService,
     StripeAccountsService,
     StripeRiskService,
     StripeEfwService,
