@@ -20,6 +20,7 @@ import {
   parseAccountPatch,
   scoreOf,
   selectAccount,
+  accountsToReplace,
   connectionChoice,
 } from './seller-routing';
 
@@ -358,3 +359,21 @@ describe('conectar mais uma conta', () => {
     expect(connectionChoice({ routingEnabled: false, occupying: 1, multiAccount: 'true' })).toBe('ask')
   })
 })
+
+describe('trocar a conta atual (roteamento desligado)', () => {
+  const occupying = [{ id: 'whopl_biz_1', provider: 'whop' as const }];
+
+  it('a conta de outro provedor do grupo sai depois que a nova conecta', () => {
+    expect(accountsToReplace({ provider: 'stripe', replace: true, routingEnabled: false, occupying })).toEqual(['whopl_biz_1']);
+  });
+
+  it('mesmo provedor: a conexão regrava a conta no lugar, nada a remover', () => {
+    expect(accountsToReplace({ provider: 'whop', replace: true, routingEnabled: false, occupying })).toEqual([]);
+  });
+
+  it('sem o pedido de troca, ou com o roteamento ligado, ninguém sai', () => {
+    expect(accountsToReplace({ provider: 'stripe', routingEnabled: false, occupying })).toEqual([]);
+    expect(accountsToReplace({ provider: 'stripe', replace: 'true', routingEnabled: false, occupying })).toEqual([]);
+    expect(accountsToReplace({ provider: 'stripe', replace: true, routingEnabled: true, occupying })).toEqual([]);
+  });
+});

@@ -96,6 +96,23 @@ export function connectionChoice(args: {
   return 'ask';
 }
 
+/**
+ * "Trocar a conta atual" com o roteamento desligado: quais contas saem DEPOIS
+ * que a nova conecta. Só as de OUTRO provedor do mesmo grupo — a do mesmo
+ * provedor é regravada no lugar pela própria conexão (uma linha por provedor
+ * sem o roteamento). Sair depois, e não antes, é o que garante que uma chave
+ * errada na conta nova não deixa o seller sem conta nenhuma.
+ */
+export function accountsToReplace(args: {
+  provider: OwnProvider;
+  replace?: unknown;
+  routingEnabled: boolean;
+  occupying: Array<{ id: string; provider: OwnProvider }>;
+}): string[] {
+  if (args.routingEnabled || args.replace !== true) return [];
+  return args.occupying.filter(entry => entry.provider !== args.provider).map(entry => entry.id);
+}
+
 // ─── Configuração por conta ───────────────────────────────────────────────
 
 /** Linha de seller_routing_accounts (ou o padrão, quando a conta não tem linha). */

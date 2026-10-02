@@ -34,7 +34,7 @@ import { ActivationRequestsService } from '../activation/activation-requests.ser
 import { WhopConnectService } from '../orchestrator/whop/whop-connect.service';
 import { WhopLinkedAccountsService, sellerMayOperate } from '../orchestrator/whop/whop-linked.service';
 import { isLinkedProviderAccountId, sellerExternalProviderView, toLinkedProviderAccountId } from '../orchestrator/whop/whop-linked';
-import { connectionChoice, defaultRoutingFeePct } from '../orchestrator/routing/seller-routing';
+import { accountsToReplace, connectionChoice, defaultRoutingFeePct } from '../orchestrator/routing/seller-routing';
 import { SellerProviderAccountsService } from '../orchestrator/seller-provider/seller-provider-accounts.service';
 import { SellerRoutingService } from '../orchestrator/routing/seller-routing.service';
 import { OwnAccountFinanceService } from '../orchestrator/own-finance/own-account-finance.service';
@@ -168,7 +168,7 @@ export class KoopfyIntegrationService {
     provider: 'whop' | SellerProviderKind,
     body: Record<string, any>,
     actor: string,
-  ): Promise<{ enabledRouting: boolean }> {
+  ): Promise<{ enabledRouting: boolean; replaceIds: string[] }> {
     const settings = await this.sellerRouting.settings(sellerId);
     const group = provider === 'paypal' ? 'paypal' : 'card';
     const occupying = settings.enabled
@@ -182,10 +182,15 @@ export class KoopfyIntegrationService {
       replace: body?.replace,
       occupying: occupying.length,
     });
-    if (choice === 'proceed') return { enabledRouting: false };
+    if (choice === 'proceed') {
+      return {
+        enabledRouting: false,
+        replaceIds: accountsToReplace({ provider, replace: body?.replace, routingEnabled: settings.enabled, occupying }),
+      };
+    }
     if (choice === 'enable') {
       await this.sellerRouting.update(sellerId, { enabled: true, acceptFee: body?.acceptFee === true }, actor);
-      return { enabledRouting: true };
+      return { enabledRouting: true, replaceIds: [] };
     }
 
     // 400, não 409: o checkout só repassa ao painel o motivo de 400/422.
@@ -211,12 +216,19 @@ export class KoopfyIntegrationService {
    */
   private async connectWithChoice<T>(
     sellerId: string,
-    prepared: { enabledRouting: boolean },
+    prepared: { enabledRouting: boolean; replaceIds: string[] },
     actor: string,
     connect: () => Promise<T>,
   ): Promise<T> {
     try {
-      return await connect();
+      const connected = await connect();
+      // "Trocar a conta atual": a antiga só sai agora, com a nova já no ar.
+      // Se não sair, a nova fica conectada e o seller vê as duas na tela.
+      for (const accountId of prepared.replaceIds) {
+        await this.disconnectAccountById(sellerId, accountId, actor)
+          .catch((err: any) => console.error(`[Integration] conta ${accountId} de ${sellerId} não saiu na troca:`, err?.message));
+      }
+      return connected;
     } catch (err) {
       if (prepared.enabledRouting) {
         await this.sellerRouting.update(sellerId, { enabled: false }, actor)
@@ -234,7 +246,11 @@ export class KoopfyIntegrationService {
   async disconnectOwnAccount(ctx: SellerCtx, accountId: string) {
     if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
     const sellerId = ctx.seller.id;
-    const actor = `seller:${ctx.userId}`;
+    await this.disconnectAccountById(sellerId, accountId, `seller:${ctx.userId}`);
+    return this.externalProviderStatus(sellerId);
+  }
+
+  private async disconnectAccountById(sellerId: string, accountId: string, actor: string) {
     if (isLinkedProviderAccountId(accountId)) {
       const row = await this.whopLinked.getRow(sellerId);
       if (!row?.whop_account_id || toLinkedProviderAccountId(row.whop_account_id) !== accountId) {
@@ -244,7 +260,6 @@ export class KoopfyIntegrationService {
     } else {
       await this.sellerProviders.disconnectById(sellerId, accountId, actor);
     }
-    return this.externalProviderStatus(sellerId);
   }
 
   /** Conta do pay de quem conecta; cria a principal quando ainda não existe. */
@@ -290,6 +305,7 @@ export class KoopfyIntegrationService {
         sellerId,
         { secretKey: body?.secretKey, publishableKey: body?.publishableKey, label: body?.label ?? null },
         actor,
+        { replacing: prepared.replaceIds.length > 0 },
       )
       : this.sellerProviders.connectPaypal(
         sellerId,
@@ -327,7 +343,7 @@ export class KoopfyIntegrationService {
     // Com o roteamento ligado e a principal já conectada, outra company entra
     // como conta Whop EXTRA (whopa_…) — ver WhopLinkedAccountsService.connect.
     await this.connectWithChoice(sellerId, prepared, actor, () =>
-      this.whopLinked.connect(sellerId, apiKey, actor, { label }));
+      this.whopLinked.connect(sellerId, apiKey, actor, { label, replacing: prepared.replaceIds.length > 0 }));
     // Mesma visão do /status (campos da Whop + `providers`).
     return this.externalProviderStatus(sellerId);
   }

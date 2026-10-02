@@ -375,7 +375,14 @@ export class WhopLinkedAccountsService {
    * Liga a conta do seller: valida a chave contra a Whop (quem é a company),
    * recusa conta que já é filha da Koopfy ou de outro seller, e guarda cifrada.
    */
-  async connect(sellerId: string, apiKey: string, actor: string | null = null, opts: { label?: string | null } = {}) {
+  async connect(
+    sellerId: string,
+    apiKey: string,
+    actor: string | null = null,
+    // `replacing`: o seller escolheu trocar a conta de cartão atual (Stripe) por
+    // esta; a antiga é desconectada por quem chama, depois que esta conectar.
+    opts: { label?: string | null; replacing?: boolean } = {},
+  ) {
     const key = String(apiKey ?? '').trim();
     if (!key) throw new BadRequestException('Informe a chave de API da sua conta Whop.');
 
@@ -394,7 +401,7 @@ export class WhopLinkedAccountsService {
     // Roteamento ligado: Whop e Stripe convivem, e uma Whop além da principal
     // vira conta EXTRA (`whopa_…`). Desligado: só uma conta própria de cartão.
     const routing = await sellerRoutingEnabled(sellerId);
-    if (!routing) {
+    if (!routing && !opts.replacing) {
       // Whop e Stripe cobram cartão: só uma conta própria de cartão por vez.
       const conflict = ownProviderConflict('whop', { whop: false, stripe: await sellerHasOwnStripe(sellerId) });
       if (conflict) throw new ConflictException(conflict);
