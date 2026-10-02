@@ -24,9 +24,11 @@
 -- Segredos (secret_enc, webhook_secret_enc) são cifrados com CRYPTO_MASTER_KEY
 -- (CryptoService), igual a whop_linked_accounts. Só cria tabelas. Idempotente.
 
+-- seller_id é TEXT: seller_profiles.id é text em produção (igual a
+-- whop_linked_accounts.seller_id). Com uuid a chave estrangeira não é criada.
 create table if not exists public.seller_provider_accounts (
   id uuid primary key default gen_random_uuid(),
-  seller_id uuid not null references public.seller_profiles (id) on delete cascade,
+  seller_id text not null references public.seller_profiles (id) on delete cascade,
   provider text not null check (provider in ('stripe', 'paypal', 'whop')),
   status text not null default 'active' check (status in ('active', 'invalid', 'disabled', 'standby')),
   -- Stripe em modo de teste (sk_test_) / PayPal sandbox = 'test'.

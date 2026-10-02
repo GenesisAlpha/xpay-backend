@@ -15,7 +15,7 @@
 -- Só cria tabelas. Idempotente. Não aplicar sem combinar o deploy do pay.
 
 create table if not exists public.seller_routing_settings (
-  seller_id uuid primary key references public.seller_profiles (id) on delete cascade,
+  seller_id text primary key references public.seller_profiles (id) on delete cascade,
   enabled boolean not null default false,
   enabled_at timestamptz,
   -- Aceite da taxa de roteamento no painel (exigido na primeira vez que liga).
@@ -42,7 +42,7 @@ comment on table public.seller_routing_settings is
 -- para onde vai a venda. Conta sem linha usa o padrão (peso 100, prioridade 100).
 create table if not exists public.seller_routing_accounts (
   provider_account_id text primary key,
-  seller_id uuid not null references public.seller_profiles (id) on delete cascade,
+  seller_id text not null references public.seller_profiles (id) on delete cascade,
   provider text not null check (provider in ('whop', 'stripe', 'paypal')),
   label text,
   weight int not null default 100 check (weight >= 0),
@@ -73,7 +73,7 @@ comment on table public.seller_routing_accounts is
 -- checkout). TTL de 24 h: sessão velha escolhe de novo.
 create table if not exists public.routing_assignments (
   routing_key text primary key,
-  seller_id uuid not null references public.seller_profiles (id) on delete cascade,
+  seller_id text not null references public.seller_profiles (id) on delete cascade,
   card_account_id text,
   paypal_account_id text,
   created_at timestamptz not null default now(),
