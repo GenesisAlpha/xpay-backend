@@ -38,6 +38,7 @@ import { accountsToReplace, connectionChoice, defaultRoutingFeePct } from '../or
 import { SellerProviderAccountsService } from '../orchestrator/seller-provider/seller-provider-accounts.service';
 import { SellerRoutingService } from '../orchestrator/routing/seller-routing.service';
 import { OwnAccountFinanceService } from '../orchestrator/own-finance/own-account-finance.service';
+import { OwnPaymentDomainsService } from '../orchestrator/own-finance/own-payment-domains.service';
 import {
   SellerProviderKind,
   combineExternalProviderView,
@@ -84,6 +85,7 @@ export class KoopfyIntegrationService {
     private readonly sellerRouting: SellerRoutingService,
     // Saldo, saque e histórico de cada conta própria.
     private readonly ownFinance: OwnAccountFinanceService,
+    private readonly ownDomains: OwnPaymentDomainsService,
   ) {}
 
   /**
@@ -145,6 +147,22 @@ export class KoopfyIntegrationService {
   externalAccountWallet(ctx: SellerCtx, accountId: string) {
     if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
     return this.ownFinance.wallet(ctx.seller.id, accountId);
+  }
+
+  /** Domínios registrados na conta dele (Apple Pay / Google Pay). */
+  async externalAccountDomains(ctx: SellerCtx, accountId: string) {
+    if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
+    try {
+      return await this.ownDomains.list(ctx.seller.id, accountId);
+    } catch (err: any) {
+      if (err instanceof BadRequestException || err instanceof NotFoundException) throw err;
+      throw new BadRequestException(`Não foi possível ler os domínios desta conta (${err?.message ?? 'erro'}).`);
+    }
+  }
+
+  async externalAccountRegisterDomain(ctx: SellerCtx, accountId: string, hostname: unknown) {
+    if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
+    return this.ownDomains.register(ctx.seller.id, accountId, hostname, `seller:${ctx.userId}`);
   }
 
   externalAccountWithdraw(ctx: SellerCtx, accountId: string, body: Record<string, any>) {
@@ -222,6 +240,9 @@ export class KoopfyIntegrationService {
   ): Promise<T> {
     try {
       const connected = await connect();
+      // Apple Pay / Google Pay: o checkout da Koopfy entra na conta dele agora,
+      // em segundo plano — a conexão não espera nem falha por isso.
+      void this.ownDomains.registerPlatformHostsEverywhere(sellerId);
       // "Trocar a conta atual": a antiga só sai agora, com a nova já no ar.
       // Se não sair, a nova fica conectada e o seller vê as duas na tela.
       for (const accountId of prepared.replaceIds) {

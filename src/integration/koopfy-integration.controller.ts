@@ -249,6 +249,21 @@ export class KoopfyIntegrationController {
     return this.svc.externalAccountWithdraw(req.sellerCtx, accountId, body ?? {});
   }
 
+  // Apple Pay / Google Pay: domínios registrados na conta Whop ou Stripe dele.
+  @Get('external-provider/accounts/:accountId/payment-domains')
+  @UseGuards(CrossServiceJwtGuard)
+  externalAccountDomains(@Req() req: any, @Param('accountId') accountId: string) {
+    return this.svc.externalAccountDomains(req.sellerCtx, accountId);
+  }
+
+  // Body: { hostname }. Registra e pede a verificação; devolve a lista atualizada.
+  @Post('external-provider/accounts/:accountId/payment-domains')
+  @UseGuards(CrossServiceJwtGuard)
+  @HttpCode(HttpStatus.OK)
+  externalAccountRegisterDomain(@Req() req: any, @Param('accountId') accountId: string, @Body() body: any) {
+    return this.svc.externalAccountRegisterDomain(req.sellerCtx, accountId, body?.hostname);
+  }
+
   // Financeiro da conta externa: saldo, contas bancárias e saques, lidos da
   // conta Whop do seller com a chave que ele conectou.
   @Get('external-provider/wallet')

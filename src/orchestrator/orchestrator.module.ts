@@ -17,6 +17,7 @@ import { CryptoModule } from '../crypto/crypto.module';
 import { SellerProviderAccountsService } from './seller-provider/seller-provider-accounts.service';
 import { SellerRoutingService } from './routing/seller-routing.service';
 import { OwnAccountFinanceService } from './own-finance/own-account-finance.service';
+import { OwnPaymentDomainsService } from './own-finance/own-payment-domains.service';
 
 @Module({
   imports: [CryptoModule], // 🔥 precisa pra decrypt
@@ -44,6 +45,7 @@ import { OwnAccountFinanceService } from './own-finance/own-account-finance.serv
     SellerRoutingService,
     // Financeiro das contas próprias: saldo, saque e histórico por conta.
     OwnAccountFinanceService,
+    OwnPaymentDomainsService,
     StripeAccountsService,
     StripeRiskService,
     StripeEfwService,
@@ -85,6 +87,8 @@ import { OwnAccountFinanceService } from './own-finance/own-account-finance.serv
     SellerRoutingService,
     // OwnAccountFinanceService: o painel lê saldo e pede saque de cada conta.
     OwnAccountFinanceService,
+    // OwnPaymentDomainsService: domínio do checkout na conta dele (Apple Pay / Google Pay).
+    OwnPaymentDomainsService,
     StripeAccountsService,
     StripeRiskService,
     StripeEfwService,

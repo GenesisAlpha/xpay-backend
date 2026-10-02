@@ -1,9 +1,11 @@
 import { WhopApiError } from '../orchestrator/whop/whop-platform.client';
-import { KoopfyPaymentDomainsService, normalizeHostname } from './koopfy-payment-domains.service';
+import { KoopfyPaymentDomainsService, normalizeHostname, ownRegistration } from './koopfy-payment-domains.service';
 
 jest.mock('../lib/supabase.client', () => ({ supabase: {} }));
 jest.mock('../orchestrator/whop/whop-connect.service', () => ({ WhopConnectService: class {} }));
 jest.mock('../orchestrator/whop/whop-linked.service', () => ({ WhopLinkedAccountsService: class {} }));
+jest.mock('../orchestrator/seller-provider/seller-provider-accounts.service', () => ({ sellerHasOwnStripe: async () => false }));
+jest.mock('../orchestrator/own-finance/own-payment-domains.service', () => ({ OwnPaymentDomainsService: class {} }));
 
 const ctx: any = { userId: 'u', email: 'a@b.com', seller: { id: 'seller-1', status: 'approved', kyc_status: null } };
 
@@ -18,7 +20,16 @@ function setup(opts: { connected?: string | null; linked?: boolean; domains?: Re
   };
   const connect: any = { getRow: jest.fn(async () => opts.connected ? { whop_account_id: opts.connected } : null) };
   const linked: any = { getRow: jest.fn(async () => opts.linked ? { whop_account_id: 'biz_own', api_key: 'k' } : null) };
-  return { whop, service: new KoopfyPaymentDomainsService(whop, connect, linked) };
+  const ownDomains: any = {
+    registerEverywhere: jest.fn(async (_seller: string, hostname: string, o?: { register: boolean }) => [
+      {
+        accountId: 'whopl_biz_own', provider: 'whop', name: 'Minha Whop', error: null,
+        domain: o?.register === false ? null : { id: 'pmdm_1', hostname, applePay: 'active', googlePay: 'not_required', message: null },
+      },
+      { accountId: 'stripel_1', provider: 'stripe', name: 'Stripe EUA', domain: null, error: 'chave sem permissão' },
+    ]),
+  };
+  return { whop, ownDomains, service: new KoopfyPaymentDomainsService(whop, connect, linked, ownDomains) };
 }
 
 describe('KoopfyPaymentDomainsService', () => {
@@ -62,10 +73,29 @@ describe('KoopfyPaymentDomainsService', () => {
     expect(whop.createPaymentMethodDomain).toHaveBeenCalledWith('loja.com', null, 'pmd:master:loja.com');
   });
 
-  it('conta Whop própria: não registra (painel do seller)', async () => {
-    const { whop, service } = setup({ linked: true });
+  it('contas próprias: registra em cada conta dele, nunca na master', async () => {
+    const { whop, ownDomains, service } = setup({ linked: true });
     const result = await service.register(ctx, 'loja.com');
     expect(result.mode).toBe('external');
     expect(whop.createPaymentMethodDomain).not.toHaveBeenCalled();
+    expect(ownDomains.registerEverywhere).toHaveBeenCalledWith('seller-1', 'loja.com');
+    expect(result.registrations).toEqual([
+      { scope: 'own', accountId: 'whopl_biz_own', provider: 'whop', name: 'Minha Whop', id: 'pmdm_1', status: 'verified', message: null, applePay: 'active', googlePay: 'not_required' },
+      { scope: 'own', accountId: 'stripel_1', provider: 'stripe', name: 'Stripe EUA', id: null, status: 'error', message: 'chave sem permissão' },
+    ]);
+  });
+
+  it('contas próprias: abrir a tela só consulta, não registra', async () => {
+    const { ownDomains, service } = setup({ linked: true });
+    const result = await service.status(ctx, 'loja.com');
+    expect(ownDomains.registerEverywhere).toHaveBeenCalledWith('seller-1', 'loja.com', { register: false });
+    expect(result.registrations[0]).toMatchObject({ scope: 'own', status: 'error', message: 'not_registered' });
+  });
+
+  it('Stripe com o arquivo pendente: Google Pay já ativo, Apple Pay esperando', () => {
+    expect(ownRegistration({
+      accountId: 'stripel_1', provider: 'stripe', name: null, error: null,
+      domain: { id: 'pmd_1', hostname: 'loja.com', applePay: 'pending', googlePay: 'active', message: 'Arquivo não encontrado.' },
+    })).toMatchObject({ status: 'pending', applePay: 'pending', googlePay: 'active', message: 'Arquivo não encontrado.' });
   });
 });

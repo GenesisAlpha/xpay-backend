@@ -206,6 +206,12 @@ export class OwnAccountFinanceService {
 
   // ─── Conta e credencial ────────────────────────────────────────────────
 
+  /** Conta do seller com a credencial dela (para os serviços vizinhos: domínios de pagamento). */
+  async resolveAccount(sellerId: string, accountId: string): Promise<{ account: OwnAccountSummary; credentials: ProviderAccountConfig }> {
+    const account = await this.accountOf(sellerId, accountId);
+    return { account, credentials: await this.credentials(sellerId, accountId) };
+  }
+
   /** A conta tem que ser do seller e estar conectada; senão "não encontrada". */
   private async accountOf(sellerId: string, accountId: string): Promise<OwnAccountSummary> {
     const account = (await this.accounts(sellerId)).find(item => item.id === accountId);

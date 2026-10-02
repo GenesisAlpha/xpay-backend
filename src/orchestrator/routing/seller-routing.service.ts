@@ -869,7 +869,7 @@ const HISTORY_DETAIL_KEYS = [
   'enabled', 'card_strategy', 'paypal_strategy', 'routing_fee_pct', 'dispute_pause_pct',
   'label', 'weight', 'priority', 'daily_cap_usd_cents', 'daily_cap_orders',
   'min_ticket_usd_cents', 'max_ticket_usd_cents', 'countries', 'currencies', 'paused_at', 'pause_reason',
-  'reason', 'disputes_7d', 'approved_7d', 'limit_pct', 'provider', 'mode', 'amount_cents', 'currency', 'routing',
+  'reason', 'disputes_7d', 'approved_7d', 'limit_pct', 'provider', 'mode', 'amount_cents', 'currency', 'routing', 'hostname',
 ] as const;
 
 export function historyDetails(payload: Record<string, any>): Record<string, unknown> {
