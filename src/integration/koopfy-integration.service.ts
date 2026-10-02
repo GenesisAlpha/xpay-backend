@@ -39,6 +39,7 @@ import { SellerProviderAccountsService } from '../orchestrator/seller-provider/s
 import { SellerRoutingService } from '../orchestrator/routing/seller-routing.service';
 import { OwnAccountFinanceService } from '../orchestrator/own-finance/own-account-finance.service';
 import { OwnPaymentDomainsService } from '../orchestrator/own-finance/own-payment-domains.service';
+import { OwnAccountPermissionsService } from '../orchestrator/own-finance/own-account-permissions.service';
 import {
   SellerProviderKind,
   combineExternalProviderView,
@@ -86,6 +87,7 @@ export class KoopfyIntegrationService {
     // Saldo, saque e histórico de cada conta própria.
     private readonly ownFinance: OwnAccountFinanceService,
     private readonly ownDomains: OwnPaymentDomainsService,
+    private readonly ownPermissions: OwnAccountPermissionsService,
   ) {}
 
   /**
@@ -147,6 +149,12 @@ export class KoopfyIntegrationService {
   externalAccountWallet(ctx: SellerCtx, accountId: string) {
     if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
     return this.ownFinance.wallet(ctx.seller.id, accountId);
+  }
+
+  /** O que a chave da conta consegue fazer além de vender (saldo e saque; carteiras). */
+  externalAccountPermissions(ctx: SellerCtx, accountId: string) {
+    if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
+    return this.ownPermissions.check(ctx.seller.id, accountId);
   }
 
   /** Domínios registrados na conta dele (Apple Pay / Google Pay). */

@@ -249,6 +249,13 @@ export class KoopfyIntegrationController {
     return this.svc.externalAccountWithdraw(req.sellerCtx, accountId, body ?? {});
   }
 
+  // Permissões da chave: o que falta ativar para saldo/saque e para as carteiras.
+  @Get('external-provider/accounts/:accountId/permissions')
+  @UseGuards(CrossServiceJwtGuard)
+  externalAccountPermissions(@Req() req: any, @Param('accountId') accountId: string) {
+    return this.svc.externalAccountPermissions(req.sellerCtx, accountId);
+  }
+
   // Apple Pay / Google Pay: domínios registrados na conta Whop ou Stripe dele.
   @Get('external-provider/accounts/:accountId/payment-domains')
   @UseGuards(CrossServiceJwtGuard)
