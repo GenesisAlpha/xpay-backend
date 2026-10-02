@@ -188,16 +188,19 @@ export class KoopfyIntegrationService {
       return { enabledRouting: true };
     }
 
-    throw new ConflictException({
+    // 400, não 409: o checkout só repassa ao painel o motivo de 400/422.
+    throw new BadRequestException({
       error: 'ROUTING_CHOICE_REQUIRED',
       message: 'Você já tem uma conta recebendo. Ligue o roteamento para usar as duas, ou troque a conta atual.',
-      feePct: settings.feePct,
-      feeAccepted: Boolean(settings.feeAcceptedAt),
-      current: occupying.map(entry => ({
-        id: entry.id,
-        provider: entry.provider,
-        name: entry.config.label ?? entry.accountName,
-      })),
+      details: {
+        feePct: settings.feePct,
+        feeAccepted: Boolean(settings.feeAcceptedAt),
+        current: occupying.map(entry => ({
+          id: entry.id,
+          provider: entry.provider,
+          name: entry.config.label ?? entry.accountName,
+        })),
+      },
     });
   }
 
