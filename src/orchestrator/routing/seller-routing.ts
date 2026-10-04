@@ -67,6 +67,52 @@ export function groupOfMethod(method: string | null | undefined): RoutingGroup {
   return String(method ?? '').toLowerCase() === 'paypal' ? 'paypal' : 'card';
 }
 
+// ─── Conectar mais uma conta ──────────────────────────────────────────────
+
+/**
+ * O que fazer quando o seller conecta uma conta e já há outra recebendo no
+ * mesmo grupo. Sem o roteamento vale UMA conta por grupo, e conectar outra
+ * trocava a atual em silêncio — ele achava que tinha duas e uma delas parava
+ * de receber. A decisão agora é dele:
+ *
+ *   • 'proceed' → segue (roteamento já ligado, primeira conta, ou ele pediu
+ *                 para trocar a atual);
+ *   • 'enable'  → ele pediu várias contas: liga o roteamento antes de conectar;
+ *   • 'ask'     → há conta recebendo e ele não disse o que quer: o painel pergunta.
+ *
+ * Conta com a credencial recusada não conta como ocupante: reconectar para
+ * consertar a chave não pode pedir decisão nenhuma.
+ */
+export function connectionChoice(args: {
+  routingEnabled: boolean;
+  multiAccount?: unknown;
+  replace?: unknown;
+  /** Contas ATIVAS do mesmo grupo (cartão ou PayPal). */
+  occupying: number;
+}): 'proceed' | 'enable' | 'ask' {
+  if (args.routingEnabled) return 'proceed';
+  if (args.multiAccount === true) return 'enable';
+  if (args.replace === true || args.occupying <= 0) return 'proceed';
+  return 'ask';
+}
+
+/**
+ * "Trocar a conta atual" com o roteamento desligado: quais contas saem DEPOIS
+ * que a nova conecta. Só as de OUTRO provedor do mesmo grupo — a do mesmo
+ * provedor é regravada no lugar pela própria conexão (uma linha por provedor
+ * sem o roteamento). Sair depois, e não antes, é o que garante que uma chave
+ * errada na conta nova não deixa o seller sem conta nenhuma.
+ */
+export function accountsToReplace(args: {
+  provider: OwnProvider;
+  replace?: unknown;
+  routingEnabled: boolean;
+  occupying: Array<{ id: string; provider: OwnProvider }>;
+}): string[] {
+  if (args.routingEnabled || args.replace !== true) return [];
+  return args.occupying.filter(entry => entry.provider !== args.provider).map(entry => entry.id);
+}
+
 // ─── Configuração por conta ───────────────────────────────────────────────
 
 /** Linha de seller_routing_accounts (ou o padrão, quando a conta não tem linha). */

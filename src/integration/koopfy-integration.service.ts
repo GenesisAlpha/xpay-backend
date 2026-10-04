@@ -34,9 +34,12 @@ import { ActivationRequestsService } from '../activation/activation-requests.ser
 import { WhopConnectService } from '../orchestrator/whop/whop-connect.service';
 import { WhopLinkedAccountsService, sellerMayOperate } from '../orchestrator/whop/whop-linked.service';
 import { isLinkedProviderAccountId, sellerExternalProviderView, toLinkedProviderAccountId } from '../orchestrator/whop/whop-linked';
-import { defaultRoutingFeePct } from '../orchestrator/routing/seller-routing';
+import { accountsToReplace, connectionChoice, defaultRoutingFeePct } from '../orchestrator/routing/seller-routing';
 import { SellerProviderAccountsService } from '../orchestrator/seller-provider/seller-provider-accounts.service';
 import { SellerRoutingService } from '../orchestrator/routing/seller-routing.service';
+import { OwnAccountFinanceService } from '../orchestrator/own-finance/own-account-finance.service';
+import { OwnPaymentDomainsService } from '../orchestrator/own-finance/own-payment-domains.service';
+import { OwnAccountPermissionsService } from '../orchestrator/own-finance/own-account-permissions.service';
 import {
   SellerProviderKind,
   combineExternalProviderView,
@@ -81,6 +84,10 @@ export class KoopfyIntegrationService {
     private readonly sellerProviders: SellerProviderAccountsService,
     // Roteamento de contas (várias contas por provedor).
     private readonly sellerRouting: SellerRoutingService,
+    // Saldo, saque e histórico de cada conta própria.
+    private readonly ownFinance: OwnAccountFinanceService,
+    private readonly ownDomains: OwnPaymentDomainsService,
+    private readonly ownPermissions: OwnAccountPermissionsService,
   ) {}
 
   /**
@@ -125,6 +132,141 @@ export class KoopfyIntegrationService {
     return this.sellerRouting.updateAccount(ctx.seller.id, accountId, body ?? {}, `seller:${ctx.userId}`);
   }
 
+  routingHistory(ctx: SellerCtx, limit?: unknown) {
+    if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
+    return this.sellerRouting.history(ctx.seller.id, limit);
+  }
+
+  // ─── Financeiro das contas próprias ─────────────────────────────────────
+  // Saldo, destinos, saque e histórico de cada conta (Whop, Stripe, PayPal),
+  // e a visão que soma todas por moeda. Ver OwnAccountFinanceService.
+
+  externalFinanceOverview(ctx: SellerCtx) {
+    if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
+    return this.ownFinance.overview(ctx.seller.id);
+  }
+
+  externalAccountWallet(ctx: SellerCtx, accountId: string) {
+    if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
+    return this.ownFinance.wallet(ctx.seller.id, accountId);
+  }
+
+  /** O que a chave da conta consegue fazer além de vender (saldo e saque; carteiras). */
+  externalAccountPermissions(ctx: SellerCtx, accountId: string) {
+    if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
+    return this.ownPermissions.check(ctx.seller.id, accountId);
+  }
+
+  /** Domínios registrados na conta dele (Apple Pay / Google Pay). */
+  async externalAccountDomains(ctx: SellerCtx, accountId: string) {
+    if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
+    try {
+      return await this.ownDomains.list(ctx.seller.id, accountId);
+    } catch (err: any) {
+      if (err instanceof BadRequestException || err instanceof NotFoundException) throw err;
+      throw new BadRequestException(`Não foi possível ler os domínios desta conta (${err?.message ?? 'erro'}).`);
+    }
+  }
+
+  async externalAccountRegisterDomain(ctx: SellerCtx, accountId: string, hostname: unknown) {
+    if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
+    return this.ownDomains.register(ctx.seller.id, accountId, hostname, `seller:${ctx.userId}`);
+  }
+
+  externalAccountWithdraw(ctx: SellerCtx, accountId: string, body: Record<string, any>) {
+    if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
+    return this.ownFinance.withdraw(
+      ctx.seller.id,
+      accountId,
+      { amountCents: body?.amountCents, currency: body?.currency, payoutMethodId: body?.payoutMethodId },
+      `seller:${ctx.userId}`,
+    );
+  }
+
+  /**
+   * Antes de conectar uma conta: o que fazer com a que já recebe no mesmo
+   * grupo (ver `connectionChoice`). `multiAccount` liga o roteamento (com o
+   * aceite da taxa), `replace` troca a atual, e sem nenhum dos dois o painel
+   * recebe 409 ROUTING_CHOICE_REQUIRED, com a taxa, para perguntar.
+   */
+  private async prepareConnection(
+    sellerId: string,
+    provider: 'whop' | SellerProviderKind,
+    body: Record<string, any>,
+    actor: string,
+  ): Promise<{ enabledRouting: boolean; replaceIds: string[] }> {
+    const settings = await this.sellerRouting.settings(sellerId);
+    const group = provider === 'paypal' ? 'paypal' : 'card';
+    const occupying = settings.enabled
+      ? []
+      : (await this.sellerRouting.loadPool(sellerId, settings).catch(() => []))
+        .filter(entry => entry.group === group && entry.connection === 'active');
+
+    const choice = connectionChoice({
+      routingEnabled: settings.enabled,
+      multiAccount: body?.multiAccount,
+      replace: body?.replace,
+      occupying: occupying.length,
+    });
+    if (choice === 'proceed') {
+      return {
+        enabledRouting: false,
+        replaceIds: accountsToReplace({ provider, replace: body?.replace, routingEnabled: settings.enabled, occupying }),
+      };
+    }
+    if (choice === 'enable') {
+      await this.sellerRouting.update(sellerId, { enabled: true, acceptFee: body?.acceptFee === true }, actor);
+      return { enabledRouting: true, replaceIds: [] };
+    }
+
+    // 400, não 409: o checkout só repassa ao painel o motivo de 400/422.
+    throw new BadRequestException({
+      error: 'ROUTING_CHOICE_REQUIRED',
+      message: 'Você já tem uma conta recebendo. Ligue o roteamento para usar as duas, ou troque a conta atual.',
+      details: {
+        feePct: settings.feePct,
+        feeAccepted: Boolean(settings.feeAcceptedAt),
+        current: occupying.map(entry => ({
+          id: entry.id,
+          provider: entry.provider,
+          name: entry.config.label ?? entry.accountName,
+        })),
+      },
+    });
+  }
+
+  /**
+   * O roteamento foi ligado só para esta conexão e ela falhou (chave errada,
+   * provedor fora do ar): volta a desligar. Sem isto o seller ficaria pagando
+   * a taxa de roteamento com a mesma conta única de antes.
+   */
+  private async connectWithChoice<T>(
+    sellerId: string,
+    prepared: { enabledRouting: boolean; replaceIds: string[] },
+    actor: string,
+    connect: () => Promise<T>,
+  ): Promise<T> {
+    try {
+      const connected = await connect();
+      // Apple Pay / Google Pay: o checkout da Koopfy entra na conta dele agora,
+      // em segundo plano — a conexão não espera nem falha por isso.
+      void this.ownDomains.registerPlatformHostsEverywhere(sellerId);
+      // "Trocar a conta atual": a antiga só sai agora, com a nova já no ar.
+      // Se não sair, a nova fica conectada e o seller vê as duas na tela.
+      for (const accountId of prepared.replaceIds) {
+        await this.disconnectAccountById(sellerId, accountId, actor)
+          .catch((err: any) => console.error(`[Integration] conta ${accountId} de ${sellerId} não saiu na troca:`, err?.message));
+      }
+      return connected;
+    } catch (err) {
+      if (prepared.enabledRouting) {
+        await this.sellerRouting.update(sellerId, { enabled: false }, actor)
+          .catch((rollback: any) => console.error(`[Integration] roteamento de ${sellerId} não desligado após conexão falha:`, rollback?.message));
+      }
+      throw err;
+    }
+  }
+
   /**
    * Desconecta UMA conta (com o roteamento há várias do mesmo provedor).
    * A Whop principal segue o desligar de sempre (volta a 'allowed', chave
@@ -133,7 +275,11 @@ export class KoopfyIntegrationService {
   async disconnectOwnAccount(ctx: SellerCtx, accountId: string) {
     if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
     const sellerId = ctx.seller.id;
-    const actor = `seller:${ctx.userId}`;
+    await this.disconnectAccountById(sellerId, accountId, `seller:${ctx.userId}`);
+    return this.externalProviderStatus(sellerId);
+  }
+
+  private async disconnectAccountById(sellerId: string, accountId: string, actor: string) {
     if (isLinkedProviderAccountId(accountId)) {
       const row = await this.whopLinked.getRow(sellerId);
       if (!row?.whop_account_id || toLinkedProviderAccountId(row.whop_account_id) !== accountId) {
@@ -143,7 +289,6 @@ export class KoopfyIntegrationService {
     } else {
       await this.sellerProviders.disconnectById(sellerId, accountId, actor);
     }
-    return this.externalProviderStatus(sellerId);
   }
 
   /** Conta do pay de quem conecta; cria a principal quando ainda não existe. */
@@ -182,19 +327,20 @@ export class KoopfyIntegrationService {
     }
 
     const { sellerId, userId } = await this.sellerForConnection(email, accountSellerId);
-    if (provider === 'stripe') {
-      await this.sellerProviders.connectStripe(
+    const actor = `seller:${userId}`;
+    const prepared = await this.prepareConnection(sellerId, provider, body ?? {}, actor);
+    await this.connectWithChoice(sellerId, prepared, actor, () => provider === 'stripe'
+      ? this.sellerProviders.connectStripe(
         sellerId,
         { secretKey: body?.secretKey, publishableKey: body?.publishableKey, label: body?.label ?? null },
-        `seller:${userId}`,
-      );
-    } else {
-      await this.sellerProviders.connectPaypal(
+        actor,
+        { replacing: prepared.replaceIds.length > 0 },
+      )
+      : this.sellerProviders.connectPaypal(
         sellerId,
         { clientId: body?.clientId, clientSecret: body?.clientSecret, mode: body?.mode, label: body?.label ?? null },
-        `seller:${userId}`,
-      );
-    }
+        actor,
+      ));
     return this.externalProviderStatus(sellerId);
   }
 
@@ -210,14 +356,23 @@ export class KoopfyIntegrationService {
    * que guarda a conexão e recebe o registro das vendas. Conta escolhida pelo
    * workspace (header) é conferida como do mesmo usuário.
    */
-  async connectExternalProvider(email: string, accountSellerId: string | null, apiKey: string, label: string | null = null) {
+  async connectExternalProvider(
+    email: string,
+    accountSellerId: string | null,
+    apiKey: string,
+    label: string | null = null,
+    choice: { multiAccount?: unknown; acceptFee?: unknown; replace?: unknown } = {},
+  ) {
     // Antes de criar conta: pedido sem chave não pode deixar conta vazia para trás.
     if (!String(apiKey ?? '').trim()) throw new BadRequestException('Informe a chave de API da sua conta Whop.');
     const { sellerId, userId } = await this.sellerForConnection(email, accountSellerId);
+    const actor = `seller:${userId}`;
+    const prepared = await this.prepareConnection(sellerId, 'whop', choice, actor);
 
     // Com o roteamento ligado e a principal já conectada, outra company entra
     // como conta Whop EXTRA (whopa_…) — ver WhopLinkedAccountsService.connect.
-    await this.whopLinked.connect(sellerId, apiKey, `seller:${userId}`, { label });
+    await this.connectWithChoice(sellerId, prepared, actor, () =>
+      this.whopLinked.connect(sellerId, apiKey, actor, { label, replacing: prepared.replaceIds.length > 0 }));
     // Mesma visão do /status (campos da Whop + `providers`).
     return this.externalProviderStatus(sellerId);
   }

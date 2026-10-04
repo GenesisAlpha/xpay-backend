@@ -178,6 +178,9 @@ export class SellerProviderAccountsService {
     sellerId: string,
     input: { secretKey?: string; publishableKey?: string; label?: string | null },
     actor: string | null = null,
+    // `replacing`: o seller escolheu trocar a conta de cartão atual (Whop) por
+    // esta; a antiga é desconectada por quem chama, depois que esta conectar.
+    opts: { replacing?: boolean } = {},
   ) {
     let mode: 'live' | 'test';
     try {
@@ -191,7 +194,7 @@ export class SellerProviderAccountsService {
     // Roteamento ligado: Whop e Stripe convivem (o roteador escolhe por
     // sessão) e cada conexão ADICIONA uma conta em vez de trocar a atual.
     const routing = await sellerRoutingEnabled(sellerId);
-    await this.assertMayConnect(sellerId, 'stripe', { routing });
+    await this.assertMayConnect(sellerId, 'stripe', { routing: routing || opts.replacing === true });
 
     const account = await this.stripeRequest(secretKey, 'GET', '/v1/account').catch((err: any) => {
       if (err?.httpStatus === 401 || err?.httpStatus === 403) {
@@ -744,11 +747,12 @@ export class SellerProviderAccountsService {
   private async log(sellerId: string, managerId: string | null, action: string, payload: Record<string, any>) {
     const { error } = await supabase.from('crm_action_log').insert({
       seller_id: sellerId,
-      manager_id: managerId,
+      // `manager_id` é do gestor do CRM; seller e sistema vão no payload.
+      manager_id: managerId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(managerId) ? managerId : null,
       action,
       resource_type: 'seller',
       resource_id: sellerId,
-      payload,
+      payload: { ...payload, actor: managerId },
       created_at: new Date().toISOString(),
     });
     if (error) console.error(`[SellerProviders] ação ${action} não registrada:`, error.message);

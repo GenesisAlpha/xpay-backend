@@ -49,6 +49,7 @@ import {
   parseAccountPatch,
   selectAccount,
 } from './seller-routing';
+import { notifySellerRoutingPause } from '../../utils/seller-mail';
 
 // ============================================================================
 // ROTEAMENTO DE CONTAS PRÓPRIAS DO SELLER
@@ -121,6 +122,25 @@ export function normalizeRoutingKey(value: unknown): string | null {
 
 const ROUTING_REASSIGNED_MESSAGE = 'Atualizamos a forma de pagamento. Confira e tente de novo.';
 
+// Ações do crm_action_log que contam a história das contas próprias e do
+// roteamento para o seller (GET routing/history).
+const HISTORY_ACTION_PREFIXES = ['routing.', 'seller_provider.', 'whop_linked.', 'own_finance.'];
+const HISTORY_LIMIT_MAX = 100;
+// Um aviso de pausa por conta por hora, por processo: o cálculo ao vivo roda a
+// cada escolha e a gravação da pausa é assíncrona.
+const PAUSE_NOTICE_TTL_MS = 60 * 60 * 1000;
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Quem fez a ação, no formato do painel. */
+export function historyActor(actor: unknown, managerId: unknown): 'seller' | 'koopfy' | 'system' {
+  const value = String(actor ?? '');
+  if (value.startsWith('seller:')) return 'seller';
+  if (value === 'system') return 'system';
+  if (value || managerId) return 'koopfy';
+  return 'system';
+}
+
 @Injectable()
 export class SellerRoutingService implements OnModuleInit {
   constructor(
@@ -134,6 +154,9 @@ export class SellerRoutingService implements OnModuleInit {
   now: () => number = () => Date.now();
 
   private statsCache = new Map<string, { at: number; rows: StatsTxRow[] }>();
+  private pauseNotices = new Map<string, number>();
+  // Injetável nos testes: o e-mail de conta pausada.
+  notifyPause: typeof notifySellerRoutingPause = notifySellerRoutingPause;
 
   onModuleInit() {
     // Breaker de conta própria aberto → grava a pausa 'errors' (volta sozinha
@@ -489,10 +512,46 @@ export class SellerRoutingService implements OnModuleInit {
           `[SellerRouting] conta ${entry.id} do seller ${sellerId} PAUSADA por disputas: `
           + `${entry.stats.disputes7d}/${entry.stats.approved7d} em 7 dias (limite ${settings.disputePausePctEffective}%)`,
         );
+        this.announcePause(sellerId, entry, pool, settings);
+      } else if (stored === 'disputes') {
+        void this.log(sellerId, 'system', 'routing.account_resumed', { account_id: entry.id, reason: 'disputes' });
       }
       void this.writeAccountConfig(sellerId, entry.id, entry.provider, patch)
         .catch((err: any) => console.error(`[SellerRouting] pausa automática de ${entry.id}:`, err?.message));
     }
+  }
+
+  /**
+   * Conta pausada por disputas: fica no histórico e o seller recebe o aviso —
+   * uma vez por pausa, não a cada venda que recalcula a mesma conta.
+   */
+  private announcePause(sellerId: string, entry: PoolEntry, pool: PoolEntry[], settings: ResolvedRoutingSettings) {
+    const last = this.pauseNotices.get(entry.id);
+    if (last && this.now() - last < PAUSE_NOTICE_TTL_MS) return;
+    this.pauseNotices.set(entry.id, this.now());
+
+    const remaining = pool.filter(other =>
+      other.id !== entry.id
+      && other.group === entry.group
+      && other.chargeable
+      && other.connection === 'active'
+      && !activePause(other, settings.disputePausePctEffective, this.now())).length;
+
+    void this.log(sellerId, 'system', 'routing.account_auto_paused', {
+      account_id: entry.id,
+      reason: 'disputes',
+      disputes_7d: entry.stats.disputes7d,
+      approved_7d: entry.stats.approved7d,
+      limit_pct: settings.disputePausePctEffective,
+    });
+    void this.notifyPause(sellerId, {
+      accountName: entry.config.label ?? entry.accountName ?? entry.id,
+      provider: entry.provider,
+      disputes: entry.stats.disputes7d,
+      approved: entry.stats.approved7d,
+      limitPct: settings.disputePausePctEffective,
+      remaining,
+    });
   }
 
   /** Breaker aberto numa conta própria: grava a pausa 'errors' (volta sozinha). */
@@ -516,6 +575,7 @@ export class SellerRoutingService implements OnModuleInit {
       paused_at: new Date(this.now()).toISOString(),
       pause_reason: 'errors',
     });
+    await this.log(sellerId, 'system', 'routing.account_auto_paused', { account_id: accountId, reason: 'errors' });
   }
 
   private async writeAccountConfig(sellerId: string, accountId: string, provider: OwnProvider, patch: Record<string, any>) {
@@ -592,6 +652,46 @@ export class SellerRoutingService implements OnModuleInit {
             todayOrders: entry.stats.todayOrders,
             todayUsdCents: entry.stats.todayUsdCents,
           },
+        };
+      }),
+    };
+  }
+
+  /**
+   * GET /integration/koopfy/routing/history — o que mudou nas contas e no
+   * roteamento, do mais recente para o mais antigo: conexões, liga/desliga,
+   * estratégia, ajustes de conta, pausas automáticas e saques. Só o que o
+   * seller pode ver: nunca credencial, nunca o id interno de quem é da Koopfy.
+   */
+  async history(sellerId: string, rawLimit?: unknown) {
+    const limit = Math.min(HISTORY_LIMIT_MAX, Math.max(1, Math.floor(Number(rawLimit)) || 50));
+    const { data, error } = await supabase
+      .from('crm_action_log')
+      .select('id, action, manager_id, payload, created_at')
+      .eq('seller_id', sellerId)
+      .or(HISTORY_ACTION_PREFIXES.map(prefix => `action.like.${prefix}%`).join(','))
+      .order('created_at', { ascending: false })
+      .limit(limit);
+    if (error) {
+      console.error('[SellerRouting] leitura do histórico:', error.message);
+      return { events: [] };
+    }
+
+    const names = new Map((await this.loadPool(sellerId).catch(() => [] as PoolEntry[]))
+      .map(entry => [entry.id, entry.config.label ?? entry.accountName ?? null]));
+
+    return {
+      events: (Array.isArray(data) ? data : []).map((row: any) => {
+        const payload = row.payload && typeof row.payload === 'object' ? row.payload : {};
+        const accountId = typeof payload.account_id === 'string' ? payload.account_id : null;
+        return {
+          id: String(row.id ?? `${row.created_at}:${row.action}`),
+          at: row.created_at,
+          action: String(row.action),
+          actor: historyActor(payload.actor, row.manager_id),
+          accountId,
+          accountName: accountId ? names.get(accountId) ?? null : null,
+          details: historyDetails(payload),
         };
       }),
     };
@@ -726,14 +826,18 @@ export class SellerRoutingService implements OnModuleInit {
     if (error) throw new BadRequestException(`Não foi possível salvar o roteamento: ${error.message}`);
   }
 
-  private async log(sellerId: string, managerId: string | null, action: string, payload: Record<string, any>) {
+  /**
+   * `actor` vai dentro do payload: `manager_id` é do gestor do CRM, e as ações
+   * do seller ("seller:<id>") e do sistema não cabem lá.
+   */
+  private async log(sellerId: string, actor: string | null, action: string, payload: Record<string, any>) {
     const { error } = await supabase.from('crm_action_log').insert({
       seller_id: sellerId,
-      manager_id: managerId,
+      manager_id: actor && UUID_RE.test(actor) ? actor : null,
       action,
       resource_type: 'seller',
       resource_id: sellerId,
-      payload,
+      payload: { ...payload, actor },
       created_at: new Date(this.now()).toISOString(),
     });
     if (error) console.error(`[SellerRouting] ação ${action} não registrada:`, error.message);
@@ -757,6 +861,23 @@ export function resolveSettings(row: RoutingSettingsRow | null): ResolvedRouting
     disputePausePct: Number.isFinite(disputePausePct as number) ? disputePausePct : null,
     disputePausePctEffective: effectiveDisputePausePct(disputePausePct),
   };
+}
+
+// Campos do payload que o seller pode ver no histórico. Lista fechada: o log é
+// compartilhado com o CRM e pode guardar coisa que não é para o painel.
+const HISTORY_DETAIL_KEYS = [
+  'enabled', 'card_strategy', 'paypal_strategy', 'routing_fee_pct', 'dispute_pause_pct',
+  'label', 'weight', 'priority', 'daily_cap_usd_cents', 'daily_cap_orders',
+  'min_ticket_usd_cents', 'max_ticket_usd_cents', 'countries', 'currencies', 'paused_at', 'pause_reason',
+  'reason', 'disputes_7d', 'approved_7d', 'limit_pct', 'provider', 'mode', 'amount_cents', 'currency', 'routing', 'hostname',
+] as const;
+
+export function historyDetails(payload: Record<string, any>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of HISTORY_DETAIL_KEYS) {
+    if (payload[key] !== undefined) out[key] = payload[key];
+  }
+  return out;
 }
 
 function parsePct(raw: unknown, opts: { min: number; max: number; label: string }): number | null {

@@ -7,7 +7,12 @@ export interface FinanceListQuery {
   search?: string;
   dateFrom?: string;
   dateTo?: string;
+  /** Conta própria do seller (`whopl_…`, `whopa_…`, `stripel_…`, `paypall_…`). */
+  accountId?: string;
 }
+
+// Só ids de conta PRÓPRIA entram no filtro: os pools da Koopfy não são do painel.
+const OWN_ACCOUNT_ID = /^(whopl|whopa|stripel|paypall)_[A-Za-z0-9_-]{4,80}$/;
 
 const FILTER_TOKEN = /^[a-z0-9_-]{1,40}$/i;
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -49,5 +54,6 @@ export function normalizeFinanceListQuery(
     search: search || undefined,
     dateFrom: date(raw.dateFrom),
     dateTo: date(raw.dateTo),
+    accountId: typeof raw.accountId === 'string' && OWN_ACCOUNT_ID.test(raw.accountId) ? raw.accountId : undefined,
   };
 }

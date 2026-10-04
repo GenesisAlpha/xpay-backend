@@ -140,8 +140,10 @@ export class TransactionsService {
     page?: number; pageSize?: number
     status?: string; method?: string
     search?: string; dateFrom?: string; dateTo?: string
+    /** Conta própria do seller: só as vendas que saíram por ela. */
+    providerAccountId?: string
   }) {
-    const { page = 1, pageSize = 20, status, method, search, dateFrom, dateTo } = params
+    const { page = 1, pageSize = 20, status, method, search, dateFrom, dateTo, providerAccountId } = params
     const { from, to } = paginate(page, pageSize)
 
     let q = supabase
@@ -157,6 +159,7 @@ export class TransactionsService {
 
     if (status && status !== 'all') q = q.eq('status', status)
     if (method && method !== 'all') q = q.eq('method', method)
+    if (providerAccountId) q = q.eq('provider_account_id', providerAccountId)
     if (dateFrom) q = q.gte('created_at', dateFrom)
     if (dateTo) q = q.lte('created_at', dateTo + 'T23:59:59')
     if (search) {
@@ -181,6 +184,7 @@ export class TransactionsService {
       amountUSD: fromCents(tx.amount_usd_net_cents),
       status: tx.status,
       provider: tx.provider,
+      providerAccountId: tx.provider_account_id ?? null,
       providerTransactionId: tx.provider_transaction_id,
       // 🔥 fee e net_amount em centavos USD
       fee: fromCents(tx.fee),
@@ -227,6 +231,7 @@ export class TransactionsService {
       amountUSD: fromCents(data.amount_usd_gross_cents),
       status: data.status,
       provider: data.provider,
+      providerAccountId: data.provider_account_id ?? null,
       providerTransactionId: data.provider_transaction_id,
       fee: fromCents(data.fee),
       netAmount: fromCents(data.net_amount),

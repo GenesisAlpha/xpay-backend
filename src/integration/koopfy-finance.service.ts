@@ -22,6 +22,7 @@ import { feesFromRows, normalizeFeeIds } from './transaction-fees';
 import { supabase } from '../lib/supabase.client';
 import { SellerPayoutAccountService } from '../payouts/seller-payout-account.service';
 import { PayoutOrchestratorService } from '../payouts/payout-orchestrator.service';
+import { ownProviderOfId } from '../orchestrator/routing/seller-routing';
 
 const TRANSACTION_STATUSES = [
   'pending',
@@ -69,14 +70,20 @@ const PAYOUT_FIELDS = [
   'whopCountry',
 ] as const;
 
+const OWN_PROCESSOR: Record<string, string> = { whop: 'Whop', stripe: 'Stripe', paypal: 'PayPal' };
+
 function publicTransaction(transaction: any) {
+  // Venda em conta PRÓPRIA do seller: o painel mostra o provedor e a conta, que
+  // são dele. Conta do pool da Koopfy nunca sai — segue "Koopfy Payments".
+  const ownProvider = ownProviderOfId(transaction.providerAccountId);
   return {
     id: transaction.id,
     customer: transaction.customer ?? null,
     customerEmail: transaction.customerEmail ?? null,
     country: transaction.country ?? null,
     paymentMethod: transaction.paymentMethod ?? null,
-    processor: 'Koopfy Payments' as const,
+    processor: ownProvider ? OWN_PROCESSOR[ownProvider] : 'Koopfy Payments',
+    ownAccountId: ownProvider ? String(transaction.providerAccountId) : null,
     orderId: transaction.orderId ?? null,
     amount: Number(transaction.amount ?? 0),
     currency: transaction.currency ?? 'USD',
@@ -235,6 +242,7 @@ export class KoopfyFinanceService {
       search: query.search,
       dateFrom: query.dateFrom,
       dateTo: query.dateTo,
+      providerAccountId: query.accountId,
     });
     return paginated(response, publicTransaction);
   }

@@ -20,6 +20,8 @@ import {
   parseAccountPatch,
   scoreOf,
   selectAccount,
+  accountsToReplace,
+  connectionChoice,
 } from './seller-routing';
 
 type Partial2 = {
@@ -332,5 +334,46 @@ describe('status.externalProvider com o roteamento', () => {
     const legacy = combineExternalProviderView(whop, { stripe, paypal: null });
     expect(legacy.routing).toBeUndefined();
     expect(legacy.providers.stripe.accounts).toBeUndefined();
+  });
+});
+
+describe('conectar mais uma conta', () => {
+  it('roteamento ligado: a conta nova sempre entra', () => {
+    expect(connectionChoice({ routingEnabled: true, occupying: 3 })).toBe('proceed')
+  })
+
+  it('primeira conta do grupo: conecta sem perguntar nada', () => {
+    expect(connectionChoice({ routingEnabled: false, occupying: 0 })).toBe('proceed')
+  })
+
+  it('já há conta recebendo e o seller não disse o que quer: o painel pergunta', () => {
+    expect(connectionChoice({ routingEnabled: false, occupying: 1 })).toBe('ask')
+  })
+
+  it('"usar várias contas" liga o roteamento; "trocar" segue como antes', () => {
+    expect(connectionChoice({ routingEnabled: false, occupying: 1, multiAccount: true })).toBe('enable')
+    // Na primeira conta também: é a opção oferecida já na conexão.
+    expect(connectionChoice({ routingEnabled: false, occupying: 0, multiAccount: true })).toBe('enable')
+    expect(connectionChoice({ routingEnabled: false, occupying: 1, replace: true })).toBe('proceed')
+    // Só `true` vale: valor solto no corpo não liga taxa nenhuma.
+    expect(connectionChoice({ routingEnabled: false, occupying: 1, multiAccount: 'true' })).toBe('ask')
+  })
+})
+
+describe('trocar a conta atual (roteamento desligado)', () => {
+  const occupying = [{ id: 'whopl_biz_1', provider: 'whop' as const }];
+
+  it('a conta de outro provedor do grupo sai depois que a nova conecta', () => {
+    expect(accountsToReplace({ provider: 'stripe', replace: true, routingEnabled: false, occupying })).toEqual(['whopl_biz_1']);
+  });
+
+  it('mesmo provedor: a conexão regrava a conta no lugar, nada a remover', () => {
+    expect(accountsToReplace({ provider: 'whop', replace: true, routingEnabled: false, occupying })).toEqual([]);
+  });
+
+  it('sem o pedido de troca, ou com o roteamento ligado, ninguém sai', () => {
+    expect(accountsToReplace({ provider: 'stripe', routingEnabled: false, occupying })).toEqual([]);
+    expect(accountsToReplace({ provider: 'stripe', replace: 'true', routingEnabled: false, occupying })).toEqual([]);
+    expect(accountsToReplace({ provider: 'stripe', replace: true, routingEnabled: true, occupying })).toEqual([]);
   });
 });

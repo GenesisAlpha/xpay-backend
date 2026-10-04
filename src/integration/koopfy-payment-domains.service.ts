@@ -2,15 +2,18 @@ import { BadRequestException, Injectable } from '@nestjs/common';
 import { WhopApiError, WhopPlatformClient } from '../orchestrator/whop/whop-platform.client';
 import { WhopConnectService } from '../orchestrator/whop/whop-connect.service';
 import { WhopLinkedAccountsService } from '../orchestrator/whop/whop-linked.service';
+import { sellerHasOwnStripe } from '../orchestrator/seller-provider/seller-provider-accounts.service';
+import { OwnDomainRegistration, OwnPaymentDomainsService } from '../orchestrator/own-finance/own-payment-domains.service';
 import type { SellerCtx } from './cross-service-jwt.guard';
 
 // Apple Pay no checkout incorporado: o domínio do site do seller precisa estar
 // registrado (e verificado) na Whop, na conta que cobra. Seller com conta
 // conectada cobra nela; se ela cair, o roteador cobra na master — então o
 // domínio vai para as duas. Seller sem conta conectada cobra na master. Seller
-// com a própria conta Whop registra no painel dele (não temos acesso).
+// com contas próprias (Whop ou Stripe) tem o domínio registrado em cada uma
+// delas, com a chave que ele conectou (ver OwnPaymentDomainsService).
 
-export type DomainScope = 'connected' | 'master';
+export type DomainScope = 'connected' | 'master' | 'own';
 
 export interface DomainRegistration {
   scope: DomainScope;
@@ -18,6 +21,27 @@ export interface DomainRegistration {
   id: string | null;
   status: 'verified' | 'pending' | 'error';
   message: string | null;
+  // Só nas contas próprias (`own`): de quem é a conta e a situação de cada carteira.
+  provider?: string;
+  name?: string | null;
+  applePay?: string;
+  googlePay?: string;
+}
+
+/** Registro numa conta própria → o formato desta tela. `verified` = Apple Pay ativo. */
+export function ownRegistration(item: OwnDomainRegistration): DomainRegistration {
+  const base = { scope: 'own' as const, accountId: item.accountId, provider: item.provider, name: item.name };
+  if (!item.domain) {
+    return { ...base, id: null, status: 'error', message: item.error ?? 'not_registered' };
+  }
+  return {
+    ...base,
+    id: item.domain.id,
+    status: item.domain.applePay === 'active' ? 'verified' : 'pending',
+    message: item.domain.message,
+    applePay: item.domain.applePay,
+    googlePay: item.domain.googlePay,
+  };
 }
 
 export interface PaymentDomainsResult {
@@ -54,11 +78,14 @@ export class KoopfyPaymentDomainsService {
     private readonly whop: WhopPlatformClient,
     private readonly connect: WhopConnectService,
     private readonly linked: WhopLinkedAccountsService,
+    private readonly ownDomains: OwnPaymentDomainsService,
   ) {}
 
   private async targets(sellerId: string): Promise<{ mode: PaymentDomainsResult['mode']; accounts: Array<{ scope: DomainScope; accountId: string | null }> }> {
     const linked = await this.linked.getRow(sellerId).catch(() => null);
     if (linked?.whop_account_id && (linked as any).api_key) return { mode: 'external', accounts: [] };
+    // Só Stripe própria (sem Whop): as vendas de cartão saem por ela.
+    if (await sellerHasOwnStripe(sellerId).catch(() => false)) return { mode: 'external', accounts: [] };
     if (!this.whop.isConfigured()) return { mode: 'unavailable', accounts: [] };
     const connected = await this.connect.getRow(sellerId).catch(() => null);
     const accounts: Array<{ scope: DomainScope; accountId: string | null }> = [];
@@ -132,6 +159,9 @@ export class KoopfyPaymentDomainsService {
     if (!sellerId) throw new BadRequestException('Conta de pagamento não encontrada.');
     const hostname = normalizeHostname(rawHostname);
     const { mode, accounts } = await this.targets(sellerId);
+    if (mode === 'external') {
+      return { hostname, mode, registrations: (await this.ownDomains.registerEverywhere(sellerId, hostname)).map(ownRegistration) };
+    }
     const registrations: DomainRegistration[] = [];
     for (const target of accounts) registrations.push(await this.ensure(hostname, target));
     return { hostname, mode, registrations };
@@ -143,6 +173,10 @@ export class KoopfyPaymentDomainsService {
     if (!sellerId) throw new BadRequestException('Conta de pagamento não encontrada.');
     const hostname = normalizeHostname(rawHostname);
     const { mode, accounts } = await this.targets(sellerId);
+    if (mode === 'external') {
+      const own = await this.ownDomains.registerEverywhere(sellerId, hostname, { register: false });
+      return { hostname, mode, registrations: own.map(ownRegistration) };
+    }
     const registrations: DomainRegistration[] = [];
     for (const target of accounts) {
       try {
