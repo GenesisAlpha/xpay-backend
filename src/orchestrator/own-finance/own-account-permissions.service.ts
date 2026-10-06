@@ -7,6 +7,8 @@ import {
   PermissionCheck,
   PermissionProbe,
   PermissionStatus,
+  CustomerEmailsStatus,
+  customerEmailsStatus,
   probeStatus,
   summarizePermissions,
 } from './own-account-permissions';
@@ -27,6 +29,8 @@ export interface OwnAccountPermissions {
   checks: PermissionCheck[];
   /** Nenhuma permissão faltando (o que não deu para conferir não conta como falta). */
   complete: boolean;
+  /** Só Whop: a Whop manda e-mail ao comprador em nome desta conta? */
+  customerEmails?: CustomerEmailsStatus;
 }
 
 @Injectable()
@@ -39,12 +43,40 @@ export class OwnAccountPermissionsService {
 
   async check(sellerId: string, accountId: string): Promise<OwnAccountPermissions> {
     const { account, credentials } = await this.finance.resolveAccount(sellerId, accountId);
-    const results = await Promise.all(PERMISSION_PROBES[account.provider].map(async probe => ({
-      probe,
-      status: await this.probe(account.provider, credentials, probe),
-    })));
+    const [results, customerEmails] = await Promise.all([
+      Promise.all(PERMISSION_PROBES[account.provider].map(async probe => ({
+        probe,
+        status: await this.probe(account.provider, credentials, probe),
+      }))),
+      account.provider === 'whop' ? this.whopCustomerEmails(credentials) : Promise.resolve(undefined),
+    ]);
     const checks = summarizePermissions(account.provider, results);
-    return { accountId, provider: account.provider, checks, complete: checks.every(item => item.status !== 'missing') };
+    return {
+      accountId,
+      provider: account.provider,
+      checks,
+      complete: checks.every(item => item.status !== 'missing'),
+      ...(customerEmails ? { customerEmails } : {}),
+    };
+  }
+
+  /** GET /accounts/me com a chave dele: lê `send_customer_emails` (ver customerEmailsStatus). */
+  private async whopCustomerEmails(account: ProviderAccountConfig): Promise<CustomerEmailsStatus> {
+    try {
+      const response = await this.fetchImpl(`${account.api_url ?? WHOP_API_URL_DEFAULT}/api/v1/accounts/me`, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${account.apiKey}`,
+          Accept: 'application/json',
+          'Api-Version-Date': process.env.WHOP_PAYOUTS_API_VERSION?.trim() || WHOP_API_VERSION_DEFAULT,
+        },
+        signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
+      });
+      const body = response.ok ? await response.json().catch(() => null) : null;
+      return customerEmailsStatus(response.status, body);
+    } catch {
+      return 'unknown';
+    }
   }
 
   private async probe(provider: OwnAccountSummary['provider'], account: ProviderAccountConfig, probe: PermissionProbe): Promise<PermissionStatus> {

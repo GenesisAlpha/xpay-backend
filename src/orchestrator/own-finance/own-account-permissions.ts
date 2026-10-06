@@ -12,6 +12,21 @@ import { OwnProvider } from '../seller-provider/seller-provider-accounts';
 export type PermissionGroupKey = 'finance' | 'wallets';
 export type PermissionStatus = 'ok' | 'missing' | 'unknown';
 
+/**
+ * E-mails da Whop ao comprador na conta própria do seller: 'on' = a Whop
+ * manda recibo e avisos em nome da conta; 'off' = só a Koopfy fala com ele.
+ * A chave da conta não pode mudar isso (a Whop só deixa uma Account API key
+ * editar contas CONECTADAS, nunca a própria) — o seller desliga no painel da
+ * Whop e a Koopfy confere com GET /accounts/me.
+ */
+export type CustomerEmailsStatus = 'on' | 'off' | 'unknown';
+
+export function customerEmailsStatus(httpStatus: number | null, body: any): CustomerEmailsStatus {
+  if (httpStatus == null || httpStatus < 200 || httpStatus >= 300) return 'unknown';
+  const value = body?.send_customer_emails;
+  return value === false ? 'off' : value === true ? 'on' : 'unknown';
+}
+
 export interface PermissionProbe {
   /** Grupo que a leitura confere. */
   group: PermissionGroupKey;

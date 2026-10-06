@@ -138,7 +138,9 @@ export class StripeProvider {
           // comportamento). Sem ela, a Stripe julga só pelos dados do cartão.
           ...(ctx.radar_session ? { radar_options: { session: ctx.radar_session } } : {}),
 
-          ...(ctx.customer_email ? { receipt_email: ctx.customer_email } : {}),
+          // Sem `receipt_email`: a Stripe não manda recibo (nem o do reembolso)
+          // ao comprador. Quem fala com ele é a Koopfy — e-mail do provedor com
+          // outro nome no remetente é causa de "não reconheço a compra".
 
           description: this.buildDescription(ctx, cfg),
 
