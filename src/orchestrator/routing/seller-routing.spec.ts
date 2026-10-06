@@ -22,6 +22,11 @@ import {
   selectAccount,
   accountsToReplace,
   connectionChoice,
+  capReached,
+  computeToday,
+  effectiveDailyLimits,
+  routingDayStartMs,
+  warmupState,
 } from './seller-routing';
 
 type Partial2 = {
@@ -377,3 +382,126 @@ describe('trocar a conta atual (roteamento desligado)', () => {
     expect(accountsToReplace({ provider: 'stripe', replace: true, routingEnabled: true, occupying })).toEqual([]);
   });
 });
+
+describe('dia do roteamento (Brasília)', () => {
+  it('vira às 03:00 UTC (meia-noite de Brasília), não às 00:00 UTC', () => {
+    // 22h de 05/10 em Brasília = 01h UTC de 06/10: ainda é dia 05 para o seller.
+    expect(new Date(routingDayStartMs(Date.parse('2026-10-06T01:00:00Z'))).toISOString()).toBe('2026-10-05T03:00:00.000Z')
+    expect(new Date(routingDayStartMs(Date.parse('2026-10-06T03:00:00Z'))).toISOString()).toBe('2026-10-06T03:00:00.000Z')
+  })
+
+  it('vendas do dia contam as aprovadas (inclusive estornadas) em USD bruto', () => {
+    const today = computeToday([
+      { provider_account_id: 'stripel_a', status: 'approved', amount_usd_gross_cents: '5000' },
+      { provider_account_id: 'stripel_a', status: 'refunded', amount_usd_gross_cents: 3000 },
+      { provider_account_id: 'stripel_a', status: 'pending', amount_usd_gross_cents: 9000 },
+      { provider_account_id: 'stripel_a', status: 'failed', amount_usd_gross_cents: 9000 },
+      { provider_account_id: 'outra', status: 'approved', amount_usd_gross_cents: 9000 },
+    ], ['stripel_a', 'stripel_b'])
+    expect(today.get('stripel_a')).toEqual({ volume: 8000, paidCount: 2 })
+    expect(today.get('stripel_b')).toEqual({ volume: 0, paidCount: 0 })
+  })
+})
+
+describe('aquecimento', () => {
+  // Começou às 10h de Brasília de 01/10.
+  const started = '2026-10-01T13:00:00Z'
+  const warm = (extra: Record<string, any> = {}) => ({
+    warmup_started_at: started,
+    warmup_days: 7,
+    warmup_start_orders: 3,
+    warmup_start_usd_cents: 15000,
+    warmup_growth_pct: 50,
+    warmup_max_ticket_usd_cents: 10000,
+    ...extra,
+  })
+  const at = (iso: string) => Date.parse(iso)
+
+  it('limites sobem pela curva a cada dia de Brasília', () => {
+    const config = { ...defaultAccountConfig('stripel_a', 's-1', 'stripe'), ...warm() }
+    const day1 = warmupState(config, at('2026-10-02T02:59:00Z'))! // 23:59 do dia 01 em Brasília
+    expect(day1).toMatchObject({ day: 1, ordersLimit: 3, usdLimitCents: 15000, totalDays: 7 })
+    expect(warmupState(config, at('2026-10-02T03:00:00Z'))).toMatchObject({ day: 2, ordersLimit: 4, usdLimitCents: 22500 })
+    expect(warmupState(config, at('2026-10-04T12:00:00Z'))).toMatchObject({ day: 4, ordersLimit: 10, usdLimitCents: 50625 })
+    expect(day1.endsAt).toBe('2026-10-08T03:00:00.000Z')
+  })
+
+  it('acaba depois dos dias e não existe antes de começar', () => {
+    const config = { ...defaultAccountConfig('stripel_a', 's-1', 'stripe'), ...warm() }
+    expect(warmupState(config, at('2026-10-08T02:59:00Z'))?.day).toBe(7)
+    expect(warmupState(config, at('2026-10-08T03:00:00Z'))).toBeNull()
+    expect(warmupState({ ...config, warmup_started_at: null }, at('2026-10-02T12:00:00Z'))).toBeNull()
+  })
+
+  it('o teto diário é o destino: a curva nunca passa dele', () => {
+    const config = { ...defaultAccountConfig('stripel_a', 's-1', 'stripe'), ...warm(), daily_cap_orders: 5, daily_cap_usd_cents: 30000 }
+    expect(effectiveDailyLimits(config, at('2026-10-01T15:00:00Z'))).toMatchObject({ orders: 3, usdCents: 15000 })
+    expect(effectiveDailyLimits(config, at('2026-10-05T15:00:00Z'))).toMatchObject({ orders: 5, usdCents: 30000 })
+    // Terminado o aquecimento, só o teto.
+    expect(effectiveDailyLimits(config, at('2026-10-20T15:00:00Z'))).toMatchObject({ orders: 5, usdCents: 30000, warmup: null })
+  })
+
+  it('só com vendas no início: volume fica livre (ou no teto)', () => {
+    const config = { ...defaultAccountConfig('stripel_a', 's-1', 'stripe'), ...warm({ warmup_start_usd_cents: null }) }
+    expect(effectiveDailyLimits(config, at('2026-10-01T15:00:00Z'))).toMatchObject({ orders: 3, usdCents: null })
+  })
+
+  it('tira a conta da escolha ao bater o limite do dia e acima do ticket máximo', () => {
+    const now = at('2026-10-01T15:00:00Z')
+    const a = acc('stripel_a', { config: warm(), stats: { todayOrders: 2, todayUsdCents: 9000 } })
+    expect(ineligibility(a, {}, 0.75, { now })).toBeNull()
+    expect(ineligibility(a, { amountUsdCents: 5000 }, 0.75, { now })).toBeNull()
+    expect(ineligibility(a, { amountUsdCents: 7000 }, 0.75, { now })).toBe('cap_usd') // 9000 + 7000 > 15000
+    expect(ineligibility(a, { amountUsdCents: 12000 }, 0.75, { now })).toBe('warmup_ticket')
+    const full = acc('stripel_a', { config: warm(), stats: { todayOrders: 3 } })
+    expect(capReached(full, null, now)).toBe('cap_orders')
+    // No dia seguinte o limite já é 4.
+    expect(capReached(full, null, at('2026-10-02T15:00:00Z'))).toBeNull()
+  })
+
+  it('a conta aquecendo divide com as outras e, cheia, a outra assume', () => {
+    const now = at('2026-10-01T15:00:00Z')
+    const nova = acc('stripel_nova', { config: { ...warm(), priority: 1 }, stats: { todayOrders: 3 } })
+    const velha = acc('stripel_velha', { config: { priority: 2 } })
+    const eligible = [nova, velha].filter(a => ineligibility(a, {}, 0.75, { now }) === null)
+    expect(selectAccount('priority_cap', eligible, {})?.id).toBe('stripel_velha')
+  })
+})
+
+describe('edição do aquecimento', () => {
+  const nowIso = '2026-10-05T15:00:00.000Z'
+  const base = defaultAccountConfig('stripel_a', 's-1', 'stripe')
+
+  it('liga começando hoje, com crescimento padrão de 30%', () => {
+    const patch = parseAccountPatch({ warmup: { days: 10, startOrders: 3 } }, base, nowIso)
+    expect(patch).toEqual({
+      warmup_started_at: nowIso,
+      warmup_days: 10,
+      warmup_start_orders: 3,
+      warmup_start_usd_cents: null,
+      warmup_growth_pct: 30,
+      warmup_max_ticket_usd_cents: null,
+    })
+  })
+
+  it('ajustar um aquecimento em curso mantém o dia; restart recomeça', () => {
+    const running = { ...base, warmup_started_at: '2026-10-03T15:00:00.000Z', warmup_days: 10, warmup_start_orders: 3 }
+    expect(parseAccountPatch({ warmup: { days: 14, startOrders: 5 } }, running, nowIso).warmup_started_at).toBe('2026-10-03T15:00:00.000Z')
+    expect(parseAccountPatch({ warmup: { days: 14, startOrders: 5, restart: true } }, running, nowIso).warmup_started_at).toBe(nowIso)
+    // Aquecimento já terminado: ligar de novo começa hoje.
+    const done = { ...running, warmup_started_at: '2026-09-01T15:00:00.000Z' }
+    expect(parseAccountPatch({ warmup: { days: 14, startOrders: 5 } }, done, nowIso).warmup_started_at).toBe(nowIso)
+  })
+
+  it('null encerra', () => {
+    expect(parseAccountPatch({ warmup: null }, base, nowIso)).toEqual({ warmup_started_at: null })
+  })
+
+  it('recusa sem dias, sem limite de início ou com valores fora da faixa', () => {
+    expect(() => parseAccountPatch({ warmup: { startOrders: 3 } }, base, nowIso)).toThrow(/days/)
+    expect(() => parseAccountPatch({ warmup: { days: 7 } }, base, nowIso)).toThrow(/primeiro dia/)
+    expect(() => parseAccountPatch({ warmup: { days: 0, startOrders: 3 } }, base, nowIso)).toThrow(/warmup.days/)
+    expect(() => parseAccountPatch({ warmup: { days: 7, startOrders: 3, growthPct: 500 } }, base, nowIso)).toThrow(/growthPct/)
+    expect(() => parseAccountPatch({ warmup: 'sim' }, base, nowIso)).toThrow(/warmup/)
+  })
+})

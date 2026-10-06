@@ -49,6 +49,26 @@ export const BREAKER_COOLDOWN_MS = 5 * 60 * 1000;
 /** Sessão presa a uma conta por até 24 h (routing_assignments.expires_at). */
 export const ASSIGNMENT_TTL_MS = 24 * 60 * 60 * 1000;
 
+// ─── Dia do roteamento ────────────────────────────────────────────────────
+
+/**
+ * Tetos do dia e dias de aquecimento contam no fuso de Brasília (UTC−3, sem
+ * horário de verão desde 2019): o seller pensa em "hoje" no relógio dele, e o
+ * dia em UTC virava às 21h — o teto zerava no meio da noite de vendas.
+ */
+const ROUTING_DAY_OFFSET_MS = -3 * 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** Número do dia (dias desde 1970) no fuso de Brasília. */
+export function routingDayNumber(ms: number): number {
+  return Math.floor((ms + ROUTING_DAY_OFFSET_MS) / DAY_MS);
+}
+
+/** Início do dia de Brasília que contém `ms`, em epoch ms (UTC). */
+export function routingDayStartMs(ms: number): number {
+  return routingDayNumber(ms) * DAY_MS - ROUTING_DAY_OFFSET_MS;
+}
+
 // ─── Ids ──────────────────────────────────────────────────────────────────
 
 /** Provedor de uma conta própria pelo prefixo do id, ou null se não é própria. */
@@ -131,6 +151,15 @@ export interface RoutingAccountConfig {
   currencies: string[] | null;
   paused_at: string | null;
   pause_reason: RoutingPauseReason | null;
+  /** Aquecimento: início (null = desligado). Ver warmupState. */
+  warmup_started_at: string | null;
+  warmup_days: number | null;
+  warmup_start_orders: number | null;
+  warmup_start_usd_cents: number | null;
+  /** Crescimento diário dos limites, em % (30 = ×1,3 por dia). */
+  warmup_growth_pct: number | null;
+  /** Ticket máximo enquanto aquece. */
+  warmup_max_ticket_usd_cents: number | null;
 }
 
 export function defaultAccountConfig(id: string, sellerId: string, provider: OwnProvider): RoutingAccountConfig {
@@ -149,6 +178,12 @@ export function defaultAccountConfig(id: string, sellerId: string, provider: Own
     currencies: null,
     paused_at: null,
     pause_reason: null,
+    warmup_started_at: null,
+    warmup_days: null,
+    warmup_start_orders: null,
+    warmup_start_usd_cents: null,
+    warmup_growth_pct: null,
+    warmup_max_ticket_usd_cents: null,
   };
 }
 
@@ -170,6 +205,87 @@ export function normalizeAccountConfig(row: any, fallback: RoutingAccountConfig)
     currencies: list(row.currencies),
     paused_at: row.paused_at ?? null,
     pause_reason: row.pause_reason ?? null,
+    warmup_started_at: row.warmup_started_at ?? null,
+    warmup_days: num(row.warmup_days),
+    warmup_start_orders: num(row.warmup_start_orders),
+    warmup_start_usd_cents: num(row.warmup_start_usd_cents),
+    warmup_growth_pct: num(row.warmup_growth_pct),
+    warmup_max_ticket_usd_cents: num(row.warmup_max_ticket_usd_cents),
+  };
+}
+
+// ─── Aquecimento ──────────────────────────────────────────────────────────
+
+export const WARMUP_DEFAULT_GROWTH_PCT = 30;
+export const WARMUP_MAX_DAYS = 90;
+
+export interface WarmupState {
+  /** Dia do aquecimento, começando em 1 (dia de Brasília em que começou). */
+  day: number;
+  totalDays: number;
+  /** Vendas aprovadas permitidas hoje pelo aquecimento (null = sem limite de vendas). */
+  ordersLimit: number | null;
+  /** Volume permitido hoje pelo aquecimento, em centavos de USD (null = sem limite de volume). */
+  usdLimitCents: number | null;
+  maxTicketUsdCents: number | null;
+  growthPct: number;
+  /** Quando o aquecimento acaba (início do dia seguinte ao último), ISO. */
+  endsAt: string;
+}
+
+/**
+ * Conta nova recebendo o volume cheio do primeiro dia é o que mais derruba
+ * conta em Stripe/Whop/PayPal: o provedor vê um salto sem histórico. O
+ * aquecimento sobe os limites do dia aos poucos:
+ *
+ *   limite do dia N = início × (1 + crescimento)^(N − 1)
+ *
+ * nunca acima do teto diário da conta (o teto é o destino do aquecimento),
+ * e com um ticket máximo opcional enquanto durar. Os dias contam no fuso de
+ * Brasília a partir do dia em que começou, vendendo ou não — a curva é do
+ * calendário, igual à do provedor. Acabados os dias, valem só os tetos.
+ * null = sem aquecimento em vigor.
+ */
+export function warmupState(config: RoutingAccountConfig, now = Date.now()): WarmupState | null {
+  const startedMs = config.warmup_started_at ? Date.parse(config.warmup_started_at) : NaN;
+  const totalDays = Number(config.warmup_days);
+  if (!Number.isFinite(startedMs) || !Number.isInteger(totalDays) || totalDays < 1) return null;
+  const index = routingDayNumber(now) - routingDayNumber(startedMs);
+  if (index < 0 || index >= totalDays) return null;
+
+  const growth = config.warmup_growth_pct != null && Number.isFinite(Number(config.warmup_growth_pct))
+    ? Math.max(0, Number(config.warmup_growth_pct))
+    : WARMUP_DEFAULT_GROWTH_PCT;
+  const factor = Math.pow(1 + growth / 100, index);
+  const curve = (start: number | null, cap: number | null) => {
+    if (start == null) return null;
+    const value = Math.max(start > 0 ? 1 : 0, Math.floor(start * factor));
+    return cap != null ? Math.min(value, cap) : value;
+  };
+
+  return {
+    day: index + 1,
+    totalDays,
+    ordersLimit: curve(config.warmup_start_orders, config.daily_cap_orders),
+    usdLimitCents: curve(config.warmup_start_usd_cents, config.daily_cap_usd_cents),
+    maxTicketUsdCents: config.warmup_max_ticket_usd_cents,
+    growthPct: growth,
+    endsAt: new Date(routingDayStartMs(startedMs) + totalDays * DAY_MS).toISOString(),
+  };
+}
+
+/** Os limites de hoje: o menor entre o teto diário e o do aquecimento. */
+export function effectiveDailyLimits(config: RoutingAccountConfig, now = Date.now()): {
+  orders: number | null;
+  usdCents: number | null;
+  warmup: WarmupState | null;
+} {
+  const warmup = warmupState(config, now);
+  const min = (a: number | null, b: number | null | undefined) => (a == null ? b ?? null : b == null ? a : Math.min(a, b));
+  return {
+    orders: min(config.daily_cap_orders, warmup?.ordersLimit),
+    usdCents: min(config.daily_cap_usd_cents, warmup?.usdLimitCents),
+    warmup,
   };
 }
 
@@ -255,6 +371,30 @@ export function computeStats(
   return result;
 }
 
+export interface TodayTxRow {
+  provider_account_id: string | null;
+  status: string | null;
+  amount_usd_gross_cents?: number | string | null;
+}
+
+/**
+ * Vendas e volume do dia por conta, a partir das transações criadas desde o
+ * início do dia de Brasília: aprovadas (inclusive as que depois voltaram), em
+ * USD BRUTO. O account_daily_metrics do pool conta o líquido de câmbio e vira
+ * o dia em UTC — comparado com o teto e o ticket (brutos) deixava passar.
+ */
+export function computeToday(rows: TodayTxRow[], accountIds: string[]): Map<string, { volume: number; paidCount: number }> {
+  const result = new Map<string, { volume: number; paidCount: number }>();
+  for (const id of accountIds) result.set(id, { volume: 0, paidCount: 0 });
+  for (const row of rows) {
+    const day = row.provider_account_id ? result.get(row.provider_account_id) : undefined;
+    if (!day || !APPROVED_STATES.has(String(row.status ?? '').toLowerCase())) continue;
+    day.paidCount += 1;
+    day.volume += Math.max(0, Math.round(Number(row.amount_usd_gross_cents ?? 0) || 0));
+  }
+  return result;
+}
+
 /**
  * Score 0–100 da conta nos últimos 7 dias:
  *
@@ -316,6 +456,7 @@ export type IneligibleReason =
   | 'country'
   | 'currency'
   | 'ticket'
+  | 'warmup_ticket'
   | 'cap_usd'
   | 'cap_orders';
 
@@ -341,15 +482,25 @@ export function activePause(
   return null;
 }
 
-export function capReached(candidate: Pick<RoutingCandidate, 'config' | 'stats'>, amountUsdCents?: number | null): 'cap_usd' | 'cap_orders' | null {
-  const { config, stats } = candidate;
-  if (config.daily_cap_orders != null && stats.todayOrders >= config.daily_cap_orders) return 'cap_orders';
-  if (config.daily_cap_usd_cents != null) {
+/**
+ * Teto do dia atingido? Vale o menor entre o teto diário e o limite do
+ * aquecimento (effectiveDailyLimits). Vendas e volume do dia são os
+ * APROVADOS no dia de Brasília, em USD bruto — a mesma unidade do ticket.
+ */
+export function capReached(
+  candidate: Pick<RoutingCandidate, 'config' | 'stats'>,
+  amountUsdCents?: number | null,
+  now = Date.now(),
+): 'cap_usd' | 'cap_orders' | null {
+  const { stats } = candidate;
+  const limits = effectiveDailyLimits(candidate.config, now);
+  if (limits.orders != null && stats.todayOrders >= limits.orders) return 'cap_orders';
+  if (limits.usdCents != null) {
     // Com o valor da venda, o teto vale para ela caber inteira; sem o valor
     // (escolha da sessão, antes do carrinho fechar), vale o que já entrou.
     const amount = Number.isFinite(Number(amountUsdCents)) && amountUsdCents != null ? Number(amountUsdCents) : 0;
     const projected = stats.todayUsdCents + amount;
-    if (amount > 0 ? projected > config.daily_cap_usd_cents : stats.todayUsdCents >= config.daily_cap_usd_cents) return 'cap_usd';
+    if (amount > 0 ? projected > limits.usdCents : stats.todayUsdCents >= limits.usdCents) return 'cap_usd';
   }
   return null;
 }
@@ -375,10 +526,12 @@ export function ineligibility(
   if (amount != null && Number.isFinite(Number(amount))) {
     if (config.min_ticket_usd_cents != null && Number(amount) < config.min_ticket_usd_cents) return 'ticket';
     if (config.max_ticket_usd_cents != null && Number(amount) > config.max_ticket_usd_cents) return 'ticket';
+    const warmup = warmupState(config, opts.now);
+    if (warmup?.maxTicketUsdCents != null && Number(amount) > warmup.maxTicketUsdCents) return 'warmup_ticket';
   }
 
   if (!opts.ignoreCaps) {
-    const cap = capReached(candidate, amount);
+    const cap = capReached(candidate, amount, opts.now);
     if (cap) return cap;
   }
   return null;
@@ -604,6 +757,58 @@ export function parseAccountPatch(body: Record<string, any>, current: RoutingAcc
     }
   }
 
+  if (has('warmup')) parseWarmupPatch(body.warmup, current, nowIso, patch, errors);
+
   if (errors.length) throw new BadRequestException(`Configuração inválida. ${errors.join(' ')}`);
   return patch;
+}
+
+/**
+ * `warmup` no corpo do PUT da conta:
+ *   • null / false → encerra o aquecimento (a curva fica guardada);
+ *   • { days, startOrders?, startUsdCents?, growthPct?, maxTicketUsdCents?, restart? }
+ *     → liga ou ajusta. Ligar começa hoje; ajustar um aquecimento em curso
+ *     mantém o dia em que ele está, a não ser com `restart: true`.
+ * Pelo menos um dos limites de início (vendas ou volume) é obrigatório:
+ * aquecimento sem limite nenhum não aquece nada.
+ */
+function parseWarmupPatch(raw: any, current: RoutingAccountConfig, nowIso: string, patch: Record<string, any>, errors: string[]) {
+  if (raw === null || raw === false) {
+    patch.warmup_started_at = null;
+    return;
+  }
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    errors.push('warmup: envie a configuração do aquecimento ou null para encerrar.');
+    return;
+  }
+
+  const value = (key: string, min: number, max: number, opts: { nullable: boolean; integer: boolean }) => {
+    const input = raw[key];
+    if (input === undefined || input === null || input === '') return opts.nullable ? null : undefined;
+    const n = Number(input);
+    if (!Number.isFinite(n) || n < min || n > max || (opts.integer && !Number.isInteger(n))) {
+      errors.push(`warmup.${key}: use ${opts.integer ? 'um inteiro' : 'um número'} entre ${min} e ${max}.`);
+      return undefined;
+    }
+    return n;
+  };
+
+  const days = value('days', 1, WARMUP_MAX_DAYS, { nullable: false, integer: true });
+  const startOrders = value('startOrders', 1, 1e6, { nullable: true, integer: true });
+  const startUsd = value('startUsdCents', 100, 1e12, { nullable: true, integer: true });
+  const growth = value('growthPct', 0, 200, { nullable: true, integer: false });
+  const maxTicket = value('maxTicketUsdCents', 100, 1e12, { nullable: true, integer: true });
+
+  if (raw.days === undefined || raw.days === null || raw.days === '') errors.push('warmup.days: informe por quantos dias a conta aquece.');
+  if (startOrders === null && startUsd === null) errors.push('warmup: informe as vendas ou o volume do primeiro dia.');
+  // Com qualquer erro a requisição inteira é recusada; não monta o patch.
+  if (errors.length) return;
+
+  const running = current.warmup_started_at != null && warmupState(current, Date.parse(nowIso)) !== null;
+  patch.warmup_started_at = running && raw.restart !== true ? current.warmup_started_at : nowIso;
+  patch.warmup_days = days;
+  patch.warmup_start_orders = startOrders;
+  patch.warmup_start_usd_cents = startUsd;
+  patch.warmup_growth_pct = growth ?? WARMUP_DEFAULT_GROWTH_PCT;
+  patch.warmup_max_ticket_usd_cents = maxTicket;
 }

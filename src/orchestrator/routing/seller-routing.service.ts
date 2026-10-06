@@ -35,6 +35,8 @@ import {
   activePause,
   capReached,
   computeStats,
+  computeToday,
+  effectiveDailyLimits,
   defaultAccountConfig,
   disputeLimitExceeded,
   effectiveDisputePausePct,
@@ -47,7 +49,9 @@ import {
   normalizeStrategy,
   ownProviderOfId,
   parseAccountPatch,
+  routingDayStartMs,
   selectAccount,
+  TodayTxRow,
 } from './seller-routing';
 import { notifySellerRoutingPause } from '../../utils/seller-mail';
 
@@ -69,6 +73,9 @@ import { notifySellerRoutingPause } from '../../utils/seller-mail';
 const STATS_TTL_MS = 60 * 1000;
 const STATS_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const STATS_ROW_LIMIT = 20000;
+// Vendas e volume do dia (tetos e aquecimento): cache bem mais curto, e
+// zerado quando uma conta do seller aprova uma venda (onOwnAccountPaid).
+const TODAY_TTL_MS = 10 * 1000;
 
 /** Conta no roteamento com o que o painel e a escolha precisam. */
 export interface PoolEntry extends RoutingCandidate {
@@ -154,6 +161,7 @@ export class SellerRoutingService implements OnModuleInit {
   now: () => number = () => Date.now();
 
   private statsCache = new Map<string, { at: number; rows: StatsTxRow[] }>();
+  private todayCache = new Map<string, { at: number; dayStart: number; rows: TodayTxRow[] }>();
   private pauseNotices = new Map<string, number>();
   // Injetável nos testes: o e-mail de conta pausada.
   notifyPause: typeof notifySellerRoutingPause = notifySellerRoutingPause;
@@ -165,6 +173,9 @@ export class SellerRoutingService implements OnModuleInit {
       void this.recordBreakerPause(accountId).catch((err: any) =>
         console.error(`[SellerRouting] pausa por erros de ${accountId}:`, err?.message));
     };
+    // Venda aprovada numa conta própria: a próxima escolha relê o dia (o
+    // teto do aquecimento costuma ser de poucas vendas).
+    this.router.onOwnAccountPaid = (accountId: string) => this.forgetToday(accountId);
   }
 
   // ─── Configuração ──────────────────────────────────────────────────────
@@ -278,8 +289,38 @@ export class SellerRoutingService implements OnModuleInit {
       this.statsCache.set(cacheKey, { at: this.now(), rows });
     }
 
-    const today = await this.router.getDailyMetrics(ids).catch(() => new Map());
+    const today = computeToday(await this.loadTodayRows(sellerId, ids), ids);
     return computeStats(rows, ids, today, disputeLimitPct);
+  }
+
+  /** Transações criadas desde o início do dia de Brasília (ver computeToday). */
+  private async loadTodayRows(sellerId: string, ids: string[]): Promise<TodayTxRow[]> {
+    const cacheKey = `${sellerId}:${[...ids].sort().join(',')}`;
+    const dayStart = routingDayStartMs(this.now());
+    const cached = this.todayCache.get(cacheKey);
+    if (cached && cached.dayStart === dayStart && this.now() - cached.at < TODAY_TTL_MS) return cached.rows;
+
+    const { data, error } = await supabase
+      .from('transactions')
+      .select('provider_account_id, status, amount_usd_gross_cents')
+      .eq('seller_id', sellerId)
+      .in('provider_account_id', ids)
+      .gte('created_at', new Date(dayStart).toISOString())
+      .limit(STATS_ROW_LIMIT);
+    if (error) {
+      console.error('[SellerRouting] vendas do dia das contas:', error.message);
+      // Sem a leitura, o último dia conhecido segura os tetos (melhor que zerar).
+      return cached && cached.dayStart === dayStart ? cached.rows : [];
+    }
+    const rows = (Array.isArray(data) ? data : []) as unknown as TodayTxRow[];
+    this.todayCache.set(cacheKey, { at: this.now(), dayStart, rows });
+    return rows;
+  }
+
+  private forgetToday(accountId: string) {
+    for (const key of this.todayCache.keys()) {
+      if (key.split(':')[1]?.split(',').includes(accountId)) this.todayCache.delete(key);
+    }
   }
 
   // ─── Escolha da conta ──────────────────────────────────────────────────
@@ -403,15 +444,24 @@ export class SellerRoutingService implements OnModuleInit {
       // A conta da sessão saiu (pausa, teto, desconexão, filtro): a próxima
       // carga das formas de pagamento já vem com a nova conta.
       const next = this.pick(group, pool, settings, ctx);
+      // Nenhuma outra aceita esta venda (ex.: ticket acima do máximo de todas):
+      // recarregar não adiantaria — o config, que não conhece o valor, daria a
+      // mesma conta de novo e o checkout ficaria preso entre 409s.
+      if (!next) {
+        throw new BadRequestException({
+          error: 'ROUTING_NO_ACCOUNT',
+          message: 'Nenhuma conta de pagamento disponível para este pedido agora.',
+        });
+      }
       if (key) {
         await this.saveAssignment(key, sellerId, {
-          card: group === 'card' ? next?.id ?? null : assignment?.card_account_id ?? null,
-          paypal: group === 'paypal' ? next?.id ?? null : assignment?.paypal_account_id ?? null,
+          card: group === 'card' ? next.id : assignment?.card_account_id ?? null,
+          paypal: group === 'paypal' ? next.id : assignment?.paypal_account_id ?? null,
         });
       }
       console.warn(
         `[SellerRouting] seller ${sellerId}: conta ${assignedId} da sessão ${key ?? '(sem chave)'} não é mais elegível `
-        + `→ ${next?.id ?? 'nenhuma'}; checkout recarrega (409)`,
+        + `→ ${next.id}; checkout recarrega (409)`,
       );
       throw new ConflictException({ error: 'ROUTING_REASSIGNED', message: ROUTING_REASSIGNED_MESSAGE });
     }
@@ -616,6 +666,7 @@ export class SellerRoutingService implements OnModuleInit {
       disputePausePctEffective: settings.disputePausePctEffective,
       accounts: [...pool].sort(order).map(entry => {
         const pause = activePause(entry, settings.disputePausePctEffective, now);
+        const limits = effectiveDailyLimits(entry.config, now);
         return {
           id: entry.id,
           provider: entry.provider,
@@ -629,7 +680,23 @@ export class SellerRoutingService implements OnModuleInit {
           status: entry.connection === 'invalid' ? 'attention' : entry.connection,
           paused: Boolean(pause),
           pauseReason: pause,
-          capReached: Boolean(capReached(entry)),
+          capReached: Boolean(capReached(entry, null, now)),
+          // Limites de HOJE (o menor entre o teto e o aquecimento).
+          todayLimitOrders: limits.orders,
+          todayLimitUsdCents: limits.usdCents,
+          warmup: entry.config.warmup_started_at && entry.config.warmup_days
+            ? {
+              active: Boolean(limits.warmup),
+              startedAt: entry.config.warmup_started_at,
+              days: entry.config.warmup_days,
+              startOrders: entry.config.warmup_start_orders,
+              startUsdCents: entry.config.warmup_start_usd_cents,
+              growthPct: entry.config.warmup_growth_pct,
+              maxTicketUsdCents: entry.config.warmup_max_ticket_usd_cents,
+              day: limits.warmup?.day ?? null,
+              endsAt: limits.warmup?.endsAt ?? null,
+            }
+            : null,
           weight: entry.config.weight,
           priority: entry.config.priority,
           dailyCapUsdCents: entry.config.daily_cap_usd_cents,
@@ -869,6 +936,8 @@ const HISTORY_DETAIL_KEYS = [
   'enabled', 'card_strategy', 'paypal_strategy', 'routing_fee_pct', 'dispute_pause_pct',
   'label', 'weight', 'priority', 'daily_cap_usd_cents', 'daily_cap_orders',
   'min_ticket_usd_cents', 'max_ticket_usd_cents', 'countries', 'currencies', 'paused_at', 'pause_reason',
+  'warmup_started_at', 'warmup_days', 'warmup_start_orders', 'warmup_start_usd_cents', 'warmup_growth_pct',
+  'warmup_max_ticket_usd_cents',
   'reason', 'disputes_7d', 'approved_7d', 'limit_pct', 'provider', 'mode', 'amount_cents', 'currency', 'routing', 'hostname',
 ] as const;
 

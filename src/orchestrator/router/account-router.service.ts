@@ -283,6 +283,9 @@ export class AccountRouterService implements OnModuleInit {
    */
   onOwnAccountBreakerOpen?: (accountId: string) => void;
 
+  /** Avisado a cada venda paga (markPaid): o roteamento relê o dia da conta. */
+  onOwnAccountPaid?: (accountId: string) => void;
+
   private getHealth(id: string): HealthMetric {
     return (
       this.health.get(id) ?? {
@@ -795,6 +798,11 @@ export class AccountRouterService implements OnModuleInit {
 
   async markPaid(accountId: string, amount: number) {
     if (amount <= 0) return;
+    try {
+      this.onOwnAccountPaid?.(accountId);
+    } catch (err: any) {
+      console.error(`[AccountRouter] aviso de venda da conta ${accountId}:`, err?.message);
+    }
 
     const day = this.today();
 

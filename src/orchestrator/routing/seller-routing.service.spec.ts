@@ -397,3 +397,75 @@ describe('histórico e aviso de pausa', () => {
     expect((await svc.history(SELLER)).events[0]).toMatchObject({ action: 'routing.account_auto_paused', actor: 'system', accountId: risky })
   })
 })
+
+describe('tetos do dia e aquecimento', () => {
+  beforeEach(() => {
+    enableRouting()
+    tables.seller_provider_accounts = [providerRow('aaa', 'stripe'), providerRow('bbbb', 'whop')]
+    // Stripe nova aquecendo desde hoje (3 vendas no 1º dia), em primeiro na cascata.
+    routingConfig('stripel_aaa', {
+      priority: 1,
+      warmup_started_at: '2026-09-28T10:00:00Z',
+      warmup_days: 7,
+      warmup_start_orders: 3,
+      warmup_growth_pct: 50,
+      warmup_max_ticket_usd_cents: 10000,
+    })
+    routingConfig('whopa_bbbb', { priority: 2, provider: 'whop' })
+  })
+
+  const approved = (n: number, id = 'stripel_aaa') =>
+    Array.from({ length: n }, (_, i) => ({ seller_id: SELLER, provider_account_id: id, status: 'approved', amount_usd_gross_cents: 2000, id: `${id}-${i}` }))
+
+  it('conta as vendas aprovadas do dia nas transações e, no limite do aquecimento, passa para a próxima', async () => {
+    tables.transactions = approved(2)
+    const svc = build()
+    expect((await svc.resolveForConfig(SELLER, 'sess-1'))?.card?.id).toBe('stripel_aaa')
+
+    tables.transactions = approved(3)
+    const router: any = (svc as any).router
+    svc.onModuleInit()
+    router.onOwnAccountPaid('stripel_aaa') // venda aprovada: esquece o dia em cache
+    expect((await svc.resolveForConfig(SELLER, 'sess-2'))?.card?.id).toBe('whopa_bbbb')
+
+    const view: any = await svc.view(SELLER)
+    const stripe = view.accounts.find((a: any) => a.id === 'stripel_aaa')
+    expect(stripe).toMatchObject({
+      capReached: true,
+      todayLimitOrders: 3,
+      todayLimitUsdCents: null,
+      warmup: { active: true, day: 1, days: 7, startOrders: 3, growthPct: 50, maxTicketUsdCents: 10000 },
+      stats: { todayOrders: 3, todayUsdCents: 6000 },
+    })
+  })
+
+  it('ticket acima do máximo do aquecimento: a sessão vai para outra conta (409)', async () => {
+    const svc = build()
+    await svc.resolveForConfig(SELLER, 'sess-1')
+    const err = await svc.resolveForSale(SELLER, { method: 'card', routingKey: 'sess-1', ctx: { amountUsdCents: 15000 } }).catch(e => e)
+    expect(err).toBeInstanceOf(ConflictException)
+    expect(tables.routing_assignments[0]).toMatchObject({ card_account_id: 'whopa_bbbb' })
+  })
+
+  it('nenhuma outra conta aceita a venda: erro claro em vez de 409 em loop', async () => {
+    tables.seller_routing_accounts.find(r => r.provider_account_id === 'whopa_bbbb').max_ticket_usd_cents = 5000
+    const svc = build()
+    await svc.resolveForConfig(SELLER, 'sess-1')
+    const err = await svc.resolveForSale(SELLER, { method: 'card', routingKey: 'sess-1', ctx: { amountUsdCents: 15000 } }).catch(e => e)
+    expect(err).toBeInstanceOf(BadRequestException)
+    expect(err.getResponse()).toMatchObject({ error: 'ROUTING_NO_ACCOUNT' })
+  })
+
+  it('ligar pelo painel grava a curva e registra no histórico', async () => {
+    const svc = build()
+    await svc.updateAccount(SELLER, 'whopa_bbbb', { warmup: { days: 10, startUsdCents: 20000, growthPct: 25 } }, 'seller:u')
+    expect(tables.seller_routing_accounts.find(r => r.provider_account_id === 'whopa_bbbb')).toMatchObject({
+      warmup_started_at: '2026-09-28T12:00:00.000Z',
+      warmup_days: 10,
+      warmup_start_usd_cents: 20000,
+      warmup_growth_pct: 25,
+    })
+    const history: any = await svc.history(SELLER)
+    expect(history.events[0]).toMatchObject({ action: 'routing.account_changed', details: { warmup_days: 10, warmup_start_usd_cents: 20000 } })
+  })
+})
