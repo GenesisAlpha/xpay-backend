@@ -131,7 +131,7 @@ export class CrmController {
       riskLevel: 'WHITE' | 'GRAY' | 'BLACK'
       enabledMethods: string[]
       /** Provedor padrão; sem valor, Whop. */
-      provider?: 'whop' | 'stripe'
+      provider?: 'whop' | 'stripe' | 'slash' | 'clip'
       feeOverride?: any
       fees?: any
       notes?: string
@@ -414,7 +414,7 @@ export class CrmController {
     @Param('id') id: string,
     @Req() req: any,
     @Body() body: {
-      provider: 'whop' | 'stripe' | null
+      provider: 'whop' | 'stripe' | 'slash' | 'clip' | null
       notes?: string
     },
   ) {

@@ -49,6 +49,8 @@ import { CrmAdminService } from './crm-admin.service'
 import { CrmCheckoutController } from './crm-checkout.controller'
 import { CrmCheckoutService } from './crm-checkout.service'
 import { CrmTicketsController } from './crm-tickets.controller'
+import { CrmClipController } from './crm-clip.controller'
+import { CrmClipService } from './crm-clip.service'
 import { StorageService } from '../lib/storage.service'
 import { CryptoModule } from '../crypto/crypto.module'
 import { OrchestratorModule } from '../orchestrator/orchestrator.module'
@@ -100,13 +102,14 @@ import { KoopfyIntegrationModule } from '../integration/koopfy-integration.modul
   // OrchestratorModule).
   // CrmCheckoutController: sellers e lojas do checkout (só leitura, via canal
   // interno).
-  controllers: [CrmController, CrmAdminController, CrmCheckoutController, CrmTicketsController, WhopConnectController, WhopRfiReviewsController, WhopLinkedController, SellerRoutingCrmController, ActivationRequestsController, AffiliateCrmController],
-  providers:   [CrmService, CrmAdminService, CrmCheckoutService, CrmAuthGuard, StorageService],
+  // CrmClipController: contas Clip (modo cartão/SPEI, status, tetos).
+  controllers: [CrmController, CrmAdminController, CrmCheckoutController, CrmTicketsController, WhopConnectController, WhopRfiReviewsController, WhopLinkedController, SellerRoutingCrmController, ActivationRequestsController, AffiliateCrmController, CrmClipController],
+  providers:   [CrmService, CrmAdminService, CrmCheckoutService, CrmClipService, CrmAuthGuard, StorageService],
   exports:     [CrmService, CrmAdminService, CrmCheckoutService],
 })
 export class CrmModule implements NestModule {
   // IP e navegador de cada requisição do CRM, para o log de ações.
   configure(consumer: MiddlewareConsumer) {
-    consumer.apply(crmRequestContext).forRoutes(CrmController, CrmAdminController, CrmCheckoutController)
+    consumer.apply(crmRequestContext).forRoutes(CrmController, CrmAdminController, CrmCheckoutController, CrmClipController)
   }
 }
