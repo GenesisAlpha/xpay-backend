@@ -23,6 +23,7 @@ import { RetrieveResponse } from '../orchestrator/providers/provider.types'
 import { CardCryptoService } from '../crypto/card-crypto.service'
 import { WebhookService } from '../webhooks/webhook.service'
 import { ClipAccountsService } from '../orchestrator/clip/clip-accounts.service'
+import { ClipProvider } from '../orchestrator/providers/clip.provider'
 import { SpeiReceiptService } from '../orchestrator/clip/spei-receipt.service'
 import { AffiliateCommissionService } from '../affiliates/affiliate-commission.service'
 import { StorageService } from '../lib/storage.service'
@@ -695,13 +696,45 @@ export class PaymentService {
             providerName = 'clip'
         }
 
+        // Upsell na Clip: não há cartão salvo, há tokens extras gerados na
+        // compra (ver loadUpsellParent). Cada cobrança consome um, na conta que
+        // montou o formulário — a da compra-mãe.
+        let clipUpsell: { reservationId: string | null } | null = null
         if (upsellParent) {
+            const parentProvider = this.normalizeProviderName(upsellParent.provider)
+            if (parentProvider === 'clip') {
+                // A Clip só cobra em peso; o upsell herda a moeda da compra.
+                if (String(dto.currency).toUpperCase() !== 'MXN') {
+                    throw new BadRequestException({
+                        message: 'Upsell indisponível nesta moeda.',
+                        error: 'CURRENCY_NOT_SUPPORTED',
+                    })
+                }
+                const taken = await this.clipAccounts.takeUpsellToken(upsellParent.id, transaction.id)
+                if (!taken || taken.accountId !== upsellParent.provider_account_id) {
+                    await supabase.from('transactions').update({
+                        status: 'failed', failure_code: 'UPSELL_NO_SAVED_PAYMENT_METHOD',
+                        failure_message: 'Prazo do upsell de um clique encerrado.',
+                        failed_at: new Date().toISOString(),
+                    }).eq('id', transaction.id)
+                    throw new BadRequestException({
+                        message: 'Upsell indisponível para esta compra.',
+                        error: 'UPSELL_NO_SAVED_PAYMENT_METHOD',
+                    })
+                }
+                dto.payment_data = {
+                    ...(dto.payment_data ?? {}),
+                    clipToken: taken.token,
+                    clipSessionId: taken.sessionId,
+                }
+                clipUpsell = { reservationId: taken.reservationId }
+            }
             const parentAccount = await this.accountRouter.resolveAccountById(upsellParent.provider_account_id)
             if (!parentAccount) {
                 throw new BadRequestException('Conta de pagamento da compra original indisponível.')
             }
             account = parentAccount
-            providerName = 'whop'
+            providerName = parentProvider === 'clip' ? 'clip' : 'whop'
         }
 
         if (routed && !clipReservation) {
@@ -809,7 +842,7 @@ export class PaymentService {
             ...dto,
             settlement,
             // WhopProvider.charge cobra off-session quando isto vem preenchido.
-            ...(upsellParent ? {
+            ...(upsellParent && !clipUpsell ? {
                 offSession: {
                     memberId: upsellParent.metadata.whop_member_id,
                     paymentMethodId: upsellParent.metadata.whop_payment_method_id,
@@ -958,6 +991,37 @@ export class PaymentService {
         //
         // Em 'pending' (3DS) NÃO capturamos: o dinheiro ainda não existe. A
         // reserva segue em pé e o desfecho chega pelo webhook.
+        // Tokens extras da compra para o upsell de um clique. Gravados ANTES de
+        // responder: o checkout leva o comprador ao funil logo em seguida, e a
+        // primeira coisa que a página pergunta é se a oferta pode ser cobrada.
+        // Também em 3DS pendente — o token vale 15 min e a compra pode fechar.
+        let clipUpsellTokensStored = 0
+        const clipUpsellTokens: string[] = dto.payment_data?.clipUpsellTokens ?? []
+        if (clipReservation && result.success && clipUpsellTokens.length) {
+            clipUpsellTokensStored = await this.clipAccounts.storeUpsellTokens({
+                transactionId: transaction.id,
+                sellerId: effectiveSellerId,
+                accountId: clipReservation.account_id,
+                reservationId: clipReservation.id,
+                sessionId: dto.payment_data?.clipSessionId ?? null,
+                tokens: clipUpsellTokens,
+            })
+        }
+
+        // A reserva vai na transação: a confirmação depois do 3DS (ver
+        // confirmAtProvider) precisa dela para capturar no teto.
+        if (clipReservation || clipUpsell) {
+            const clipMeta = {
+                ...(transaction.metadata ?? {}),
+                clip_reservation_id: clipReservation?.id ?? clipUpsell?.reservationId ?? null,
+                ...(clipUpsell ? { clip_upsell_of: upsellParent?.id ?? null } : {}),
+                ...(clipUpsellTokensStored ? { clip_upsell_tokens: clipUpsellTokensStored } : {}),
+            }
+            transaction.metadata = clipMeta
+            const { error } = await supabase.from('transactions').update({ metadata: clipMeta }).eq('id', transaction.id)
+            if (error) console.error('[PaymentService] metadata Clip:', error.message)
+        }
+
         if (clipReservation && result.success && String(result.status).toLowerCase() !== 'pending') {
             void this.clipAccounts.capture({
                 reservationId: clipReservation.id,
@@ -968,20 +1032,26 @@ export class PaymentService {
                 kind: 'base',
                 source: 'payments.create',
             }).then(() => {
-                // ⚠️ FINALIZA AQUI PORQUE ESTE CHECKOUT NÃO TEM UPSELL ONE-CLICK.
+                // Com tokens de upsell a folga da reserva FICA: os upsells caem
+                // nesta conta e capturam contra ela. Sobra devolvida pelo TTL.
                 //
-                // A reserva guarda upsell_headroom (653 MXN por padrão) porque
-                // no funil do tkt-page os upsells re-tokenizam o mesmo SDK e
-                // caem nesta conta. O checkout Koopfy não faz isso: os bumps
-                // entram na MESMA transação, não em cobranças posteriores.
-                //
-                // Sem este finalize a folga ficaria presa até o TTL (3h). Com
-                // ticket de ~1.500 MXN isso é ~30% do teto diário parado
-                // segurando dinheiro que nunca vai chegar.
-                //
-                // Se um dia este fluxo ganhar upsell pós-compra, REMOVA esta
-                // chamada — senão o upsell estoura o teto na borda.
+                // Sem tokens (funil sem oferta, ou o checkout não conseguiu
+                // gerá-los), devolve agora: segurar folga que nunca vai ser
+                // usada é teto parado — com ticket de ~1.500 MXN, ~30% do dia.
+                if (clipUpsellTokensStored > 0) return
                 return this.clipAccounts.finalize(clipReservation.id)
+            })
+        }
+
+        // Upsell aprovado: entra no teto pela reserva da compra-mãe. Sem
+        // reserva (expirou), o gw_capture não tem onde contar — fica no log.
+        if (clipUpsell?.reservationId && result.success && String(result.status).toLowerCase() !== 'pending') {
+            void this.clipAccounts.capture({
+                reservationId: clipUpsell.reservationId,
+                amountMinor: Math.round(Number(dto.amount)),
+                clipPaymentId: result.providerTransactionId ?? null,
+                kind: `upsell:${transaction.id}`,
+                source: 'payments.create',
             })
         }
 
@@ -993,8 +1063,12 @@ export class PaymentService {
         // pipeline de PAID (que faz pending→approved + credita a wallet) reusando o
         // handleWebhookProvider — sem disparar postback (o checkout marca o pedido
         // pago de forma síncrona, evitando o race do postback antes do pedido existir).
+        // Clip aprova na hora: `paid` na resposta é dinheiro capturado, e ela
+        // não manda webhook (decisão do dono). Sem isto a venda ficava pendente
+        // para sempre e o checkout mostrava "recusado" a quem foi cobrado.
         const isImmediateApproval = ['approved', 'captured', 'succeeded']
             .includes(String(result.status).toLowerCase())
+            || (providerName === 'clip' && String(result.status).toLowerCase() === 'paid')
         // MB Way é hosted (requires_action + redirectUrl), mas queremos que conte
         // como PENDENTE e apareça em dash-pay/checkout na hora — sem depender do
         // webhook sale_in_progress. Só o cartão fica em 'requires_action' (não conta
@@ -1903,6 +1977,14 @@ export class PaymentService {
                 clipToken: dto.clip.token,
                 clipSessionId: dto.clip.sessionId ?? null,
                 clipReservationId: dto.clip.reservationId ?? null,
+                // Upsell de um clique: tokens extras do MESMO formulário, gerados
+                // no momento da compra (a Clip não guarda cartão). Ver
+                // ClipAccountsService.storeUpsellTokens.
+                clipUpsellTokens: Array.isArray(dto.clip.upsellTokens)
+                    ? dto.clip.upsellTokens
+                        .filter((t: unknown) => typeof t === 'string' && t.length > 0 && t.length < 200)
+                        .slice(0, ClipAccountsService.MAX_UPSELL_TOKENS)
+                    : [],
             }
             return
         }
@@ -2025,16 +2107,29 @@ export class PaymentService {
     private static readonly providerPulls = new Map<string, number>()
     private static readonly PROVIDER_PULL_INTERVAL_MS = 2_000
 
-    /** Compra-mãe apta a upsell de um clique: Whop, aprovada, recente e com meio de pagamento salvo. */
+    /**
+     * Compra-mãe apta a upsell de um clique: Whop (cartão salvo, até 1 h) ou
+     * Clip (token extra da compra ainda válido), aprovada.
+     */
     private async loadUpsellParent(sellerId: string, transactionId: string) {
         const { data: parent } = await supabase.from('transactions')
             .select('id, seller_id, provider, provider_account_id, status, approved_at, metadata')
             .eq('id', transactionId).eq('seller_id', sellerId).maybeSingle()
 
         if (!parent) return { parent: null, reason: 'not_found' }
-        if (this.normalizeProviderName(parent.provider) !== 'whop') return { parent: null, reason: 'not_whop' }
+        const provider = this.normalizeProviderName(parent.provider)
+        if (provider !== 'whop' && provider !== 'clip') return { parent: null, reason: 'unsupported_provider' }
         if (parent.status !== 'approved') return { parent: null, reason: 'not_approved' }
         if (!parent.provider_account_id) return { parent: null, reason: 'no_account' }
+
+        // Clip: não há cartão salvo — vale enquanto sobrar token extra da
+        // compra (~15 min). A janela de 1 h não se aplica: quem manda é o token.
+        if (provider === 'clip') {
+            const available = await this.clipAccounts.availableUpsellTokens(parent.id)
+            return available > 0
+                ? { parent, reason: null }
+                : { parent: null, reason: 'no_saved_payment_method' }
+        }
         if (!parent.metadata?.whop_member_id || !parent.metadata?.whop_payment_method_id) {
             // Pix, cripto e afins não ficam salvos; e compra feita sem
             // setup-future-usage no embed também não.
@@ -2233,8 +2328,58 @@ export class PaymentService {
      * pergunta de 3 em 3 segundos e várias abas não podem virar várias
      * chamadas à Whop.
      */
+    /**
+     * Clip depois do 3DS: a cobrança voltou `pending` com o desafio do banco e
+     * a Clip não manda webhook. Quem pergunta o status (tela de resultado,
+     * página do funil) confirma aqui, na fonte, e o teto é capturado.
+     */
+    private async confirmClipAtProvider(tx: any): Promise<boolean> {
+        if (tx.status !== 'pending' || !tx.provider_transaction_id || !tx.provider_account_id) return false
+
+        const last = PaymentService.providerPulls.get(tx.id) ?? 0
+        if (Date.now() - last < PaymentService.PROVIDER_PULL_INTERVAL_MS) return false
+        PaymentService.providerPulls.set(tx.id, Date.now())
+
+        try {
+            const account: any = await this.accountRouter.resolveAccountById(tx.provider_account_id)
+            if (!account?.apiKey) return false
+            const r = await new ClipProvider().retrieve({
+                providerTransactionId: tx.provider_transaction_id,
+                providerConfig: { id: account.id, apiKey: account.apiKey, config: account.config },
+            })
+            const mapped = r.status === 'paid' ? 'PAID' : r.status === 'failed' ? 'FAILED' : null
+            if (!mapped) return false
+
+            const reservationId = tx.metadata?.clip_reservation_id
+            if (mapped === 'PAID' && reservationId) {
+                const reservation = await this.clipAccounts.getReservation(reservationId)
+                const isUpsell = !!tx.metadata?.clip_upsell_of
+                void this.clipAccounts.capture({
+                    reservationId,
+                    amountMinor: isUpsell ? Math.round(Number(tx.amount)) : Number(reservation?.amount_minor ?? tx.amount),
+                    clipPaymentId: tx.provider_transaction_id,
+                    kind: isUpsell ? `upsell:${tx.id}` : 'base',
+                    source: 'clip-status',
+                })
+            } else if (mapped === 'FAILED' && reservationId && !tx.metadata?.clip_upsell_of) {
+                void this.clipAccounts.release(reservationId, 'declined')
+            }
+
+            await this.webhookService.handleWebhookProvider({
+                reference: tx.id,
+                status: mapped,
+                type: 'TRANSACTION',
+            })
+            return true
+        } catch (err: any) {
+            console.error('[PaymentService] confirmação Clip na fonte:', err?.message ?? err)
+            return false
+        }
+    }
+
     private async confirmAtProvider(tx: any): Promise<boolean> {
         if (!tx || ['approved', 'refunded', 'chargeback'].includes(String(tx.status))) return false
+        if (this.normalizeProviderName(tx.provider) === 'clip') return this.confirmClipAtProvider(tx)
         if (this.normalizeProviderName(tx.provider) !== 'whop') return false
         const paymentId = tx.metadata?.whop_payment_id
         if (typeof paymentId !== 'string' || !paymentId) return false

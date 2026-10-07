@@ -410,6 +410,90 @@ export class ClipAccountsService {
   }
 
   // ─────────────────────────────────────────────
+  // UPSELL DE UM CLIQUE — tokens extras da compra
+  //
+  // A Clip não guarda cartão: o token é de um uso e vale 15 min. O checkout
+  // gera alguns tokens a mais enquanto o formulário está vivo e manda com a
+  // compra; cada oferta aceita no funil consome um. Ver a migration
+  // 20261007140000_gw_clip_upsell_tokens.
+  // ─────────────────────────────────────────────
+
+  /** Vida útil que assumimos: 15 min da Clip menos a folga da viagem. */
+  static readonly UPSELL_TOKEN_TTL_MS = 14 * 60 * 1000;
+  static readonly MAX_UPSELL_TOKENS = 5;
+
+  async storeUpsellTokens(args: {
+    transactionId: string;
+    sellerId: string;
+    accountId: string;
+    reservationId: string | null;
+    sessionId?: string | null;
+    tokens: string[];
+  }): Promise<number> {
+    const tokens = args.tokens.slice(0, ClipAccountsService.MAX_UPSELL_TOKENS);
+    if (!tokens.length) return 0;
+    const expiresAt = new Date(Date.now() + ClipAccountsService.UPSELL_TOKEN_TTL_MS).toISOString();
+    const rows = tokens.map(t => ({
+      transaction_id: args.transactionId,
+      seller_id: args.sellerId,
+      account_id: args.accountId,
+      reservation_id: args.reservationId,
+      token_enc: this.crypto.encrypt(t),
+      session_id: args.sessionId ?? null,
+      expires_at: expiresAt,
+    }));
+    const { error } = await supabase.from('gw_clip_upsell_tokens').insert(rows);
+    if (error) {
+      // Sem os tokens a compra continua valendo; só o funil não oferece upsell.
+      console.error('[ClipAccounts] tokens de upsell não gravados:', error.message);
+      return 0;
+    }
+    return rows.length;
+  }
+
+  /** Quantos tokens ainda dão para cobrar (elegibilidade da oferta). */
+  async availableUpsellTokens(transactionId: string): Promise<number> {
+    const { count, error } = await supabase
+      .from('gw_clip_upsell_tokens')
+      .select('id', { count: 'exact', head: true })
+      .eq('transaction_id', transactionId)
+      .is('used_at', null)
+      .gt('expires_at', new Date(Date.now() + 20_000).toISOString());
+    if (error) {
+      console.error('[ClipAccounts] contagem de tokens de upsell:', error.message);
+      return 0;
+    }
+    return count ?? 0;
+  }
+
+  /** Consome um token (atômico). null = acabaram ou venceram. */
+  async takeUpsellToken(parentTransactionId: string, usedBy: string): Promise<{
+    accountId: string; reservationId: string | null; token: string; sessionId: string | null;
+  } | null> {
+    const { data, error } = await supabase.rpc('gw_take_clip_upsell_token', {
+      p_transaction_id: parentTransactionId,
+      p_used_by: usedBy,
+    });
+    if (error) {
+      console.error('[ClipAccounts] gw_take_clip_upsell_token:', error.message);
+      return null;
+    }
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row?.token_enc) return null;
+    try {
+      return {
+        accountId: row.account_id,
+        reservationId: row.reservation_id ?? null,
+        token: this.crypto.decrypt(row.token_enc),
+        sessionId: row.session_id ?? null,
+      };
+    } catch (err: any) {
+      console.error('[ClipAccounts] token de upsell ilegível:', err?.message);
+      return null;
+    }
+  }
+
+  // ─────────────────────────────────────────────
   // SPEI — cadastro e saque
   // ─────────────────────────────────────────────
 
