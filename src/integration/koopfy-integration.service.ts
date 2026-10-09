@@ -54,6 +54,7 @@ import {
   SubscriptionMembershipRow,
   SubscriptionTransactionRow,
 } from './subscription-report';
+import { PaymentAccountMode, parsePaymentAccountMode, readPaymentAccountMode, writePaymentAccountMode } from '../orchestrator/seller-provider/payment-account-mode';
 
 /**
  * Moeda de exibição da carteira. `wallet_balance` guarda centavos sem moeda —
@@ -113,6 +114,79 @@ export class KoopfyIntegrationService {
       counts: { whop: whopCount, stripe: counts.stripe, paypal: counts.paypal },
       routing: { enabled: Boolean(routing?.enabled), feePct: routing?.feePct ?? defaultRoutingFeePct() },
     });
+  }
+
+  // ─── Conta de pagamento: Koopfy Payments ou provedor externo ────────────
+  // Ver payment-account-mode.ts. Quem nunca escolheu segue como estava: conta
+  // própria cobrando = externo; sem conta própria = Koopfy Payments.
+
+  async paymentAccountView(ctx: SellerCtx) {
+    if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
+    const sellerId = ctx.seller.id;
+    const [chosen, counts, linked, profile] = await Promise.all([
+      readPaymentAccountMode(sellerId),
+      this.sellerProviders.connectedCounts(sellerId).catch(() => ({ whop: 0, stripe: 0, paypal: 0 })),
+      this.whopLinked.status(sellerId).catch(() => null),
+      supabase.from('seller_profiles').select('status, provider_default').eq('id', sellerId).maybeSingle(),
+    ]);
+    const whopPrincipal = Boolean(sellerExternalProviderView(linked)?.connected);
+    const accounts = {
+      whop: counts.whop + (whopPrincipal ? 1 : 0),
+      stripe: counts.stripe,
+      paypal: counts.paypal,
+    };
+    const externalAvailable = accounts.whop + accounts.stripe + accounts.paypal > 0;
+    const status = String((profile.data as any)?.status ?? ctx.seller.status ?? '');
+    const koopfyProvider = (profile.data as any)?.provider_default ?? null;
+    // Koopfy Payments exige conta aprovada e provedor configurado pela Koopfy.
+    const koopfyAvailable = status === 'active' && Boolean(koopfyProvider);
+    const mode: PaymentAccountMode = chosen
+      ?? (externalAvailable ? 'external' : 'koopfy');
+    return {
+      mode,
+      // false = nunca escolheu: `mode` é o que já valia para ele.
+      chosen: chosen !== null,
+      koopfy: { available: koopfyAvailable, provider: koopfyProvider, reason: koopfyAvailable ? null : status !== 'active' ? 'not_approved' : 'no_provider' },
+      external: { available: externalAvailable, accounts },
+    };
+  }
+
+  async updatePaymentAccount(ctx: SellerCtx, body: Record<string, any>) {
+    if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
+    const mode = parsePaymentAccountMode(body?.mode);
+    if (!mode) throw new BadRequestException('Escolha a conta de pagamento: Koopfy Payments ou provedor externo.');
+    const view = await this.paymentAccountView(ctx);
+    if (mode === 'koopfy' && !view.koopfy.available) {
+      throw new BadRequestException({
+        code: 'PAYMENT_ACCOUNT_KOOPFY_UNAVAILABLE',
+        message: view.koopfy.reason === 'not_approved'
+          ? 'A Koopfy Payments fica disponível depois que a sua conta for aprovada.'
+          : 'A sua conta ainda não tem a Koopfy Payments configurada. Fale com o suporte.',
+      });
+    }
+    if (mode === 'external' && !view.external.available) {
+      throw new BadRequestException({
+        code: 'PAYMENT_ACCOUNT_EXTERNAL_UNAVAILABLE',
+        message: 'Conecte uma conta (Stripe, Whop ou PayPal) antes de escolher o provedor externo.',
+      });
+    }
+    try {
+      await writePaymentAccountMode(ctx.seller.id, mode);
+    } catch (err: any) {
+      console.error('[KoopfyIntegration] conta de pagamento:', err?.message);
+      throw new BadRequestException('Não foi possível salvar a conta de pagamento agora. Tente novamente.');
+    }
+    // Histórico (mesma trilha das contas próprias e do roteamento); falha aqui não desfaz a escolha.
+    void supabase.from('crm_action_log').insert({
+      seller_id: ctx.seller.id,
+      manager_id: null,
+      action: 'seller_provider.payment_account',
+      resource_type: 'seller',
+      resource_id: ctx.seller.id,
+      payload: { actor: `seller:${ctx.userId}`, mode, previous: view.mode },
+      created_at: new Date().toISOString(),
+    }).then(({ error }) => { if (error) console.error('[KoopfyIntegration] histórico da conta de pagamento:', error.message); });
+    return this.paymentAccountView(ctx);
   }
 
   // ─── Roteamento de contas ───────────────────────────────────────────────

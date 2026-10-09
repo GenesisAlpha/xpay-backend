@@ -368,3 +368,64 @@ export function combineExternalProviderView(
     ...(extras.routing ? { routing: extras.routing } : {}),
   };
 }
+
+// ─────────────────────────────────────────────
+// Métodos ativos na conta Stripe do seller
+// ─────────────────────────────────────────────
+
+/** Nome do método na Stripe (payment_method_configurations) → nome no checkout. */
+export const STRIPE_METHOD_NAMES: Record<string, string> = {
+  card: 'credit_card',
+  apple_pay: 'apple_pay',
+  google_pay: 'google_pay',
+  link: 'link',
+  ideal: 'ideal',
+  bancontact: 'bancontact',
+  eps: 'eps',
+  p24: 'p24',
+  blik: 'blik',
+  klarna: 'klarna',
+  affirm: 'affirm',
+  afterpay_clearpay: 'afterpay',
+  sepa_debit: 'sepa',
+  multibanco: 'multibanco',
+  mb_way: 'mbway',
+  twint: 'twint',
+  swish: 'swish',
+  mobilepay: 'mobile_pay',
+  oxxo: 'oxxo',
+  pix: 'pix',
+  boleto: 'boleto',
+  cashapp: 'cashapp',
+  us_bank_account: 'ach',
+  revolut_pay: 'revolut_pay',
+  alipay: 'ali_pay',
+};
+
+/** Métodos que só fecham levando o comprador ao banco/app (o intent precisa aceitar redirecionamento). */
+export const STRIPE_REDIRECT_METHODS = new Set([
+  'ideal', 'bancontact', 'eps', 'p24', 'blik', 'klarna', 'affirm', 'afterpay', 'sepa',
+  'multibanco', 'mbway', 'twint', 'swish', 'mobile_pay', 'giropay', 'sofort', 'bizum',
+  'revolut_pay', 'ali_pay', 'cashapp',
+]);
+
+/**
+ * Métodos ligados na configuração padrão da conta (resposta de
+ * GET /v1/payment_method_configurations). "Ligado" = a Stripe diz que está
+ * disponível para cobrar (`available`), que já junta a preferência do painel e
+ * a capacidade aprovada. Devolve null quando não há configuração legível: quem
+ * chama mantém a lista de antes em vez de esconder o cartão de todo mundo.
+ */
+export function stripeEnabledMethodsFrom(response: unknown): string[] | null {
+  const list = Array.isArray((response as any)?.data) ? (response as any).data as Record<string, any>[] : [];
+  // A padrão da própria conta: sem pai e sem aplicação (as de plataforma Connect ficam de fora).
+  const config = list.find(item => item?.is_default === true && !item?.parent && item?.active !== false)
+    ?? list.find(item => item?.is_default === true)
+    ?? null;
+  if (!config) return null;
+  const out: string[] = [];
+  for (const [stripeName, ourName] of Object.entries(STRIPE_METHOD_NAMES)) {
+    if (config[stripeName]?.available === true && !out.includes(ourName)) out.push(ourName);
+  }
+  return out.length ? out : null;
+}

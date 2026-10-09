@@ -8,6 +8,7 @@ import { isLinkedProviderAccountId } from './whop-linked';
 import { WhopLinkedAccountsService } from './whop-linked.service';
 import { isWhopExtraAccountId } from '../seller-provider/seller-provider-accounts';
 import { SellerProviderAccountsService } from '../seller-provider/seller-provider-accounts.service';
+import { sellerUsesKoopfyPayments } from '../seller-provider/payment-account-mode';
 
 // ============================================================================
 // WHOP ACCOUNTS — pool dinâmico (tabela `whop_accounts`)
@@ -189,6 +190,8 @@ export class WhopAccountsService {
    * fica lá: sem taxa de aplicação e sem passar pela carteira da Koopfy.
    */
   async getSellerLinkedAccount(sellerId: string): Promise<ProviderAccountConfig | null> {
+    // Seller na Koopfy Payments: a Whop dele não cobra (payment-account-mode.ts).
+    if (await sellerUsesKoopfyPayments(sellerId)) return null;
     return this.linked ? this.linked.getProviderAccountForSeller(sellerId) : null;
   }
 

@@ -33,7 +33,9 @@ import {
   toWhopExtraAccountId,
   validatePaypalCredentials,
   validateStripeKeys,
+  stripeEnabledMethodsFrom,
 } from './seller-provider-accounts';
+import { sellerUsesKoopfyPayments } from './payment-account-mode';
 
 // ============================================================================
 // CONTAS STRIPE E PAYPAL PRÓPRIAS DO SELLER (provedor externo)
@@ -69,6 +71,8 @@ const CACHE_TTL_MS = 15 * 1000;
 // Métodos de quem vende só pela Stripe dele sem aprovação da Koopfy: a lista
 // que a Stripe cobre no checkout embedado (Payment Element).
 const STRIPE_DEFAULT_METHODS = ['credit_card', 'apple_pay', 'google_pay'];
+const STRIPE_METHODS_TTL_MS = 10 * 60 * 1000;
+const STRIPE_METHODS_RETRY_MS = 60 * 1000;
 
 function payPublicUrl(): string {
   return (process.env.PAY_PUBLIC_URL ?? 'https://api.koopfy.com/pay').replace(/\/+$/, '');
@@ -432,6 +436,7 @@ export class SellerProviderAccountsService {
 
   /** Conta pronta para cobrar, ou null (e a venda não sai por ela). */
   async getChargeableAccount(sellerId: string, provider: SellerProviderKind): Promise<ProviderAccountConfig | null> {
+    if (await sellerUsesKoopfyPayments(sellerId)) return null;
     const row = await this.getRow(sellerId, provider);
     if (!row || providerChargeBlocker(row)) return null;
     return this.toProviderAccount(row);
@@ -703,6 +708,32 @@ export class SellerProviderAccountsService {
     }
   }
 
+  // Métodos ativos por conta Stripe. O checkout pergunta a cada carregamento;
+  // o painel da Stripe muda raramente, e a resposta dela leva ~300 ms.
+  private readonly stripeMethodsCache = new Map<string, { methods: string[] | null; at: number }>();
+
+  /**
+   * Métodos ligados na conta Stripe do seller, nos nomes do checkout, ou null
+   * quando não deu para ler (chave restrita sem a permissão, Stripe fora do ar):
+   * aí vale a lista que o seller já tinha. Nunca lança — é caminho de venda.
+   */
+  async stripeEnabledMethods(account: { id?: string | null; apiKey?: string | null } | null | undefined): Promise<string[] | null> {
+    const id = String(account?.id ?? '');
+    const secret = String(account?.apiKey ?? '');
+    if (!id || !secret) return null;
+    const hit = this.stripeMethodsCache.get(id);
+    // Falha fica menos tempo: a permissão pode ter sido corrigida.
+    if (hit && Date.now() - hit.at < (hit.methods ? STRIPE_METHODS_TTL_MS : STRIPE_METHODS_RETRY_MS)) return hit.methods;
+    let methods: string[] | null = null;
+    try {
+      methods = stripeEnabledMethodsFrom(await this.stripeRequest(secret, 'GET', '/v1/payment_method_configurations?limit=20'));
+    } catch (err: any) {
+      console.error(`[SellerProviders] métodos da Stripe ${id}:`, err?.message);
+    }
+    this.stripeMethodsCache.set(id, { methods, at: Date.now() });
+    return methods;
+  }
+
   private async stripeRequest(secretKey: string, method: 'GET' | 'POST' | 'DELETE', path: string, form?: URLSearchParams) {
     let response;
     try {
@@ -800,7 +831,10 @@ async function loadLinkedRow(sellerId: string): Promise<any | null> {
 
 /** Quais contas próprias estão cobrando agora. */
 export async function ownAccountsCharging(sellerId: string): Promise<{ whop: boolean; stripe: boolean; paypal: boolean; commissionPct: number }> {
-  const [linked, rows] = await Promise.all([loadLinkedRow(sellerId), loadSellerProviderRows(sellerId)]);
+  const [linked, rows, koopfy] = await Promise.all([loadLinkedRow(sellerId), loadSellerProviderRows(sellerId), sellerUsesKoopfyPayments(sellerId)]);
+  // Seller escolheu a Koopfy Payments: as contas próprias seguem conectadas,
+  // mas nenhuma cobra (ver payment-account-mode.ts).
+  if (koopfy) return { whop: false, stripe: false, paypal: false, commissionPct: normalizeCommissionPct(linked?.commission_pct) };
   const charging = (provider: SellerProviderRowKind) =>
     rows.some(row => row.provider === provider && providerChargeBlocker(row) === null);
   return {

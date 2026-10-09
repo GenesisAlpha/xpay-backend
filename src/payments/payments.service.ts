@@ -101,6 +101,10 @@ function summarizeProviderError(data: unknown): Record<string, unknown> | null {
     return Object.keys(summary).length > 1 ? summary : null
 }
 
+// Conta Stripe do seller sem leitura dos métodos (chave restrita): do cadastro
+// só passa o que a Stripe cobra no checkout embedado.
+const STRIPE_FALLBACK_METHODS = new Set(['credit_card', 'debit_card', 'card', 'apple_pay', 'google_pay'])
+
 @Injectable()
 export class PaymentService {
 
@@ -1751,13 +1755,23 @@ export class PaymentService {
         // cartão (Stripe, ou Whop sendo a Whop o provider dele), os métodos da
         // Koopfy ficam de fora e sobra o PayPal próprio (campo `paypal`).
         const approved = seller.status === 'active'
+        // Stripe do seller: a lista é a dos métodos LIGADOS NA CONTA DELE. A
+        // lista do cadastro (enabled_methods) é a do provedor da Koopfy e
+        // trazia SPEI, iDEAL, MB Way para uma conta que não tem nenhum deles.
+        const sellerMethods: string[] = seller.enabled_methods ?? []
+        const stripeMethods = async (account: any): Promise<string[]> => {
+            const read = await this.accountRouter.ownStripeMethods(account).catch(() => null)
+            if (read) return read
+            const kept = sellerMethods.filter(method => STRIPE_FALLBACK_METHODS.has(String(method)))
+            return kept.length ? kept : ['credit_card', 'apple_pay', 'google_pay']
+        }
         const ownCard = Boolean(ownStripe)
             || (provider === 'whop' && Boolean(await this.accountRouter.getOwnAccount(sellerId, 'whop').catch(() => null)))
 
         const legacy = {
             active: await sellerMayOperate({ id: sellerId, status: seller.status }),
             provider, // ex.: 'setinel_gate' | 'approvebly' | 'coinflow' | 'stripe'
-            methods: approved || ownCard ? (seller.enabled_methods ?? []) : [],
+            methods: ownStripe ? await stripeMethods(ownStripe) : approved || ownCard ? sellerMethods : [],
             providerConfig: provider
                 ? this.buildProviderPublicConfig(provider, mid, seller.config, stripeAccount, whopAccount)
                 : null,
@@ -1803,7 +1817,7 @@ export class PaymentService {
         return {
             ...legacy,
             provider: cardProvider,
-            methods: card ? (seller.enabled_methods ?? []) : [],
+            methods: !card ? [] : cardProvider === 'stripe' ? await stripeMethods(card) : sellerMethods,
             providerConfig: card
                 ? this.buildProviderPublicConfig(
                     cardProvider as string,

@@ -194,6 +194,23 @@ export class KoopfyIntegrationController {
     return this.svc.disconnectOwnAccount(req.sellerCtx, accountId);
   }
 
+  // ─── Conta de pagamento ─────────────────────────────────────────────────
+  // Koopfy Payments (o provedor que a Koopfy configurou) ou provedor externo
+  // (as contas próprias do seller). Resposta: { mode, chosen, koopfy, external }.
+
+  @Get('payment-account')
+  @UseGuards(CrossServiceJwtGuard)
+  paymentAccount(@Req() req: any) {
+    return this.svc.paymentAccountView(req.sellerCtx);
+  }
+
+  // Body: { mode: 'koopfy' | 'external' }
+  @Put('payment-account')
+  @UseGuards(CrossServiceJwtGuard)
+  updatePaymentAccount(@Req() req: any, @Body() body: any) {
+    return this.svc.updatePaymentAccount(req.sellerCtx, body ?? {});
+  }
+
   // ─── Roteamento de contas ──────────────────────────────────────────────
   // Ligado pelo seller (com aceite da taxa); várias Whop/Stripe/PayPal e a
   // estratégia de cada grupo. Resposta de todas: a visão completa do GET.

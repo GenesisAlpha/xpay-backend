@@ -5,6 +5,7 @@ import { WhopLinkedAccountsService } from '../orchestrator/whop/whop-linked.serv
 import { sellerHasOwnStripe } from '../orchestrator/seller-provider/seller-provider-accounts.service';
 import { OwnDomainRegistration, OwnPaymentDomainsService } from '../orchestrator/own-finance/own-payment-domains.service';
 import type { SellerCtx } from './cross-service-jwt.guard';
+import { sellerUsesKoopfyPayments } from '../orchestrator/seller-provider/payment-account-mode';
 
 // Apple Pay no checkout incorporado: o domínio do site do seller precisa estar
 // registrado (e verificado) na Whop, na conta que cobra. Seller com conta
@@ -82,10 +83,13 @@ export class KoopfyPaymentDomainsService {
   ) {}
 
   private async targets(sellerId: string): Promise<{ mode: PaymentDomainsResult['mode']; accounts: Array<{ scope: DomainScope; accountId: string | null }> }> {
-    const linked = await this.linked.getRow(sellerId).catch(() => null);
+    // Seller na Koopfy Payments: as vendas saem pelas contas da Koopfy mesmo
+    // com conta própria conectada, então o domínio vai para as contas dela.
+    const koopfy = await sellerUsesKoopfyPayments(sellerId).catch(() => false);
+    const linked = koopfy ? null : await this.linked.getRow(sellerId).catch(() => null);
     if (linked?.whop_account_id && (linked as any).api_key) return { mode: 'external', accounts: [] };
     // Só Stripe própria (sem Whop): as vendas de cartão saem por ela.
-    if (await sellerHasOwnStripe(sellerId).catch(() => false)) return { mode: 'external', accounts: [] };
+    if (!koopfy && await sellerHasOwnStripe(sellerId).catch(() => false)) return { mode: 'external', accounts: [] };
     if (!this.whop.isConfigured()) return { mode: 'unavailable', accounts: [] };
     const connected = await this.connect.getRow(sellerId).catch(() => null);
     const accounts: Array<{ scope: DomainScope; accountId: string | null }> = [];

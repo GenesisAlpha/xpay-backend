@@ -26,6 +26,7 @@ import {
   getActiveProviderAccounts,
   ProviderName,
 } from '../provider-accounts.config';
+import { sellerUsesKoopfyPayments } from '../seller-provider/payment-account-mode';
 
 // ─────────────────────────────────────────────
 // TYPES
@@ -955,8 +956,11 @@ export class AccountRouterService implements OnModuleInit {
       if (stickyId) {
         const sticky = accounts.find(a => a.id === stickyId)
           ?? await this.resolveAccountById(stickyId);
+        // Pedido que começou numa conta própria e o seller passou para a Koopfy
+        // Payments: a nova tentativa não volta para a conta dele.
+        const ownButKoopfy = isOwnProviderAccountId(stickyId) && await sellerUsesKoopfyPayments(args.sellerId);
 
-        if (sticky && sticky.status === 'active') {
+        if (sticky && sticky.status === 'active' && !ownButKoopfy) {
           console.log(`[AccountRouter] sticky ${args.provider}: ${args.orderRef} → ${stickyId}`);
           return sticky;
         }
@@ -1039,6 +1043,15 @@ export class AccountRouterService implements OnModuleInit {
   }
 
   /** Conta própria do seller pronta para cobrar, ou null — sem log (consulta de config). */
+  /**
+   * Métodos ligados na conta Stripe PRÓPRIA do seller (lidos na Stripe, com
+   * cache). null = conta da Koopfy, ou não deu para ler: vale a lista do seller.
+   */
+  async ownStripeMethods(account: { id?: string | null; apiKey?: string | null } | null | undefined): Promise<string[] | null> {
+    if (!account || !isOwnProviderAccountId(account.id) || !this.sellerProviders) return null;
+    return this.sellerProviders.stripeEnabledMethods(account);
+  }
+
   async getOwnAccount(sellerId: string, provider: OwnProvider): Promise<ProviderAccount | null> {
     const account = provider === 'whop'
       ? await this.whopAccounts.getSellerLinkedAccount(sellerId)
@@ -1107,7 +1120,9 @@ export class AccountRouterService implements OnModuleInit {
         const leavesConnectedAccount = whopRouting.mode === 'connected'
           && String(account?.provider) === 'whop'
           && account?.id !== whopRouting.account.id;
-        if (account && account.status === 'active' && !leavesConnectedAccount) {
+        // Mesmo caso para a conta própria de quem passou para a Koopfy Payments.
+        const ownButKoopfy = isOwnProviderAccountId(sticky.accountId) && await sellerUsesKoopfyPayments(args.sellerId);
+        if (account && account.status === 'active' && !leavesConnectedAccount && !ownButKoopfy) {
           console.log(
             `[AccountRouter] sticky cross-PSP: pedido ${args.orderRef} → `
             + `${sticky.provider}/${sticky.accountId}`,

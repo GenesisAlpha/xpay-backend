@@ -2,6 +2,7 @@ import Stripe from 'stripe';
 import { ChargeResponse, RetrieveResponse } from './provider.types';
 import { StripeRiskService } from '../stripe/stripe-risk.service';
 import { maskedPlanTitle } from './whop-plan-title';
+import { STRIPE_REDIRECT_METHODS } from '../seller-provider/seller-provider-accounts';
 
 // ============================================================================
 // STRIPE — Payment Intents, uma conta (um titular) por cobrança
@@ -118,8 +119,11 @@ export class StripeProvider {
           automatic_payment_methods: {
             enabled: true,
             // Sem redirect: o checkout é embedado e um método que leva o
-            // comprador para fora quebra o fluxo de upsell.
-            allow_redirects: ctx.allow_redirects === true ? 'always' : 'never',
+            // comprador para fora quebra o fluxo de upsell. A exceção é o
+            // comprador ter ESCOLHIDO um método que só fecha no banco/app
+            // (iDEAL, MB Way, Bancontact…): com 'never' a Stripe recusava a
+            // confirmação e o método aparecia no checkout sem funcionar.
+            allow_redirects: ctx.allow_redirects === true || STRIPE_REDIRECT_METHODS.has(String(ctx.method ?? '').toLowerCase()) ? 'always' : 'never',
           },
 
           // Descriptor por titular. É a causa nº1 de disputa "não reconheço a

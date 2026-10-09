@@ -54,6 +54,7 @@ import {
   TodayTxRow,
 } from './seller-routing';
 import { notifySellerRoutingPause } from '../../utils/seller-mail';
+import { sellerUsesKoopfyPayments } from '../seller-provider/payment-account-mode';
 
 // ============================================================================
 // ROTEAMENTO DE CONTAS PRÓPRIAS DO SELLER
@@ -353,6 +354,9 @@ export class SellerRoutingService implements OnModuleInit {
   async resolveForConfig(sellerId: string, routingKey: string | null, ctx: RoutingContext = {}): Promise<RoutingConfigPick | null> {
     const settings = await this.settings(sellerId);
     if (!settings.enabled) return null;
+    // Seller na Koopfy Payments: o roteamento é das contas próprias, que não
+    // cobram nesse modo. A configuração dele fica guardada para quando voltar.
+    if (await sellerUsesKoopfyPayments(sellerId)) return null;
 
     const pool = await this.loadPool(sellerId, settings);
     this.syncAutoPauses(sellerId, pool, settings);
@@ -406,6 +410,9 @@ export class SellerRoutingService implements OnModuleInit {
   ): Promise<RoutingSalePick | null> {
     const settings = await this.settings(sellerId);
     if (!settings.enabled) return null;
+    // Seller na Koopfy Payments: o roteamento é das contas próprias, que não
+    // cobram nesse modo. A configuração dele fica guardada para quando voltar.
+    if (await sellerUsesKoopfyPayments(sellerId)) return null;
 
     const group = groupOfMethod(args.method);
     const ctx = args.ctx ?? {};
