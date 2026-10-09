@@ -1669,7 +1669,19 @@ export class CrmService {
       }).eq('id', transactionId);
       // Devolve o espaço reservado agora, em vez de esperar o TTL.
       await this.clipAccounts.release(reservationId, `rejeitado por human:${managerId}`);
-      return { status: 'rejected' };
+      // Recusa de uma pessoa é final: o pedido vira FALHA pelo pipeline
+      // canônico (status, KPI e aviso ao checkout). Antes só o comprovante era
+      // marcado e a transação ficava pendente para sempre — o seller via um
+      // pedido em aberto que ninguém mais ia pagar. A recusa da análise
+      // automática continua deixando o comprador mandar outro comprovante.
+      if (tx.status === 'pending') {
+        await this.webhookService.handleWebhookProvider({
+          reference: transactionId, status: 'FAILED', type: 'TRANSACTION',
+          failure_code: 'spei_proof_rejected',
+          failure_message: body.nota?.trim() || 'Comprovante SPEI recusado na conferência.',
+        } as any);
+      }
+      return { status: 'rejected', order: tx.status === 'pending' ? 'failed' : tx.status };
     }
 
     // ⚠️ Só quem abriu o extrato pode marcar como conferido. O default é a

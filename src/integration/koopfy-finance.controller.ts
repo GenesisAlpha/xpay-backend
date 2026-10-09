@@ -219,6 +219,14 @@ export class KoopfyFinanceController {
     return this.finance.listPaymentMethods(req.sellerCtx);
   }
 
+  // Configuração de um método pelo seller. Hoje só o SPEI tem: o nome do
+  // beneficiário que o comprador vê nos dados da transferência.
+  // Body: { beneficiaryName } — vazio volta ao nome da loja.
+  @Patch('payment-methods/:id/config')
+  updatePaymentMethodConfig(@Req() req: any, @Param('id') id: string, @Body() body: { beneficiaryName?: unknown }) {
+    return this.finance.updatePaymentMethodConfig(req.sellerCtx, id, { beneficiaryName: body?.beneficiaryName });
+  }
+
   @Get('payment-methods/:id/performance')
   paymentMethodPerformance(@Req() req: any, @Param('id') id: string) {
     return this.finance.getPaymentMethodPerformance(req.sellerCtx, id);

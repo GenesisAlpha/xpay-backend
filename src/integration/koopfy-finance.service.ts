@@ -611,6 +611,13 @@ export class KoopfyFinanceService {
     }));
   }
 
+  /** Nome do beneficiário do SPEI que o comprador vê (vazio = nome da loja). */
+  async updatePaymentMethodConfig(ctx: SellerCtx, id: string, data: { beneficiaryName?: unknown }) {
+    const beneficiaryName = typeof data?.beneficiaryName === 'string' ? data.beneficiaryName : '';
+    await this.methods.updateConfig(this.seller(ctx).id, id, { beneficiaryName });
+    return { id, speiBeneficiaryName: beneficiaryName.trim() };
+  }
+
   async getPaymentMethodPerformance(ctx: SellerCtx, id: string) {
     return this.methods.getPerformance(this.readableSeller(ctx).id, id);
   }
