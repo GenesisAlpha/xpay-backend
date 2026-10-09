@@ -1254,6 +1254,10 @@ export class PaymentMethodsService {
       { id: 'pix', name: 'PIX', icon: 'pix', category: 'instant', countries: ['BR'] },
       { id: 'boleto', name: 'Boleto', icon: 'boleto', category: 'bank', countries: ['BR'] },
       { id: 'oxxo', name: 'OXXO', icon: 'oxxo', category: 'bank', countries: ['MX'] },
+      // SPEI (Clip, México). Faltava no catálogo: o método existia no cadastro do
+      // seller e no checkout, mas esta lista nunca o devolvia — e o painel
+      // depende dela para mostrar o nome do beneficiário (speiBeneficiaryName).
+      { id: 'spei', name: 'SPEI', icon: 'spei', category: 'bank', countries: ['MX'] },
       { id: 'ideal', name: 'iDEAL', icon: 'ideal', category: 'instant', countries: ['NL'] },
       { id: 'bancontact', name: 'Bancontact', icon: 'bancontact', category: 'instant', countries: ['BE'] },
       { id: 'sepa_debit', name: 'SEPA Direct Debit', icon: 'sepa_debit', category: 'bank', countries: ['EU'] },
@@ -1300,7 +1304,8 @@ export class PaymentMethodsService {
         countries: m.countries,
         // Na Whop os métodos padrão são resolvidos automaticamente por país,
         // moeda, dispositivo e elegibilidade do comprador.
-        enabled: isWhopSeller || enabledMethods.includes(m.id),
+        // SPEI não é método da Whop: só vale para quem o tem liberado no cadastro (Clip).
+        enabled: m.id === 'spei' ? enabledMethods.includes('spei') : isWhopSeller || enabledMethods.includes(m.id),
         volume,           // já convertido via fromCents
         transactions: txs,
         approvalRate: rate,
