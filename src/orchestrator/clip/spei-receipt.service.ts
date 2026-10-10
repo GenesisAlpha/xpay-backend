@@ -241,6 +241,12 @@ export type ReceiptVerdict = {
   captured?: boolean;
 };
 
+/** Clave de rastreo comparável: só letras e números, maiúscula. Curta demais não identifica nada. */
+export function normalizarClave(value: unknown): string | null {
+  const clave = String(value ?? '').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+  return clave.length >= 8 ? clave : null;
+}
+
 @Injectable()
 export class SpeiReceiptService {
   constructor(private readonly storage: StorageService) { }
@@ -304,6 +310,23 @@ export class SpeiReceiptService {
 
     if (avaliacao.verdict !== 'approved') {
       return this.registrarRecusa(args, reserva, sha256, mime, extracted, avaliacao, usage);
+    }
+
+    // ── UMA TRANSFERÊNCIA, UM PEDIDO ────────────────────────────────────────
+    // O valor cobrado é o do pedido, sem centavo único (migration
+    // 20261010120000): dois pedidos de $601 na mesma conta são iguais para as
+    // três portas, e duas capturas DIFERENTES do mesmo comprovante passam pelo
+    // dedupe de arquivo. Se esta transferência já aprovou outro pedido, quem
+    // decide é uma pessoa — nunca aprovação automática, nunca recusa (a leitura
+    // da clave varia, e duas pessoas podem pagar o mesmo valor no mesmo minuto).
+    const repetida = await this.transferenciaJaUsada(extracted, reserva.account_id, args.reservationId);
+    if (repetida) {
+      return this.registrarRecusa(args, reserva, sha256, mime, extracted, {
+        verdict: 'review',
+        confidence: avaliacao.confidence,
+        checks: { ...avaliacao.checks, transferencia_unica: false },
+        reasons: [`Esta transferência parece já ter aprovado outro pedido (${repetida}). Confira no extrato antes de aprovar.`],
+      }, usage);
     }
 
     // Aprovação e captura numa transação só — ver gw_spei_confirm_receipt.
@@ -720,6 +743,43 @@ ${JSON.stringify(EXTRACTION_SCHEMA.properties, null, 1)}`;
       .maybeSingle();
 
     return { ...r, ...(acc ?? {}) };
+  }
+
+  /**
+   * A mesma transferência já aprovou outro pedido desta conta? Devolve o motivo
+   * ("mesma clave de rastreo" / "mesma data, hora e valor") ou null.
+   *
+   * Só olha comprovantes APROVADOS dos últimos 7 dias, de OUTRA reserva. Falha
+   * de leitura do banco devolve null: a checagem é uma trava a mais, e travar a
+   * fila inteira por indisponibilidade seria pior que seguir com as três portas.
+   */
+  private async transferenciaJaUsada(e: ExtractedReceipt, accountId: string, exceptReservation: string): Promise<string | null> {
+    const clave = normalizarClave(e.clave_rastreo);
+    const quando = e.fecha_hora ? String(e.fecha_hora).trim() : '';
+    if (!clave && !(quando && e.monto != null)) return null;
+
+    const { data, error } = await supabase
+      .from('gw_spei_receipts')
+      .select('reservation_id, extracted')
+      .eq('account_id', accountId)
+      .eq('verdict', 'approved')
+      .gte('created_at', new Date(Date.now() - 7 * 86_400_000).toISOString())
+      .order('created_at', { ascending: false })
+      .limit(500);
+    if (error) {
+      console.error('[SpeiReceipt] checagem de transferência repetida:', error.message);
+      return null;
+    }
+
+    for (const row of (data ?? []) as { reservation_id: string; extracted: any }[]) {
+      if (row.reservation_id === exceptReservation) continue;
+      const outro = row.extracted ?? {};
+      if (clave && normalizarClave(outro.clave_rastreo) === clave) return 'mesma clave de rastreo';
+      if (quando && e.monto != null
+        && String(outro.fecha_hora ?? '').trim() === quando
+        && Number(outro.monto) === Number(e.monto)) return 'mesma data, hora e valor';
+    }
+    return null;
   }
 
   private async arquivoJaAprovado(sha256: string, exceptReservation: string) {
