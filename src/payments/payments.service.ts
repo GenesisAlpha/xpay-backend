@@ -399,7 +399,8 @@ export class PaymentService {
                 if (!isEmbedProvider) {
                     if (existing.status === 'approved') return this.formatResponse(existing)
                     if (existing.status === 'pending' && existing.provider_gateway_id) return this.formatResponse(existing)
-                    if (existing.status === 'failed' && existing.retry_blocked) return this.formatResponse(existing)
+                    // `stripe_attempts_blocked`: trava de recusas da Stripe (decline-guard.ts).
+                    if (existing.status === 'failed' && (existing.retry_blocked || existing.metadata?.stripe_attempts_blocked)) return this.formatResponse(existing)
                 } else if (existing.status === 'approved') {
                     // Já pago: aí sim devolve — não há embed a montar, e recriar a
                     // sessão cobraria de novo.

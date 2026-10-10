@@ -1,6 +1,6 @@
 import {
   Injectable, NotFoundException, BadRequestException, ForbiddenException,
-  ServiceUnavailableException,
+  ServiceUnavailableException, Optional,
 } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
 import { getEffectiveSellerFees } from '../shared/fee.calculator'
@@ -10,6 +10,8 @@ import { WhopConnectedPayoutService } from '../orchestrator/whop/whop-connected-
 import { isWhopConnectedPayout } from '../orchestrator/whop/whop-connected-payout'
 import { getProviderAccountById } from '../orchestrator/provider-accounts.config'
 import { SlashProvider } from '../orchestrator/providers/slash.provider'
+import { StripeProvider } from '../orchestrator/providers/stripe.provider'
+import { StripeAccountsService } from '../orchestrator/stripe/stripe-accounts.service'
 
 // Linha do ledger (debit_payout) → dados do e-mail de saque. O destino fica em
 // metadata.destination (camelCase), igual ao que o CRM exibe.
@@ -117,6 +119,8 @@ export class CrmAdminService {
   constructor(
     private readonly connectedPayouts: WhopConnectedPayoutService,
     private readonly payouts: PayoutOrchestratorService,
+    // Opcional: os testes montam o serviço sem o pool da Stripe.
+    @Optional() private readonly stripeAccounts?: StripeAccountsService,
   ) { }
 
   // ─── Guard: admin (rw) ou supervisor (ro) ────────────────────────────
@@ -1491,8 +1495,17 @@ export class CrmAdminService {
       return this.refundOnSlash(ctx, tx, amountCents, dto.reason)
     }
 
-    // ⚠️ TODO: Aqui precisa chamar o provider real (Stripe/Viva/SIBS) para
-    // executar o refund. Por enquanto só registramos no banco.
+    // Stripe: o mesmo desenho da Slash. O estorno sai pela API na conta que
+    // cobrou e a contabilidade entra quando o webhook charge.refunded confirmar.
+    // Antes isto só marcava o banco: o comprador era avisado do reembolso, não
+    // recebia nada e abria disputa — o pior desfecho para a conta.
+    if (tx.provider === 'stripe') {
+      return this.refundOnStripe(ctx, tx, amountCents, dto.reason)
+    }
+
+    // ⚠️ Demais provedores (Viva/SIBS…): ainda sem estorno pela API. O registro
+    // abaixo é só interno — o retorno diz isso, para ninguém avisar o comprador
+    // de um reembolso que não saiu.
 
     const isPartial = amountCents < Number(tx.amount_usd_gross_cents)
     const newStatus = isPartial ? 'partial_refund' : 'refunded'
@@ -1532,7 +1545,69 @@ export class CrmAdminService {
       seller_id: tx.seller_id,
     })
 
-    return { message: 'Reembolso registrado' }
+    return {
+      message: 'Reembolso registrado só no sistema. Faça o estorno no painel do provedor para o comprador receber.',
+      provider_refund: false,
+    }
+  }
+
+  private async refundOnStripe(ctx: AdminContext, tx: any, amountUsdCents: number, reason: string) {
+    if (!tx.provider_transaction_id || !tx.provider_account_id) {
+      throw new BadRequestException('Transação sem o pagamento da Stripe. Estorne pelo painel da Stripe.')
+    }
+    const account = this.stripeAccounts ? await this.stripeAccounts.getById(String(tx.provider_account_id)) : null
+    if (!account?.apiKey) {
+      throw new BadRequestException('A conta Stripe desta venda não está disponível (chave removida ou conta desconectada). Estorne pelo painel da Stripe.')
+    }
+
+    // O CRM fala em USD; a Stripe estorna na moeda da venda. Total: sem valor,
+    // a Stripe devolve o que resta da cobrança. Parcial: na proporção do bruto.
+    const grossUsd = Number(tx.amount_usd_gross_cents)
+    const partial = amountUsdCents < grossUsd
+    const amountMinor = partial ? Math.round(Number(tx.amount) * amountUsdCents / grossUsd) : null
+    if (partial && !(Number(amountMinor) > 0)) throw new BadRequestException('Valor inválido')
+
+    const result = await new StripeProvider().refund({
+      providerConfig: account,
+      providerTransactionId: String(tx.provider_transaction_id),
+      ...(partial ? { amount: amountMinor as number, currency: String(tx.currency) } : {}),
+      transactionId: String(tx.id),
+    })
+    if (!result.success) {
+      throw new BadRequestException(`A Stripe recusou o reembolso: ${result.message ?? 'erro'}`)
+    }
+
+    await supabase.from('transactions').update({
+      metadata: {
+        ...(tx.metadata ?? {}),
+        refund_reason: reason,
+        refund_requested_minor: amountMinor,
+        refund_requested_usd_cents: amountUsdCents,
+        refund_requested_by: ctx.managerId,
+        refund_requested_at: new Date().toISOString(),
+        stripe_refund_id: result.refundId ?? null,
+      },
+    }).eq('id', tx.id)
+
+    await this.audit(ctx, 'transaction.refund_requested', 'transaction', tx.id, {
+      provider: 'stripe',
+      account_id: tx.provider_account_id,
+      amount_minor: amountMinor,
+      currency: tx.currency,
+      amount_usd_cents: amountUsdCents,
+      refund_id: result.refundId ?? null,
+      reason,
+      seller_id: tx.seller_id,
+    })
+
+    return {
+      message: partial
+        ? 'Reembolso parcial enviado à Stripe. O saldo do seller NÃO é ajustado sozinho em reembolso parcial: faça o ajuste manual.'
+        : 'Reembolso enviado à Stripe. O saldo do seller é ajustado quando a Stripe confirmar.',
+      refund_id: result.refundId ?? null,
+      status: result.status ?? 'pending',
+      provider_refund: true,
+    }
   }
 
   private async refundOnSlash(ctx: AdminContext, tx: any, amountUsdCents: number, reason: string) {

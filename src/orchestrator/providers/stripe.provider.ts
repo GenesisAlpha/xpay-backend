@@ -234,30 +234,53 @@ export class StripeProvider {
     currency?: string;
     reason?: 'duplicate' | 'fraudulent' | 'requested_by_customer';
     transactionId: string;
-  }): Promise<{ success: boolean; refundId?: string; message?: string }> {
+  }): Promise<{ success: boolean; refundId?: string; status?: string | null; message?: string }> {
     const secretKey = ctx.providerConfig?.apiKey;
     if (!secretKey) return { success: false, message: 'Stripe: conta sem secret_key' };
+
+    // Sem valor = o que ainda resta da cobrança (reembolso total).
+    const partialAmount = ctx.amount != null && ctx.currency
+      ? this.toStripeAmount(ctx.amount, ctx.currency)
+      : null;
 
     try {
       const refund = await this.clientFor(secretKey).refunds.create(
         {
           payment_intent: ctx.providerTransactionId,
-          ...(ctx.amount != null && ctx.currency
-            ? { amount: this.toStripeAmount(ctx.amount, ctx.currency) }
-            : {}),
+          ...(partialAmount != null ? { amount: partialAmount } : {}),
           // 'requested_by_customer' de propósito no default. Marcar como
           // 'fraudulent' entra no histórico de fraude da CONTA na Stripe —
           // use só quando for fraude de verdade.
           reason: ctx.reason ?? 'requested_by_customer',
           metadata: { koopfy_transaction_id: String(ctx.transactionId) },
         },
-        { idempotencyKey: `koopfy_rf_${ctx.transactionId}` },
+        // O valor entra na chave: clique repetido no mesmo valor devolve o
+        // mesmo reembolso, e um segundo parcial de outro valor não colide com
+        // o primeiro (com a chave só do pedido a Stripe recusaria).
+        { idempotencyKey: `koopfy_rf_${ctx.transactionId}_${partialAmount ?? 'full'}` },
       );
 
-      return { success: true, refundId: refund.id };
+      return { success: true, refundId: refund.id, status: refund.status ?? null };
     } catch (err: any) {
       console.error('[StripeProvider] refund error:', err?.message);
       return { success: false, message: err?.message ?? 'refund failed' };
+    }
+  }
+
+  /**
+   * Cancela um PaymentIntent que não vai mais ser pago (trava de recusas). O
+   * client_secret dele deixa de aceitar tentativas. Nunca lança.
+   */
+  async cancelIntent(providerConfig: any, intentId: string): Promise<boolean> {
+    const secretKey = providerConfig?.apiKey;
+    if (!secretKey || !intentId) return false;
+    try {
+      await this.clientFor(secretKey).paymentIntents.cancel(intentId, { cancellation_reason: 'abandoned' });
+      return true;
+    } catch (err: any) {
+      // Já pago ou já cancelado: não há o que fazer, e não é erro nosso.
+      console.error('[StripeProvider] cancelIntent:', intentId, err?.message);
+      return false;
     }
   }
 

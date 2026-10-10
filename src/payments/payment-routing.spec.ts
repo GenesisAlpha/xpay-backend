@@ -59,6 +59,8 @@ function service(routing: any) {
   svc.cardCrypto = { getPublicKeyInfo: () => null }
   svc.currencyService = { convertToUSD: async (amount: number) => ({ grossUSD: amount, fxMarketRate: 1 }) }
   svc.accountRouter = {
+    // getPaymentConfig lê os métodos da conta Stripe do seller; null = usa os de reserva.
+    ownStripeMethods: jest.fn(async () => null),
     getOwnAccount: async (_sellerId: string, provider: string) => (provider === 'whop' ? whopPrincipal : null),
     getAccountByProvider: async () => whopPrincipal,
     resolveOwnRoute: jest.fn(async () => ({ account: whopPrincipal, provider: 'whop', degraded: false, attempted: ['whop'] })),

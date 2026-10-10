@@ -4,7 +4,9 @@ import { SellerBillingService } from '../seller-billing/seller-billing.service'
 import { whopDeclineCode } from '../orchestrator/providers/whop.provider'
 import { whopCardOf } from './whop-card'
 import { isWhopInitiatedRefund, refundFeeCents } from './refund-fee'
-import { Injectable, Optional } from '@nestjs/common'
+import { BadRequestException, Injectable, Optional, ServiceUnavailableException } from '@nestjs/common'
+import { declineCodeOf, declineGuardDecision, maxFailedAttempts } from '../orchestrator/stripe/decline-guard'
+import { StripeProvider } from '../orchestrator/providers/stripe.provider'
 import { supabase } from '../lib/supabase.client'
 import { WalletService } from '../wallets/wallet.service'
 import { AccountRouterService } from '../orchestrator/router/account-router.service'
@@ -141,6 +143,17 @@ const STRIPE_ZERO_DECIMAL = new Set([
   'PYG', 'RWF', 'UGX', 'VND', 'VUV', 'XAF', 'XOF', 'XPF',
 ])
 const STRIPE_THREE_DECIMAL = new Set(['BHD', 'JOD', 'KWD', 'OMR', 'TND'])
+
+// Quanto tempo um evento sem transação continua sendo recusado (para a Stripe
+// reentregar) antes de ser aceito e deixado para conciliação.
+const STRIPE_ORPHAN_GRACE_MS = 2 * 60 * 60 * 1000
+
+/** `event.created` (segundos) mais antigo que a janela. Sem data, não é antigo. */
+export function stripeEventOlderThan(event: any, windowMs: number, now = Date.now()): boolean {
+  const created = Number(event?.created)
+  if (!Number.isFinite(created) || created <= 0) return false
+  return now - created * 1000 > windowMs
+}
 
 @Injectable()
 export class WebhookService {
@@ -1748,7 +1761,9 @@ export class WebhookService {
         `[WebhookService] Stripe: conta ${accountId} sem webhook_secret — evento recusado. `
         + 'Cadastre o whsec_ do endpoint DESTA conta em stripe_accounts.webhook_secret.',
       )
-      return { ignored: true, reason: 'missing webhook secret' }
+      // 503, não 2xx: com 200 a Stripe dá o evento por entregue e o pagamento
+      // nunca confirma. Sem processar nada, ela reentrega até o segredo existir.
+      throw new ServiceUnavailableException('webhook secret not configured')
     }
 
     const verification = this.verifyStripeSignature(rawBody, headers, secret)
@@ -1759,11 +1774,12 @@ export class WebhookService {
         + 'no main.ts — o prefixo é SINGULAR). Suspeita nº2: o whsec_ cadastrado é de outro '
         + 'endpoint/conta.',
       )
-      // THROW, não 2xx. Responder 200 faz a Stripe marcar como entregue e o
-      // evento se perde: dinheiro entrou e o pedido nunca confirma. Com 5xx ela
-      // reentrega por até 3 dias, o que dá janela para corrigir o segredo sem
-      // perder as primeiras vendas.
-      throw new Error(`Stripe: assinatura inválida (${verification.reason}) em ${accountId}`)
+      // Erro, não 2xx. Responder 200 faz a Stripe marcar como entregue e o
+      // evento se perde: dinheiro entrou e o pedido nunca confirma. Qualquer
+      // resposta fora de 2xx faz ela reentregar por até 3 dias, o que dá janela
+      // para corrigir o segredo. 400 e não 500: o problema é do pedido, e 5xx
+      // aparece na conta como falha do nosso servidor.
+      throw new BadRequestException(`invalid signature (${verification.reason})`)
     }
 
     let event: any = {}
@@ -1855,10 +1871,22 @@ export class WebhookService {
         '[WebhookService] Stripe: PAGAMENTO ÓRFÃO — nenhuma transação casou.',
         JSON.stringify({ accountId, eventType, objectId: object?.id ?? null }),
       )
-      // THROW, não `ignored`. Responder 2xx faz a Stripe parar de tentar e o
-      // pagamento morre órfão de vez. Com 5xx ela reentrega (a reserva de
-      // dedupe é desfeita no catch), e a corrida "webhook chegou antes de a
-      // linha existir" se resolve sozinha na retentativa.
+      // Evento recente: THROW, não `ignored`. Responder 2xx faz a Stripe parar
+      // de tentar; com erro ela reentrega (a reserva de dedupe é desfeita no
+      // catch), e a corrida "webhook chegou antes de a linha existir" se
+      // resolve sozinha na retentativa.
+      //
+      // Evento antigo: a corrida já teria se resolvido. Continuar recusando
+      // são dias de entrega falhando na conta — a Stripe mede isso e desativa
+      // o endpoint, o que derruba a confirmação de TODAS as vendas. Aceita e
+      // deixa o registro para conciliação manual.
+      if (stripeEventOlderThan(event, STRIPE_ORPHAN_GRACE_MS)) {
+        console.error(
+          '[WebhookService] 🚨 Stripe: órfão fora da janela de espera — aceito sem processar (CONCILIAR).',
+          JSON.stringify({ accountId, eventType, eventId: event?.id ?? null, objectId: object?.id ?? null }),
+        )
+        return { ignored: true, reason: 'orphan past grace window' }
+      }
       throw new Error(`Stripe: transação não encontrada para ${eventType} (${accountId})`)
     }
 
@@ -1878,6 +1906,25 @@ export class WebhookService {
         payload: { eventType },
       }).catch(err => console.error('[WebhookService] recordRiskEvent(refund):', err?.message))
 
+      // Reembolso PARCIAL: refundTransaction só sabe estornar tudo (saldo,
+      // reserva, status). Parcial fica registrado na transação, como na Slash;
+      // tratá-lo como total tiraria do seller o valor cheio de uma venda que
+      // só voltou em parte.
+      const refundedMinor = Number(object?.amount_refunded)
+      const chargedMinor = Number(object?.amount)
+      if (object?.object === 'charge' && Number.isFinite(refundedMinor) && Number.isFinite(chargedMinor) && refundedMinor < chargedMinor) {
+        // resolveStripeTx não traz o metadata: lê antes de gravar, para não apagar o resto.
+        const { data: current } = await supabase.from('transactions').select('metadata').eq('id', tx.id).maybeSingle()
+        await supabase.from('transactions')
+          .update({ metadata: { ...((current as any)?.metadata ?? {}), stripe_refunded_minor: refundedMinor, stripe_charged_minor: chargedMinor } })
+          .eq('id', tx.id)
+        console.error(
+          `[WebhookService] Stripe: reembolso PARCIAL (${refundedMinor}/${chargedMinor}) na transação ${tx.id} `
+          + '— saldo do seller não foi ajustado automaticamente (conciliar).',
+        )
+        return { partialRefund: true, refundedMinor }
+      }
+
       return this.refundTransaction(tx.id)
     }
 
@@ -1885,6 +1932,11 @@ export class WebhookService {
     // intent reusado). Não bloqueia, mas tem que ser visível: aprovar a
     // transação errada é pior do que aprovar tarde.
     this.warnOnStripeAmountMismatch(tx, object)
+
+    if (eventType === 'payment_intent.payment_failed') {
+      await this.guardStripeDeclines(accountId, tx.id, object)
+        .catch(err => console.error('[WebhookService] trava de recusas:', err?.message))
+    }
 
     return this.handleWebhookProvider({
       reference: tx.id,
@@ -1895,6 +1947,44 @@ export class WebhookService {
         ?? object?.failure_message
         ?? null,
     })
+  }
+
+  // ─────────────────────────────────────────────
+  // Trava de recusas (ver decline-guard.ts): conta a tentativa recusada e, em
+  // recusa definitiva ou tentativas demais, cancela o intent na Stripe e fecha
+  // o pedido para novas tentativas.
+  // ─────────────────────────────────────────────
+
+  private async guardStripeDeclines(accountId: string, txId: string, intent: any) {
+    const { data: row } = await supabase
+      .from('transactions').select('metadata').eq('id', txId).maybeSingle()
+    const metadata = ((row as any)?.metadata ?? {}) as Record<string, any>
+    const attempts = Number(metadata.stripe_failed_attempts ?? 0) + 1
+    const declineCode = declineCodeOf(intent)
+    const reason = declineGuardDecision({ attempts, declineCode, maxAttempts: maxFailedAttempts() })
+
+    await supabase.from('transactions').update({
+      metadata: {
+        ...metadata,
+        stripe_failed_attempts: attempts,
+        stripe_last_decline_code: declineCode,
+        // Lido no createPayment (payments.service): pedido fechado não gera
+        // outra cobrança. Fica no metadata — a coluna retry_blocked não tem
+        // migration neste repositório, e um update com coluna inexistente
+        // falharia inteiro, sem contar a tentativa.
+        ...(reason ? { stripe_attempts_blocked: reason } : {}),
+      },
+    }).eq('id', txId)
+
+    if (!reason) return
+    const account = await this.stripeAccounts.getById(accountId)
+    const cancelled = account && intent?.id
+      ? await new StripeProvider().cancelIntent(account, String(intent.id))
+      : false
+    console.error(
+      `[WebhookService] Stripe: pedido ${txId} encerrado para novas tentativas (${reason}; `
+      + `${attempts} recusa(s), último código ${declineCode ?? '—'}; intent ${cancelled ? 'cancelado' : 'NÃO cancelado'}).`,
+    )
   }
 
   // ─────────────────────────────────────────────
