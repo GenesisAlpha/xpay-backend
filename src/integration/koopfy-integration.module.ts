@@ -22,6 +22,8 @@ import { AnticipationService } from '../wallets/anticipation.service';
 import { PayoutModule } from '../payouts/payout.module';
 import { KoopfyPaymentDomainsController } from './koopfy-payment-domains.controller';
 import { KoopfyPaymentDomainsService } from './koopfy-payment-domains.service';
+import { SellerRefundService } from './seller-refund.service';
+import { WebhookModule } from '../webhooks/webhook.module';
 
 @Module({
   // WalletDashModule exporta o WalletService — o saldo do card da home do
@@ -41,9 +43,11 @@ import { KoopfyPaymentDomainsService } from './koopfy-payment-domains.service';
     ActivationModule,
     OrchestratorModule,
     PayoutModule,
+    // Reembolso pedido pelo seller: a contabilidade é a do webhook de estorno.
+    WebhookModule,
   ],
   controllers: [KoopfyIntegrationController, KoopfyFinanceController, KoopfyPaymentDomainsController],
-  providers: [KoopfyIntegrationService, KoopfyFinanceService, StorageService, AnticipationService, KoopfyPaymentDomainsService],
+  providers: [KoopfyIntegrationService, KoopfyFinanceService, StorageService, AnticipationService, KoopfyPaymentDomainsService, SellerRefundService],
   // O CRM cria a conta de pagamento de quem recebe o provedor externo sem ter
   // passado pelo Koopfy Payments (CrmCheckoutService.setExternalProvider).
   exports: [KoopfyIntegrationService],

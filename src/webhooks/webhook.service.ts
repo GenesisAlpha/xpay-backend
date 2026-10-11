@@ -2527,6 +2527,15 @@ export class WebhookService {
     }
   }
 
+  /**
+   * Estorno CONFIRMADO pelo provedor na própria chamada de reembolso (Clip, que
+   * não manda webhook; Whop/Stripe quando já respondem "devolvido"). Mesmo
+   * caminho do webhook e idempotente com ele: quem chegar depois não debita de novo.
+   */
+  applyConfirmedRefund(transactionId: string) {
+    return this.refundTransaction(transactionId)
+  }
+
   // ─── REFUND ───────────────────────────────────────────────────────────────
   // Reverte uma transação estornada. O estorno é dirigido pelas entradas REAIS
   // de crédito no ledger (credit_pending / credit_platform_fee /

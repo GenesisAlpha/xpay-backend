@@ -382,7 +382,7 @@ describe('KoopfyFinanceController.requestPayout', () => {
     const finance = {
       requestPayout: jest.fn().mockResolvedValue({ payoutId: 'po-1' }),
     };
-    const controller = new KoopfyFinanceController(finance as never);
+    const controller = new KoopfyFinanceController(finance as never, {} as never);
     const req = { sellerCtx: activeContext };
 
     await controller.requestPayout(req, KEY, achPayout);

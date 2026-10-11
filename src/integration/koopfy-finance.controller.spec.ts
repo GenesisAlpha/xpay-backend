@@ -4,6 +4,9 @@ jest.mock('./cross-service-jwt.guard', () => ({
 jest.mock('./koopfy-finance.service', () => ({
   KoopfyFinanceService: class KoopfyFinanceService {},
 }));
+jest.mock('./seller-refund.service', () => ({
+  SellerRefundService: class SellerRefundService {},
+}));
 
 import { KoopfyFinanceController } from './koopfy-finance.controller';
 
@@ -12,7 +15,7 @@ describe('KoopfyFinanceController', () => {
     const finance = {
       getTransaction: jest.fn().mockResolvedValue({ id: 'tx-1' }),
     };
-    const controller = new KoopfyFinanceController(finance as never);
+    const controller = new KoopfyFinanceController(finance as never, {} as never);
     const req = {
       sellerCtx: { seller: { id: 'verified-seller' } },
       body: { sellerId: 'attacker-seller' },
@@ -31,7 +34,7 @@ describe('KoopfyFinanceController', () => {
     const finance = {
       respondToDispute: jest.fn().mockResolvedValue({ message: 'ok' }),
     };
-    const controller = new KoopfyFinanceController(finance as never);
+    const controller = new KoopfyFinanceController(finance as never, {} as never);
     const req = { sellerCtx: { seller: { id: 'verified-seller' } } };
     const body = {
       message: 'Evidence attached',
@@ -51,7 +54,7 @@ describe('KoopfyFinanceController', () => {
     const finance = {
       createPayoutMethod: jest.fn().mockResolvedValue({ id: 'local-method-1' }),
     };
-    const controller = new KoopfyFinanceController(finance as never);
+    const controller = new KoopfyFinanceController(finance as never, {} as never);
     const sellerCtx = { seller: { id: 'verified-seller' } };
 
     await controller.createPayoutMethod(
@@ -78,7 +81,7 @@ describe('KoopfyFinanceController', () => {
       previewPayout: jest.fn(),
       reconfirmPayout: jest.fn(),
     };
-    const controller = new KoopfyFinanceController(finance as never);
+    const controller = new KoopfyFinanceController(finance as never, {} as never);
     const sellerCtx = { seller: { id: 'verified-seller' } };
     const req = { sellerCtx };
 

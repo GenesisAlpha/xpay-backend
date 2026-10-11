@@ -1045,6 +1045,46 @@ export class WhopProvider {
   }
 
   // ─────────────────────────────────────────────
+  // REEMBOLSO — total, pela API
+  //
+  // POST /payments/{id}/refund sem corpo devolve o pagamento inteiro
+  // (docs.whop.com/api-reference/payments/refund-payment). A contabilidade
+  // (saldo do seller, reserva, aviso ao checkout) NÃO é daqui: entra quando o
+  // estorno é confirmado — ver SellerRefundService.
+  // ─────────────────────────────────────────────
+
+  async refund(
+    paymentId: string,
+    providerConfig: { api_url?: string; apiKey?: string },
+  ): Promise<{ success: boolean; refunded?: boolean; status?: string | null; message?: string }> {
+    if (!providerConfig?.apiKey) return { success: false, message: 'Whop: conta sem chave de API' };
+    const apiUrl = providerConfig.api_url ?? WHOP_API_URL_DEFAULT;
+    try {
+      const res = await fetch(`${apiUrl}/api/v1/payments/${encodeURIComponent(paymentId)}/refund`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${providerConfig.apiKey}`,
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: '{}',
+      });
+      const json: any = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        return { success: false, message: json?.error?.message ?? json?.message ?? `Whop HTTP ${res.status}` };
+      }
+      const refunds: any[] = Array.isArray(json?.refunds) ? json.refunds : [];
+      // Já devolvido de fato (e não só aceito): dá para contabilizar na hora.
+      const refunded = Boolean(json?.refunded_at)
+        || String(json?.substatus ?? json?.status ?? '').toLowerCase().includes('refunded')
+        || refunds.some((refund) => String(refund?.status ?? '').toLowerCase() === 'succeeded');
+      return { success: true, refunded, status: json?.status ?? null };
+    } catch (err: any) {
+      return { success: false, message: `Whop: ${err?.message ?? 'falha de rede'}` };
+    }
+  }
+
+  // ─────────────────────────────────────────────
   // ASSINATURA — membership da Whop (área do cliente)
   //
   // Cancelar é sempre no fim do período (`at_period_end`): o comprador já pagou

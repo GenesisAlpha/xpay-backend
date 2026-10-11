@@ -250,6 +250,45 @@ export class ClipProvider {
   }
 
   // ─────────────────────────────────────────────
+  // REEMBOLSO — POST /refunds (developer.clip.mx/reference/post_refunds)
+  //
+  // Referência pelo id do pagamento (`type: transaction`). Valor em unidade
+  // decimal, como na cobrança. A Clip não manda webhook: 200 é a confirmação.
+  // ─────────────────────────────────────────────
+
+  async refund(ctx: {
+    providerTransactionId: string;
+    /** CENTAVOS de MXN. */
+    amountMinor: number;
+    reason: string;
+    providerConfig: { id: string; apiKey?: string; config?: Record<string, any> };
+  }): Promise<{ success: boolean; message?: string; raw?: any }> {
+    const secretKey = ctx.providerConfig?.apiKey;
+    const publicKey = ctx.providerConfig?.config?.public_key;
+    if (!secretKey || !publicKey) return { success: false, message: 'Clip: conta sem credenciais para o reembolso' };
+
+    const amount = Math.round(Number(ctx.amountMinor)) / 100;
+    if (!Number.isFinite(amount) || amount <= 0) return { success: false, message: 'Clip: valor de reembolso inválido' };
+
+    const res = await this.request('/refunds', 'POST', {
+      reference: { type: 'transaction', id: ctx.providerTransactionId },
+      amount,
+      reason: String(ctx.reason ?? '').trim().slice(0, 120) || 'Reembolso solicitado',
+    }, publicKey, secretKey);
+    console.log(`[ClipProvider] ${ctx.providerConfig.id} refund payment=${ctx.providerTransactionId} amount=${amount} ${this.diag(res)}`);
+
+    let body: any = {};
+    try { body = JSON.parse(res.body); } catch { body = {}; }
+    if (res.status >= 400 || res.status === 0) {
+      const motivo = res.status === 404 ? 'o pagamento não existe na Clip ou não pode ser reembolsado'
+        : res.status === 409 ? 'a Clip não permite este reembolso (valor ou prazo)'
+          : body?.message ?? body?.detail ?? `HTTP ${res.status}`;
+      return { success: false, message: `Clip recusou o reembolso: ${motivo}`, raw: body };
+    }
+    return { success: true, raw: body };
+  }
+
+  // ─────────────────────────────────────────────
   // PAYLOAD
   //
   // Cada campo aqui existe porque MOVE a taxa de aprovação. A Clip pontua o

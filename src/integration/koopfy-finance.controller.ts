@@ -13,11 +13,15 @@ import {
 } from '@nestjs/common';
 import { CrossServiceJwtGuard } from './cross-service-jwt.guard';
 import { KoopfyFinanceService } from './koopfy-finance.service';
+import { SellerRefundService } from './seller-refund.service';
 
 @Controller('integration/koopfy/finance')
 @UseGuards(CrossServiceJwtGuard)
 export class KoopfyFinanceController {
-  constructor(private readonly finance: KoopfyFinanceService) {}
+  constructor(
+    private readonly finance: KoopfyFinanceService,
+    private readonly refunds: SellerRefundService,
+  ) {}
 
   @Get('overview')
   overview(@Req() req: any, @Query('period') period?: string) {
@@ -38,6 +42,18 @@ export class KoopfyFinanceController {
   @Get('transactions/:id')
   transaction(@Req() req: any, @Param('id') id: string) {
     return this.finance.getTransaction(req.sellerCtx, id);
+  }
+
+  // Reembolso total pedido pelo seller. O GET diz se pode e quanto sai do
+  // saldo (a tela mostra antes de confirmar); o POST faz. Body: { reason }.
+  @Get('transactions/:id/refund')
+  refundPreview(@Req() req: any, @Param('id') id: string) {
+    return this.refunds.preview(req.sellerCtx, id);
+  }
+
+  @Post('transactions/:id/refund')
+  refund(@Req() req: any, @Param('id') id: string, @Body() body: { reason?: unknown }) {
+    return this.refunds.request(req.sellerCtx, id, body ?? {});
   }
 
   @Get('wallet')
