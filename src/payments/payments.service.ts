@@ -1662,6 +1662,18 @@ export class PaymentService {
         // Capturada é dinheiro que entrou: nunca devolve espaço.
         if (reserva.state !== 'held') return { released: false }
 
+        // Cobrança no meio do 3DS: a página vai para o banco e avisa "saí" do
+        // mesmo jeito que um carrinho abandonado. Devolver o espaço aqui tira
+        // do teto uma venda que ainda pode aprovar. Quem resolve esta reserva é
+        // o desfecho da cobrança (captura, recusa) ou o TTL.
+        const { data: emVoo } = await supabase.from('transactions')
+            .select('id')
+            .eq('seller_id', sellerId).eq('status', 'pending')
+            .eq('metadata->>clip_reservation_id', reservationId)
+            .not('provider_transaction_id', 'is', null)
+            .limit(1)
+        if (emVoo?.length) return { released: false }
+
         await this.clipAccounts.release(reservationId, 'checkout-abandonou')
         return { released: true }
     }
@@ -2121,6 +2133,9 @@ export class PaymentService {
     /** Última consulta ao provedor por transação (ver confirmAtProvider). */
     private static readonly providerPulls = new Map<string, number>()
     private static readonly PROVIDER_PULL_INTERVAL_MS = 2_000
+    private static readonly CLIP_RECONCILE_WINDOW_MS = 24 * 60 * 60 * 1000
+    private static readonly CLIP_RECONCILE_GRACE_MS = 60 * 1000
+    private static readonly CLIP_RECONCILE_BATCH = 50
 
     /**
      * Compra-mãe apta a upsell de um clique: Whop (cartão salvo, até 1 h) ou
@@ -2390,6 +2405,40 @@ export class PaymentService {
             console.error('[PaymentService] confirmação Clip na fonte:', err?.message ?? err)
             return false
         }
+    }
+
+    /**
+     * Cartões Clip que ficaram no 3DS e ninguém voltou para perguntar.
+     *
+     * A confirmação acima só roda quando a tela do comprador consulta o status.
+     * Quem fecha a aba no banco (ou cai fora depois de aprovar) deixava o
+     * pedido pendente para sempre, com o dinheiro já na Clip. Esta varredura
+     * faz a mesma pergunta pelo servidor — ver ClipReconcilerService.
+     *
+     * Só olha a janela em que o desfecho ainda pode chegar; depois dela a
+     * cobrança que continua `pending` na Clip é desafio abandonado.
+     */
+    async reconcilePendingClip(now = new Date()) {
+        const since = new Date(now.getTime() - PaymentService.CLIP_RECONCILE_WINDOW_MS).toISOString()
+        // A tela do comprador pergunta de 3 em 3 s; o primeiro minuto é dela.
+        const until = new Date(now.getTime() - PaymentService.CLIP_RECONCILE_GRACE_MS).toISOString()
+        const { data, error } = await supabase.from('transactions')
+            .select('id, status, provider, provider_transaction_id, provider_account_id, metadata, amount')
+            .eq('provider', 'clip').eq('status', 'pending')
+            .not('provider_transaction_id', 'is', null)
+            .gte('processed_at', since).lte('processed_at', until)
+            .order('processed_at', { ascending: true })
+            .limit(PaymentService.CLIP_RECONCILE_BATCH)
+        if (error) {
+            console.error('[PaymentService] varredura Clip:', error.message)
+            return { checked: 0, resolved: 0 }
+        }
+
+        let resolved = 0
+        for (const tx of data ?? []) {
+            if (await this.confirmClipAtProvider(tx)) resolved += 1
+        }
+        return { checked: data?.length ?? 0, resolved }
     }
 
     private async confirmAtProvider(tx: any): Promise<boolean> {

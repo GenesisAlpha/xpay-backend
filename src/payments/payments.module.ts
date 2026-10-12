@@ -3,6 +3,7 @@ import { PaymentService } from './payments.service';
 import { PaymentController } from './payments.controller';
 import { WhopCardBackfillController } from './whop-card-backfill.controller';
 import { WhopCardBackfillService } from './whop-card-backfill.service';
+import { ClipReconcilerService } from './clip-reconciler.service';
 
 import { WalletModule } from '../wallets/wallet.module';
 import { CurrencyModule } from '../currency/currency.module';
@@ -32,6 +33,7 @@ import { AffiliatesModule } from '../affiliates/affiliates.module';
     PaymentService,
     StorageService,
     WhopCardBackfillService,
+    ClipReconcilerService,
   ],
   exports: [PaymentService],
   controllers: [PaymentController, WhopCardBackfillController],

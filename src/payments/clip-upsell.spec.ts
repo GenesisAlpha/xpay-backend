@@ -102,3 +102,74 @@ describe('Clip — confirmação do 3DS na fonte', () => {
     expect(handleWebhookProvider).not.toHaveBeenCalled();
   });
 });
+
+// Query encadeável que devolve `rows` em qualquer ponto em que for aguardada.
+function listQuery(rows: any[], calls: Array<[string, unknown[]]> = []) {
+  const q: any = {};
+  for (const m of ['select', 'eq', 'not', 'gte', 'lte', 'order', 'limit']) {
+    q[m] = (...args: unknown[]) => { calls.push([m, args]); return q; };
+  }
+  q.then = (ok: any, fail: any) => Promise.resolve({ data: rows, error: null }).then(ok, fail);
+  return q;
+}
+
+describe('Clip — 3DS que ninguém voltou para conferir', () => {
+  const service = Object.create(PaymentService.prototype) as any;
+  const retrieve = jest.fn();
+  const handleWebhookProvider = jest.fn().mockResolvedValue({});
+  const capture = jest.fn().mockResolvedValue(true);
+  const release = jest.fn().mockResolvedValue(undefined);
+  const getReservation = jest.fn();
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service.normalizeProviderName = (p: string) => String(p ?? '').toLowerCase();
+    service.accountRouter = { resolveAccountById: jest.fn().mockResolvedValue({ id: 'clip_mx_gray_01', apiKey: 'sk', config: { public_key: 'pk' } }) };
+    service.webhookService = { handleWebhookProvider };
+    service.clipAccounts = { capture, release, getReservation };
+    getReservation.mockResolvedValue({ seller_id: 's1', state: 'held', amount_minor: 23800 });
+    jest.spyOn(require('../orchestrator/providers/clip.provider').ClipProvider.prototype, 'retrieve')
+      .mockImplementation(retrieve as never);
+  });
+
+  const pending = (id: string) => ({
+    id, status: 'pending', provider: 'clip', provider_account_id: 'clip_mx_gray_01',
+    provider_transaction_id: `pay-${id}`, amount: 23800, metadata: { clip_reservation_id: `res-${id}` },
+  });
+
+  it('a varredura aprova o que o banco aprovou e deixa o resto como está', async () => {
+    const calls: Array<[string, unknown[]]> = [];
+    (supabase.from as jest.Mock).mockReturnValue(listQuery([pending('rec-a'), pending('rec-b')], calls));
+    retrieve.mockImplementation(async (ctx: any) => ({
+      success: true, status: ctx.providerTransactionId === 'pay-rec-a' ? 'paid' : 'pending',
+    }));
+
+    const now = new Date('2026-10-12T01:00:00Z');
+    await expect(service.reconcilePendingClip(now)).resolves.toEqual({ checked: 2, resolved: 1 });
+    expect(handleWebhookProvider).toHaveBeenCalledTimes(1);
+    expect(handleWebhookProvider).toHaveBeenCalledWith(expect.objectContaining({ reference: 'rec-a', status: 'PAID' }));
+    expect(capture).toHaveBeenCalledWith(expect.objectContaining({ reservationId: 'res-rec-a', clipPaymentId: 'pay-rec-a' }));
+
+    // Só cartão Clip pendente com cobrança criada, das últimas 24 h e fora do
+    // primeiro minuto (que é da tela do comprador).
+    expect(calls).toEqual(expect.arrayContaining([
+      ['eq', ['provider', 'clip']],
+      ['eq', ['status', 'pending']],
+      ['not', ['provider_transaction_id', 'is', null]],
+      ['gte', ['processed_at', '2026-10-11T01:00:00.000Z']],
+      ['lte', ['processed_at', '2026-10-12T00:59:00.000Z']],
+    ]));
+  });
+
+  it('sair para o banco não devolve a reserva de uma cobrança em andamento', async () => {
+    (supabase.from as jest.Mock).mockReturnValue(listQuery([{ id: 'tx-3ds' }]));
+    await expect(service.clipRelease('s1', 'res-1')).resolves.toEqual({ released: false });
+    expect(release).not.toHaveBeenCalled();
+  });
+
+  it('carrinho abandonado sem cobrança continua devolvendo o espaço', async () => {
+    (supabase.from as jest.Mock).mockReturnValue(listQuery([]));
+    await expect(service.clipRelease('s1', 'res-1')).resolves.toEqual({ released: true });
+    expect(release).toHaveBeenCalledWith('res-1', 'checkout-abandonou');
+  });
+});
