@@ -559,6 +559,16 @@ export class PaymentService {
                 failure_code: null,
                 failure_message: null,
                 failed_at: null,
+                // Este caminho retorna antes do update que grava as taxas das
+                // outras vendas. Sem elas a aprovação do comprovante parava no
+                // crédito da carteira (valor nulo) e o checkout nunca era
+                // avisado: pedido aprovado no pay e pendente na loja.
+                fee: saleFees.platformFeeCents,
+                chargeback_protection_fee: 0,
+                net_amount: Math.max(0, saleFees.netCents - (externalFee?.amount_cents ?? 0)),
+                reserve_amount: saleFees.reserveCents,
+                available_at: saleFees.availableAt.toISOString(),
+                reserve_until: saleFees.reserveUntil.toISOString(),
                 metadata: {
                     ...(transaction.metadata ?? {}),
                     spei_reservation_id: hold.reservation_id,
@@ -577,6 +587,9 @@ export class PaymentService {
                 })
                 throw new Error('Não foi possível atualizar o status da transação SPEI.')
             }
+            supabase.from('transactions').update({ fee_breakdown: saleFees.breakdown }).eq('id', transaction.id)
+                .then(({ error }) => { if (error) console.error('[PaymentService] fee_breakdown (spei):', error.message) })
+
             if (speiTransaction.status !== 'pending' || speiTransaction.failure_code) {
                 console.error('[PaymentService] transação SPEI permaneceu inconsistente:', speiTransaction)
                 throw new Error('Status da transação SPEI permaneceu inconsistente.')

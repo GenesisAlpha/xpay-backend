@@ -1598,7 +1598,7 @@ export class CrmService {
 
     const { data, error, count } = await supabase
       .from('transactions')
-      .select('id, seller_id, amount, currency, status, provider_status, metadata, created_at', { count: 'exact' })
+      .select('id, seller_id, amount, currency, status, provider_status, webhook_status, metadata, created_at', { count: 'exact' })
       .eq('provider', 'clip')
       .eq('metadata->>spei_proof_status', status)
       .order('created_at', { ascending: false })
@@ -1630,6 +1630,9 @@ export class CrmService {
         currency: tx.currency,
         status: tx.status,
         providerStatus: tx.provider_status,
+        // Aprovado no pay mas o checkout não recebeu o aviso: o pedido segue
+        // pendente na loja. A tela oferece "Reprocessar".
+        pedidoSemAviso: tx.status === 'approved' && tx.webhook_status !== 'delivered',
         createdAt: tx.created_at,
         reservationId: md.spei_reservation_id ?? null,
         // Valor que o comprador DEVIA transferir, com os centavos únicos.
@@ -1682,6 +1685,14 @@ export class CrmService {
         } as any);
       }
       return { status: 'rejected', order: tx.status === 'pending' ? 'failed' : tx.status };
+    }
+
+    // Aprovação que parou no meio (status trocado, sem crédito na carteira e
+    // sem aviso ao checkout): aprovar de novo só completa o que faltou, sem
+    // reescrever quem decidiu nem como. Com o crédito já lançado, não faz nada.
+    if (tx.status === 'approved') {
+      const { reprocessed } = await this.webhookService.reprocessApprovedSale(transactionId);
+      return { status: 'approved', source: md.spei_proof_source ?? null, capturou: false, reprocessado: reprocessed };
     }
 
     // ⚠️ Só quem abriu o extrato pode marcar como conferido. O default é a

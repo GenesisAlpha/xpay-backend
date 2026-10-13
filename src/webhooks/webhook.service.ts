@@ -30,7 +30,7 @@ import { StripeRiskService } from '../orchestrator/stripe/stripe-risk.service'
 import { StripeEfwService } from '../orchestrator/stripe/stripe-efw.service'
 import { AffiliateRiskService } from '../orchestrator/stripe/affiliate-risk.service'
 import { CurrencyService } from '../currency/currency.service'
-import { getEffectiveSellerFees } from '../shared/fee.calculator'
+import { calculateSaleFees, getEffectiveSellerFees } from '../shared/fee.calculator'
 import {
   isWhopRenewalPayment,
   renewalEconomics,
@@ -210,6 +210,11 @@ export class WebhookService {
     // ── Pagamento aprovado ────────────────────────────────────────────────
     if (status === 'PAID' && type === 'TRANSACTION') {
 
+      // Antes de trocar o status: se faltar taxa/líquido e o cálculo falhar, a
+      // venda continua pendente e dá para tentar de novo. Depois do status não
+      // há retentativa (a próxima chamada sai em `alreadyProcessed`).
+      await this.ensureSaleFees(tx)
+
       const { data: approvedRows, error: updateError } = await supabase
         .from('transactions')
         .update({
@@ -236,106 +241,7 @@ export class WebhookService {
       // checkout criava dois pedidos na Shopify.
       if (!approvedRows?.length) return { alreadyProcessed: true }
 
-      // ── Side effects ─────────────────────────────────────────────────
-
-      // 1) Crédito pendente na wallet (com external_fee se houver)
-      //
-      // Conta PRÓPRIA do seller (Whop, Stripe ou PayPal dele): o dinheiro
-      // entrou na conta DELE. Creditar aqui criaria saldo que a Koopfy não tem
-      // como pagar no saque.
-      if (isOwnProviderAccountId(tx.provider_account_id)) {
-        console.log(
-          `[WebhookService] venda ${tx.id} na conta do próprio seller `
-          + `(${tx.provider_account_id}) — sem crédito na carteira da Koopfy.`,
-        )
-      } else {
-      await this.walletService.creditPending({
-        sellerId: tx.seller_id,
-        transactionId: tx.id,
-        amount: tx.net_amount,
-        fee: tx.fee,
-        reserveAmount: tx.reserve_amount,
-        availableAt: tx.available_at,
-        reserveUntil: tx.reserve_until,
-        externalFee: tx.external_fee_cents
-          ? { amount: tx.external_fee_cents, recipientId: tx.external_fee_recipient_id }
-          : null,
-        // 🔥 NOVO
-        platformFee: tx.fee > 0 && tx.platform_partner
-          ? {
-            amount: tx.fee,
-            walletRef: tx.platform_partner === 'koopfy'
-              ? process.env.KOOPFY_PLATFORM_WALLET_REF!
-              : process.env.NEXOR_PLATFORM_WALLET_REF!,
-            partner: tx.platform_partner,
-          }
-          : null,
-      })
-      }
-
-      // 2) Contabiliza volume PAGO no router
-      if (tx.provider_account_id) {
-        const volumeForRouting =
-          tx.amount_usd_net_cents
-          ?? tx.net_amount
-          ?? tx.amount
-          ?? 0
-
-        if (volumeForRouting > 0) {
-          this.router.markPaid(tx.provider_account_id, volumeForRouting)
-            .catch(err => console.error('[WebhookService] markPaid error:', err))
-        }
-      } else {
-        console.warn(
-          '[WebhookService] tx sem provider_account_id, pulando markPaid:',
-          tx.id,
-        )
-      }
-
-      // 3) KPI de aprovação (seller principal)
-      const { error: kpiError } = await supabase.rpc('increment_kpi_safe', {
-        p_seller_id: tx.seller_id,
-        p_amount: tx.amount_usd_net_cents,
-        p_fee: tx.fee ?? 0,
-        p_status: 'approved',
-        p_method: tx.method,
-      })
-      if (kpiError) console.error('[WebhookService] KPI error:', kpiError)
-
-      // 🔥 3b) KPI da external_fee — categoria própria pro recipient
-      if (tx.external_fee_cents && tx.external_fee_recipient_id) {
-        const { error: extKpiError } = await supabase.rpc('increment_kpi_safe', {
-          p_seller_id: tx.external_fee_recipient_id,
-          p_method: 'external_fee',
-          p_amount: tx.external_fee_cents,
-          p_fee: 0,
-          p_status: 'approved',
-        })
-        if (extKpiError) {
-          console.error('[WebhookService] external_fee KPI error:', extKpiError)
-        }
-      }
-
-      // 4) Dispatch de webhooks pro seller
-      if (!opts.skipDispatch) await this.dispatchToAll(tx, 'payment.approved', {
-        status: 'approved',
-        transactionId: tx.id,
-        amount: tx.amount,
-        currency: tx.currency,
-        amountUsd: tx.amount_usd_net_cents,
-        netAmount: tx.net_amount,
-        fee: tx.fee,
-        availableAt: tx.available_at,
-        ...(tx.external_fee_cents
-          ? {
-            externalFee: {
-              amount: tx.external_fee_cents,
-              pct: tx.external_fee_pct,
-              recipientId: tx.external_fee_recipient_id,
-            },
-          }
-          : {}),
-      })
+      await this.runPaidSideEffects(tx, opts)
     }
 
     // ── Pagamento INICIADO (cliente inseriu os dados / sale_in_progress) ──────
@@ -2683,6 +2589,169 @@ export class WebhookService {
   }
 
   // ─── Dispatch para todas as URLs (inalterado) ─────────────────────────────
+
+  // ─── Efeitos de uma venda aprovada ────────────────────────────────────────
+  // Carteira, volume do roteador, KPI e aviso ao checkout. Separado do
+  // handleWebhookProvider para o reprocessamento (reprocessApprovedSale) rodar
+  // exatamente o mesmo caminho.
+  private async runPaidSideEffects(tx: any, opts: { skipDispatch?: boolean } = {}): Promise<void> {
+    // ── Side effects ─────────────────────────────────────────────────
+
+    // 1) Crédito pendente na wallet (com external_fee se houver)
+    //
+    // Conta PRÓPRIA do seller (Whop, Stripe ou PayPal dele): o dinheiro
+    // entrou na conta DELE. Creditar aqui criaria saldo que a Koopfy não tem
+    // como pagar no saque.
+    if (isOwnProviderAccountId(tx.provider_account_id)) {
+      console.log(
+        `[WebhookService] venda ${tx.id} na conta do próprio seller `
+        + `(${tx.provider_account_id}) — sem crédito na carteira da Koopfy.`,
+      )
+    } else {
+    await this.walletService.creditPending({
+      sellerId: tx.seller_id,
+      transactionId: tx.id,
+      amount: tx.net_amount,
+      fee: tx.fee,
+      reserveAmount: tx.reserve_amount,
+      availableAt: tx.available_at,
+      reserveUntil: tx.reserve_until,
+      externalFee: tx.external_fee_cents
+        ? { amount: tx.external_fee_cents, recipientId: tx.external_fee_recipient_id }
+        : null,
+      // 🔥 NOVO
+      platformFee: tx.fee > 0 && tx.platform_partner
+        ? {
+          amount: tx.fee,
+          walletRef: tx.platform_partner === 'koopfy'
+            ? process.env.KOOPFY_PLATFORM_WALLET_REF!
+            : process.env.NEXOR_PLATFORM_WALLET_REF!,
+          partner: tx.platform_partner,
+        }
+        : null,
+    })
+    }
+
+    // 2) Contabiliza volume PAGO no router
+    if (tx.provider_account_id) {
+      const volumeForRouting =
+        tx.amount_usd_net_cents
+        ?? tx.net_amount
+        ?? tx.amount
+        ?? 0
+
+      if (volumeForRouting > 0) {
+        this.router.markPaid(tx.provider_account_id, volumeForRouting)
+          .catch(err => console.error('[WebhookService] markPaid error:', err))
+      }
+    } else {
+      console.warn(
+        '[WebhookService] tx sem provider_account_id, pulando markPaid:',
+        tx.id,
+      )
+    }
+
+    // 3) KPI de aprovação (seller principal)
+    const { error: kpiError } = await supabase.rpc('increment_kpi_safe', {
+      p_seller_id: tx.seller_id,
+      p_amount: tx.amount_usd_net_cents,
+      p_fee: tx.fee ?? 0,
+      p_status: 'approved',
+      p_method: tx.method,
+    })
+    if (kpiError) console.error('[WebhookService] KPI error:', kpiError)
+
+    // 🔥 3b) KPI da external_fee — categoria própria pro recipient
+    if (tx.external_fee_cents && tx.external_fee_recipient_id) {
+      const { error: extKpiError } = await supabase.rpc('increment_kpi_safe', {
+        p_seller_id: tx.external_fee_recipient_id,
+        p_method: 'external_fee',
+        p_amount: tx.external_fee_cents,
+        p_fee: 0,
+        p_status: 'approved',
+      })
+      if (extKpiError) {
+        console.error('[WebhookService] external_fee KPI error:', extKpiError)
+      }
+    }
+
+    // 4) Dispatch de webhooks pro seller
+    if (!opts.skipDispatch) await this.dispatchToAll(tx, 'payment.approved', {
+      status: 'approved',
+      transactionId: tx.id,
+      amount: tx.amount,
+      currency: tx.currency,
+      amountUsd: tx.amount_usd_net_cents,
+      netAmount: tx.net_amount,
+      fee: tx.fee,
+      availableAt: tx.available_at,
+      ...(tx.external_fee_cents
+        ? {
+          externalFee: {
+            amount: tx.external_fee_cents,
+            pct: tx.external_fee_pct,
+            recipientId: tx.external_fee_recipient_id,
+          },
+        }
+        : {}),
+    })
+  }
+
+  // Venda sem taxa/líquido gravados (o SPEI da Clip era criado assim): calcula
+  // com as taxas do seller e grava, para a carteira receber um valor válido.
+  // Altera `tx` no lugar.
+  private async ensureSaleFees(tx: any): Promise<void> {
+    if (tx.net_amount != null && tx.fee != null) return
+    if (isOwnProviderAccountId(tx.provider_account_id)) return
+
+    const gross = Number(tx.amount_usd_gross_cents)
+    if (!Number.isFinite(gross) || gross <= 0) {
+      throw new Error(`Venda ${tx.id} sem valor em USD para calcular as taxas`)
+    }
+    const fees = calculateSaleFees(gross, await getEffectiveSellerFees(tx.seller_id), {
+      currencyConverted: String(tx.currency ?? '').toUpperCase() !== 'USD',
+    })
+    const patch = {
+      fee: fees.platformFeeCents,
+      net_amount: Math.max(0, fees.netCents - Number(tx.external_fee_cents ?? 0)),
+      reserve_amount: fees.reserveCents,
+      available_at: fees.availableAt.toISOString(),
+      reserve_until: fees.reserveUntil.toISOString(),
+    }
+    const { error } = await supabase.from('transactions').update(patch).eq('id', tx.id)
+    if (error) throw new Error(`Falha ao gravar as taxas da venda ${tx.id}: ${error.message}`)
+    Object.assign(tx, patch)
+
+    supabase.from('transactions').update({ fee_breakdown: fees.breakdown }).eq('id', tx.id)
+      .then(({ error: e }) => { if (e) console.error('[WebhookService] fee_breakdown:', e.message) })
+  }
+
+  // ─── Reprocessar venda aprovada pela metade ───────────────────────────────
+  // Para a venda que ficou `approved` sem crédito na carteira e sem aviso ao
+  // checkout (a aprovação parou depois de trocar o status). Só age quando NÃO
+  // há crédito lançado: com crédito, os efeitos já rodaram e repetir dobraria
+  // carteira e KPI.
+  async reprocessApprovedSale(transactionId: string): Promise<{ reprocessed: boolean; reason?: string }> {
+    const { data: tx } = await supabase
+      .from('transactions').select('*').eq('id', transactionId).maybeSingle()
+    if (!tx) throw new Error('Transaction not found')
+    if (tx.status !== 'approved') return { reprocessed: false, reason: 'not_approved' }
+
+    const own = isOwnProviderAccountId(tx.provider_account_id)
+    if (own) {
+      if (tx.webhook_status === 'delivered') return { reprocessed: false, reason: 'already_delivered' }
+    } else {
+      const { data: credit, error } = await supabase
+        .from('wallet_ledger').select('id')
+        .eq('transaction_id', tx.id).eq('type', 'credit_pending').limit(1)
+      if (error) throw new Error(`Falha ao ler a carteira da venda ${tx.id}: ${error.message}`)
+      if (credit?.length) return { reprocessed: false, reason: 'already_credited' }
+    }
+
+    await this.ensureSaleFees(tx)
+    await this.runPaidSideEffects(tx)
+    return { reprocessed: true }
+  }
 
   private async dispatchToAll(tx: any, event: string, data: Record<string, any>): Promise<void> {
     const { data: profile } = await supabase
