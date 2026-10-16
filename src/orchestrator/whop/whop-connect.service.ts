@@ -930,7 +930,7 @@ export class WhopConnectService implements OnModuleInit {
     const back = process.env.CHECKOUT_PAYMENTS_URL ?? 'https://app.koopfy.com/checkout/payments?modal=koopfy-payments';
     try {
       const link = await this.whop.createAccountLink({
-        company_id: row.whop_account_id,
+        account_id: row.whop_account_id,
         use_case: 'account_onboarding',
         refresh_url: back,
         return_url: back,

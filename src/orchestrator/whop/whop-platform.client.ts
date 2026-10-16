@@ -101,8 +101,10 @@ export class WhopPlatformClient {
    * o formulário de verificação). ⚠️ O token dele carrega permissões de saque e
    * de conta bancária: gerar na hora do clique, nunca guardar nem enviar por e-mail.
    */
-  createAccountLink(body: { company_id: string; use_case: string; refresh_url: string; return_url: string }) {
-    return this.request('POST', '/account_links', { body });
+  createAccountLink(body: { account_id: string; use_case: string; refresh_url: string; return_url: string }) {
+    // `account_id` é o campo da API v1 (obrigatório no contrato). `company_id`
+    // vai junto enquanto a Whop ainda o aceita: campo desconhecido é ignorado.
+    return this.request('POST', '/account_links', { body: { ...body, company_id: body.account_id } });
   }
 
   /**

@@ -29,7 +29,7 @@ function ctx(overrides: Record<string, any> = {}) {
 // responde sozinho e a resposta do teste vale para a cobrança.
 function mockFetch(status: number, body: any) {
   const fetchMock = jest.fn().mockImplementation((url: string) =>
-    String(url).includes('/api/v1/plans')
+    String(url).includes('/api/v1/variants')
       ? Promise.resolve({ ok: true, status: 200, json: async () => ({ id: 'plan_test' }) })
       : Promise.resolve({ ok: status < 400, status, json: async () => body }),
   );
@@ -150,7 +150,7 @@ describe('WhopProvider off-session charge — forma do plano', () => {
     await new WhopProvider().charge(ctx());
 
     // O plano virou recurso próprio: a forma que a Whop aceita está na criação.
-    const planCall = fetchMock.mock.calls.find(([url]) => String(url).includes('/api/v1/plans'));
+    const planCall = fetchMock.mock.calls.find(([url]) => String(url).includes('/api/v1/variants'));
     const plan = JSON.parse(planCall![1].body);
     expect(plan).toMatchObject({
       currency: 'usd',
@@ -222,7 +222,7 @@ describe('WhopProvider off-session charge — plano por id', () => {
     const result = await new WhopProvider().charge(ctx());
 
     expect(result.success).toBe(true);
-    expect(calls[0].url).toContain('/api/v1/plans');
+    expect(calls[0].url).toContain('/api/v1/variants');
     expect(calls[0].body).toMatchObject({ plan_type: 'one_time', currency: 'usd' });
     expect(calls[1].url).toContain('/api/v1/payments');
     expect(calls[1].body).toMatchObject({ plan_id: 'plan_123', member_id: 'mber_1' });

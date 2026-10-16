@@ -4,6 +4,7 @@ import { whopRenewalTerms } from './whop-subscription-terms';
 import { supabase } from '../../lib/supabase.client';
 import { koopfyProductExternalId, koopfyProductTitle, connectedApplicationFee } from '../whop/whop-connected';
 import { maskedPlanTitle } from './whop-plan-title';
+import { lookupWhopCompany } from '../whop/whop-company';
 
 /** Membership da Whop reduzida ao que a área do cliente usa. */
 export interface WhopMembershipState {
@@ -444,7 +445,9 @@ export class WhopProvider {
       // é daí que sai a nossa comissão (não há application fee nessa conta).
       ...(config?.affiliate_code ? { affiliate_code: config.affiliate_code } : {}),
       plan: {
-        company_id: companyId,
+        // `account_id` é o nome na API v1. O antigo `company_id` é ignorado em
+        // silêncio (sondado em 2026-10-16: o plano nascia na conta da chave).
+        account_id: companyId,
         currency: cur,
         // Mascarado em maskedPlanTitle, que também respeita o limite de 30
         // chars da API (acima disso a compra inteira falha com 400).
@@ -795,7 +798,9 @@ export class WhopProvider {
     };
 
     try {
-      const res = await fetch(`${args.apiUrl}/api/v1/plans`, {
+      // POST /plans virou "compatibility endpoint" obsoleto; /variants é o
+      // atual, com o mesmo corpo e a mesma permissão (plan:create).
+      const res = await fetch(`${args.apiUrl}/api/v1/variants`, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${args.apiKey}`,
@@ -1103,8 +1108,10 @@ export class WhopProvider {
     membershipId: string,
     providerConfig: { api_url?: string; apiKey?: string },
   ): Promise<WhopMembershipState> {
+    // API v1: `cancel_at_period_end: true`. O antigo `cancellation_mode` não
+    // existe mais no contrato — ignorado, cancelaria na hora.
     return this.membershipRequest('POST', membershipId, '/cancel', providerConfig, {
-      cancellation_mode: 'at_period_end',
+      cancel_at_period_end: true,
     });
   }
 
@@ -1112,13 +1119,17 @@ export class WhopProvider {
     membershipId: string,
     providerConfig: { api_url?: string; apiKey?: string },
   ): Promise<WhopMembershipState> {
-    return this.membershipRequest('POST', membershipId, '/uncancel', providerConfig);
+    // Não há /uncancel na v1 ("Unrecognized request URL"): desfazer o
+    // agendamento é PATCH na membership com `cancel_at_period_end: false`.
+    return this.membershipRequest('PATCH', membershipId, '', providerConfig, {
+      cancel_at_period_end: false,
+    });
   }
 
   private async membershipRequest(
-    method: 'GET' | 'POST',
+    method: 'GET' | 'POST' | 'PATCH',
     membershipId: string,
-    action: '' | '/cancel' | '/uncancel',
+    action: '' | '/cancel',
     providerConfig: { api_url?: string; apiKey?: string },
     body?: Record<string, unknown>,
   ): Promise<WhopMembershipState> {
@@ -1221,18 +1232,15 @@ export class WhopProvider {
   ): Promise<{ id: string; title: string | null }> {
     const base = apiUrl ?? WHOP_API_URL_DEFAULT;
 
-    // /api/v5 (não v1): é a única rota que resolve a company sem já saber o id.
-    const res = await fetch(`${base}/api/v5/company`, {
-      method: 'GET',
-      headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' },
-    });
-
-    const json: any = await res.json().catch(() => ({}));
-    if (!res.ok || !json?.id) {
-      throw new Error(json?.message ?? json?.error?.message ?? `Whop HTTP ${res.status}`);
+    // /api/v5/company primeiro (aceita a chave com menos permissões) e
+    // /api/v1/accounts/me quando o legado sair do ar — ver whop-company.ts.
+    const lookup = await lookupWhopCompany(apiKey, base);
+    if (!lookup.company) {
+      const json = lookup.json;
+      throw new Error(json?.message ?? json?.error?.message ?? `Whop HTTP ${lookup.status}`);
     }
 
-    return { id: json.id, title: json.title ?? null };
+    return lookup.company;
   }
 
   // ─────────────────────────────────────────────

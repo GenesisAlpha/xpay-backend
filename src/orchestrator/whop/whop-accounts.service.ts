@@ -5,6 +5,7 @@ import { ProviderAccountConfig } from '../provider-accounts.config';
 import { ConnectedRouting, WhopConnectService } from './whop-connect.service';
 import { isConnectedProviderAccountId } from './whop-connected';
 import { isLinkedProviderAccountId } from './whop-linked';
+import { lookupWhopCompany } from './whop-company';
 import { WhopLinkedAccountsService } from './whop-linked.service';
 import { isWhopExtraAccountId } from '../seller-provider/seller-provider-accounts';
 import { SellerProviderAccountsService } from '../seller-provider/seller-provider-accounts.service';
@@ -267,15 +268,14 @@ export class WhopAccountsService {
     if (fromEnv) return Promise.resolve({ id: fromEnv, title: null });
 
     if (!this.envCompany) {
-      this.envCompany = fetch(`${apiUrl}/api/v5/company`, {
-        headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' },
-      })
-        .then(async res => {
-          const json: any = await res.json().catch(() => ({}));
-          if (!res.ok || !json?.id) {
-            throw new Error(json?.error?.message ?? json?.message ?? `Whop HTTP ${res.status}`);
+      // v5/company e, se o legado sumir, v1/accounts/me — ver whop-company.ts.
+      this.envCompany = lookupWhopCompany(apiKey, apiUrl)
+        .then(lookup => {
+          if (!lookup.company) {
+            const json = lookup.json;
+            throw new Error(json?.error?.message ?? json?.message ?? `Whop HTTP ${lookup.status}`);
           }
-          return { id: String(json.id), title: (json.title as string | undefined) ?? null };
+          return lookup.company;
         })
         .catch((err: any) => {
           console.error(

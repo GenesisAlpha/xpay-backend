@@ -33,7 +33,7 @@ function mockFetch(status: number, body: any) {
   // A cobrança off-session cria o plano antes: ele responde sozinho e a resposta
   // do teste vale para a cobrança.
   const fetchMock = jest.fn().mockImplementation((url: string) =>
-    String(url).includes('/api/v1/plans')
+    String(url).includes('/api/v1/variants')
       ? Promise.resolve({ ok: true, status: 200, json: async () => ({ id: 'plan_test' }) })
       : Promise.resolve({ ok: status < 400, status, json: async () => body }),
   );
@@ -72,7 +72,7 @@ describe('WhopProvider em conta conectada', () => {
     expect(init.headers.Authorization).toBe('Bearer whop-key');
     expect(JSON.parse(init.body).account_id).toBe('biz_seller');
     expect(JSON.parse(init.body).plan).toMatchObject({
-      company_id: 'biz_seller',
+      account_id: 'biz_seller',
       initial_price: 343.48,
       application_fee_amount: 343.47,
     });
@@ -87,7 +87,7 @@ describe('WhopProvider em conta conectada', () => {
 
     expect(result.success).toBe(true);
     // A fee vive no plano, e o plano virou recurso próprio (ver ensureOneTimePlan).
-    const planCall = fetchMock.mock.calls.find(([url]: any[]) => String(url).includes('/api/v1/plans'));
+    const planCall = fetchMock.mock.calls.find(([url]: any[]) => String(url).includes('/api/v1/variants'));
     expect(JSON.parse(planCall![1].body)).toMatchObject({
       account_id: 'biz_seller',
       initial_price: 343.48,

@@ -152,19 +152,23 @@ describe('OwnAccountFinanceService', () => {
   it('saque na Whop: registra, pede com a chave de idempotência e guarda o que a Whop devolveu', async () => {
     const { svc, calls } = build({
       ...ROUTES,
-      '/api/v1/withdrawals': call => call.method === 'POST'
-        ? { json: { id: 'wdrl_1', status: 'pending', fees: { fee_amount: '1.50' }, estimated_availability: '2026-10-03T00:00:00Z' } }
-        : { json: { status: 'pending' } },
+      // API v1: cotação + POST /payouts (a antiga /withdrawals responde 410).
+      '/api/v1/payouts/quotes': () => ({ json: { quote_token: 'pqt_1', expires_at: '2026-10-03T00:10:00Z' } }),
+      '/api/v1/payouts': call => call.method === 'POST'
+        ? { json: { id: 'wdrl_1', status: 'requested', fee_amount: '1.50', markup_fee: '0', estimated_arrival: '2026-10-03T00:00:00Z' } }
+        : { json: { status: 'requested' } },
     })
     const wallet = await svc.withdraw(SELLER, WHOP, { amountCents: 10000, currency: 'USD', payoutMethodId: 'pm_1' }, 'seller:u-1')
 
-    const post = calls.find(call => call.method === 'POST' && call.url.endsWith('/api/v1/withdrawals'))!
+    const post = calls.find(call => call.method === 'POST' && call.url.endsWith('/api/v1/payouts'))!
     const sent = JSON.parse(post.body!)
-    expect(sent).toMatchObject({ company_id: 'biz_AAA', payout_method_id: 'pm_1', amount: 100, currency: 'usd' })
-    expect(sent.idempotency_key).toEqual(expect.any(String))
+    expect(sent).toMatchObject({ account_id: 'biz_AAA', payout_method_id: 'pm_1', amount: 100, currency: 'usd', quote_token: 'pqt_1' })
+    expect(post.headers['Idempotency-Key']).toEqual(expect.any(String))
+    const quote = calls.find(call => call.method === 'POST' && call.url.endsWith('/api/v1/payouts/quotes'))!
+    expect(quote.headers['Idempotency-Key']).toBe(`${post.headers['Idempotency-Key']}_quote`)
 
     expect(tables.whop_linked_withdrawals[0]).toMatchObject({
-      seller_id: SELLER, whop_account_id: 'biz_AAA', amount_cents: 10000, whop_withdrawal_id: 'wdrl_1', status: 'pending', fee_cents: 150, requested_by: 'seller:u-1',
+      seller_id: SELLER, whop_account_id: 'biz_AAA', amount_cents: 10000, whop_withdrawal_id: 'wdrl_1', status: 'requested', fee_cents: 150, requested_by: 'seller:u-1',
     })
     expect(wallet.withdrawals[0]).toMatchObject({ externalId: 'wdrl_1', amountCents: 10000, feeCents: 150 })
     expect(tables.crm_action_log[0]).toMatchObject({ action: 'own_finance.withdrawal', payload: expect.objectContaining({ account_id: WHOP, actor: 'seller:u-1' }) })
@@ -203,7 +207,7 @@ describe('OwnAccountFinanceService', () => {
   it('recusa do provedor no saque vira mensagem para o seller e o registro fica como falho', async () => {
     const { svc } = build({
       ...ROUTES,
-      '/api/v1/withdrawals': () => ({ status: 422, json: { error: { message: 'payout account not verified' } } }),
+      '/api/v1/payouts': () => ({ status: 422, json: { error: { message: 'payout account not verified' } } }),
     })
     await expect(svc.withdraw(SELLER, WHOP, { amountCents: 1000, currency: 'usd', payoutMethodId: 'pm_1' }))
       .rejects.toThrow('A Whop recusou o saque: payout account not verified')

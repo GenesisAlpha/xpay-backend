@@ -23,6 +23,8 @@ import {
   sellerHasOwnStripe,
 } from '../seller-provider/seller-provider-accounts.service';
 import { saveRoutingLabel, sellerRoutingEnabled } from '../routing/routing-store';
+import { lookupWhopCompany } from './whop-company';
+import { WHOP_PAYOUT_FINAL_STATUS, fetchWhopPayout, requestWhopPayout } from './whop-payouts-api';
 
 // ============================================================================
 // CONTA WHOP PRÓPRIA DO SELLER (modo conexão)
@@ -41,7 +43,7 @@ const TABLE = 'whop_linked_accounts';
 const WITHDRAWALS_TABLE = 'whop_linked_withdrawals';
 
 // Status em que a Whop não mexe mais: não vale reconsultar.
-const FINAL_WITHDRAWAL_STATUS = new Set(['completed', 'failed', 'canceled', 'cancelled', 'denied']);
+const FINAL_WITHDRAWAL_STATUS = WHOP_PAYOUT_FINAL_STATUS;
 
 // Duplicado de whop-accounts.service de propósito: importar de lá fecharia um
 // ciclo (whop-accounts → whop-linked → whop-accounts) e a injeção do Nest
@@ -224,22 +226,25 @@ export class WhopLinkedAccountsService {
     }
 
     try {
-      const withdrawal = await this.whopPost(apiKey, row.api_url ?? WHOP_API_URL_DEFAULT, '/api/v1/withdrawals', {
-        company_id: row.whop_account_id,
-        payout_method_id: payoutMethodId,
-        // A Whop trabalha em decimal; nós guardamos centavos.
-        amount: amountCents / 100,
+      // POST /payouts (a antiga /withdrawals responde 410) — ver whop-payouts-api.ts.
+      const withdrawal = await requestWhopPayout({
+        apiKey,
+        apiUrl: row.api_url ?? WHOP_API_URL_DEFAULT,
+        accountId: row.whop_account_id!,
+        payoutMethodId,
+        amountCents,
         currency,
-        idempotency_key: idempotencyKey,
+        idempotencyKey,
+        metadata: { koopfy_seller_id: sellerId, koopfy_withdrawal_id: saved.id },
       });
 
       await supabase
         .from(WITHDRAWALS_TABLE)
         .update({
-          whop_withdrawal_id: withdrawal?.id ?? null,
-          status: withdrawal?.status ?? 'requested',
-          fee_cents: toCents(withdrawal?.fees?.fee_amount ?? 0) + toCents(withdrawal?.fees?.markup_fee ?? 0),
-          estimated_at: withdrawal?.estimated_availability ?? null,
+          whop_withdrawal_id: withdrawal.id,
+          status: withdrawal.status,
+          fee_cents: withdrawal.feeCents,
+          estimated_at: withdrawal.estimatedAt,
           updated_at: new Date().toISOString(),
         })
         .eq('id', saved.id);
@@ -247,7 +252,7 @@ export class WhopLinkedAccountsService {
       await this.log(sellerId, actor, 'whop_linked.withdrawal', {
         amount_cents: amountCents,
         currency,
-        whop_withdrawal_id: withdrawal?.id ?? null,
+        whop_withdrawal_id: withdrawal.id,
       });
 
       return this.withdrawals(sellerId);
@@ -304,15 +309,15 @@ export class WhopLinkedAccountsService {
 
     for (const row of open) {
       try {
-        const fresh = await this.whopGet(
+        const fresh = await fetchWhopPayout({
           apiKey,
-          account.api_url ?? WHOP_API_URL_DEFAULT,
-          `/api/v1/withdrawals/${encodeURIComponent(row.whop_withdrawal_id)}`,
-        );
-        const status = String(fresh?.status ?? '').trim();
+          apiUrl: account.api_url ?? WHOP_API_URL_DEFAULT,
+          payoutId: row.whop_withdrawal_id,
+        });
+        const status = fresh.status;
         if (!status || status === row.status) continue;
         row.status = status;
-        row.estimated_at = fresh?.estimated_availability ?? row.estimated_at;
+        row.estimated_at = fresh.estimatedAt ?? row.estimated_at;
         await supabase
           .from(WITHDRAWALS_TABLE)
           .update({ status, estimated_at: row.estimated_at, updated_at: new Date().toISOString() })
@@ -801,16 +806,15 @@ export class WhopLinkedAccountsService {
   /** Quem é a company da chave — também serve de validação da chave. */
   private async readCompany(apiKey: string): Promise<{ id: string; title: string | null; apiUrl: string }> {
     const apiUrl = process.env.WHOP_API_URL?.trim() || WHOP_API_URL_DEFAULT;
-    let response: Response;
+    // v5/company e, se o legado sumir, v1/accounts/me — ver whop-company.ts.
+    let response: { ok: boolean; status: number; json: any; company: { id: string; title: string | null } | null };
     try {
-      response = await fetch(`${apiUrl}/api/v5/company`, {
-        headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' },
-      });
+      response = await lookupWhopCompany(apiKey, apiUrl);
     } catch (err: any) {
       throw new BadRequestException(`Não foi possível falar com a Whop agora (${err?.message ?? 'erro de rede'}).`);
     }
 
-    const json: any = await response.json().catch(() => ({}));
+    const json: any = response.json;
     if (response.status === 401 || response.status === 403) {
       throw new BadRequestException('A Whop recusou esta chave. Confira se copiou a chave certa e se ela tem permissão de cobrança.');
     }

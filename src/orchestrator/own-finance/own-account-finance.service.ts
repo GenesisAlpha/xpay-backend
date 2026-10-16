@@ -8,6 +8,7 @@ import { OwnProvider } from '../seller-provider/seller-provider-accounts';
 import { SellerProviderAccountsService } from '../seller-provider/seller-provider-accounts.service';
 import { isLinkedProviderAccountId, mapLedgerBalance, mapPayoutMethods, toCents } from '../whop/whop-linked';
 import { WhopLinkedAccountsService } from '../whop/whop-linked.service';
+import { WHOP_PAYOUT_FINAL_STATUS, fetchWhopPayout, requestWhopPayout } from '../whop/whop-payouts-api';
 import {
   OwnAccountBalance,
   OwnFinanceCapabilities,
@@ -42,7 +43,7 @@ const STRIPE_API_URL = 'https://api.stripe.com';
 const WHOP_API_URL_DEFAULT = 'https://api.whop.com';
 // O histórico de saques da Whop é o nosso registro (a API não lista).
 const WHOP_WITHDRAWALS_TABLE = 'whop_linked_withdrawals';
-const FINAL_WHOP_STATUS = new Set(['completed', 'failed', 'canceled', 'cancelled', 'denied']);
+const FINAL_WHOP_STATUS = WHOP_PAYOUT_FINAL_STATUS;
 
 // O painel espera a tela inteira; um provedor lento não pode segurar as outras contas.
 const PROVIDER_TIMEOUT_MS = 12_000;
@@ -287,11 +288,17 @@ export class OwnAccountFinanceService {
     // Enquanto o saque não termina, a Whop é a dona da verdade sobre o status.
     for (const row of rows.filter(item => item.whop_withdrawal_id && !FINAL_WHOP_STATUS.has(String(item.status)))) {
       try {
-        const fresh = await this.whop(account, 'GET', `/api/v1/withdrawals/${encodeURIComponent(row.whop_withdrawal_id)}`);
-        const status = String(fresh?.status ?? '').trim();
+        // GET /payouts/{id} (a antiga /withdrawals responde 410) — ver whop-payouts-api.ts.
+        const fresh = await fetchWhopPayout({
+          apiKey: String(account.apiKey),
+          apiUrl: account.api_url ?? WHOP_API_URL_DEFAULT,
+          payoutId: row.whop_withdrawal_id,
+          fetchImpl: this.fetchImpl,
+        });
+        const status = fresh.status;
         if (!status || status === row.status) continue;
         row.status = status;
-        row.estimated_at = fresh?.estimated_availability ?? row.estimated_at;
+        row.estimated_at = fresh.estimatedAt ?? row.estimated_at;
         await supabase
           .from(WHOP_WITHDRAWALS_TABLE)
           .update({ status, estimated_at: row.estimated_at, updated_at: new Date().toISOString() })
@@ -346,21 +353,25 @@ export class OwnAccountFinanceService {
     }
 
     try {
-      const withdrawal = await this.whop(account, 'POST', '/api/v1/withdrawals', {
-        company_id: companyId,
-        payout_method_id: request.payoutMethodId,
-        // A Whop trabalha em decimal; nós guardamos centavos.
-        amount: request.amountCents / 100,
+      // POST /payouts (a antiga /withdrawals responde 410) — ver whop-payouts-api.ts.
+      const withdrawal = await requestWhopPayout({
+        apiKey: String(account.apiKey),
+        apiUrl: account.api_url ?? WHOP_API_URL_DEFAULT,
+        accountId: companyId,
+        payoutMethodId: String(request.payoutMethodId),
+        amountCents: request.amountCents,
         currency: request.currency,
-        idempotency_key: idempotencyKey,
+        idempotencyKey,
+        metadata: { koopfy_seller_id: sellerId, koopfy_withdrawal_id: saved.id },
+        fetchImpl: this.fetchImpl,
       });
       await supabase
         .from(WHOP_WITHDRAWALS_TABLE)
         .update({
-          whop_withdrawal_id: withdrawal?.id ?? null,
-          status: withdrawal?.status ?? 'requested',
-          fee_cents: toCents(withdrawal?.fees?.fee_amount ?? 0) + toCents(withdrawal?.fees?.markup_fee ?? 0),
-          estimated_at: withdrawal?.estimated_availability ?? null,
+          whop_withdrawal_id: withdrawal.id,
+          status: withdrawal.status,
+          fee_cents: withdrawal.feeCents,
+          estimated_at: withdrawal.estimatedAt,
           updated_at: new Date().toISOString(),
         })
         .eq('id', saved.id);

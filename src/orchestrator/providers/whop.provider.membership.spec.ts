@@ -36,19 +36,19 @@ describe('WhopProvider memberships', () => {
     expect(url).toBe('https://api.whop.test/api/v1/memberships/mem_1/cancel');
     expect(init.method).toBe('POST');
     expect(init.headers.Authorization).toBe('Bearer whop-key');
-    expect(JSON.parse(init.body)).toEqual({ cancellation_mode: 'at_period_end' });
+    expect(JSON.parse(init.body)).toEqual({ cancel_at_period_end: true });
   });
 
-  it('reactivates with uncancel', async () => {
+  it('reactivates with PATCH cancel_at_period_end=false (there is no /uncancel in v1)', async () => {
     const fetchMock = mockFetch(200, { ...MEMBERSHIP, cancel_at_period_end: false });
 
     await expect(new WhopProvider().uncancelMembership('mem_1', account))
       .resolves.toMatchObject({ cancelAtPeriodEnd: false });
 
     const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toBe('https://api.whop.test/api/v1/memberships/mem_1/uncancel');
-    expect(init.method).toBe('POST');
-    expect(init.body).toBeUndefined();
+    expect(url).toBe('https://api.whop.test/api/v1/memberships/mem_1');
+    expect(init.method).toBe('PATCH');
+    expect(JSON.parse(init.body)).toEqual({ cancel_at_period_end: false });
   });
 
   it('reads the membership', async () => {
