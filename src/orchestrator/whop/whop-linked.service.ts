@@ -779,7 +779,9 @@ export class WhopLinkedAccountsService {
           'dispute.created',
           'dispute_alert.created',
         ],
-        api_version: 'v1',
+        // Sem `api_version`: a Whop passou a recusar o campo ("api_version is no
+        // longer supported"). Webhook novo já vem com eventos v1; sem
+        // `api_version_date` o payload fica no formato que o handler já lê.
         enabled: true,
       }),
     }).catch((err: any) => {

@@ -1193,7 +1193,9 @@ export class WhopProvider {
           // a venda sozinha — a taxa de chargeback é cobrada do seller.
           'dispute_alert.created',
         ],
-        api_version: 'v1',
+        // Sem `api_version`: a Whop passou a recusar o campo ("api_version is no
+        // longer supported"). Webhook novo já vem com eventos v1; sem
+        // `api_version_date` o payload fica no formato que o handler já lê.
         enabled: true,
       }),
     });
