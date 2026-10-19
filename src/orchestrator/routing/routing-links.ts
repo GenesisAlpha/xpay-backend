@@ -58,7 +58,8 @@ export interface LinkSaleInput {
   status: LinkSaleStatus;
   amountUsdGrossCents: number;
   disputed: boolean;
-  occurredAt: string;
+  /** Só na aprovação: estorno e disputa mantêm o dia original da venda. */
+  occurredAt: string | null;
 }
 
 export function parseLinkSale(body: any): LinkSaleInput {
@@ -68,9 +69,13 @@ export function parseLinkSale(body: any): LinkSaleInput {
   if (!SALE_STATUSES.includes(status)) throw new BadRequestException('Situação da venda inválida.');
   const amount = Number(body?.amountUsdGrossCents);
   if (!Number.isInteger(amount) || amount < 0 || amount > 1e12) throw new BadRequestException('Valor da venda inválido.');
-  const at = body?.occurredAt ? Date.parse(String(body.occurredAt)) : Date.now();
-  if (!Number.isFinite(at)) throw new BadRequestException('Data da venda inválida.');
-  return { saleRef, status, amountUsdGrossCents: amount, disputed: body?.disputed === true, occurredAt: new Date(at).toISOString() };
+  let occurredAt: string | null = null;
+  if (body?.occurredAt) {
+    const at = Date.parse(String(body.occurredAt));
+    if (!Number.isFinite(at)) throw new BadRequestException('Data da venda inválida.');
+    occurredAt = new Date(at).toISOString();
+  }
+  return { saleRef, status, amountUsdGrossCents: amount, disputed: body?.disputed === true, occurredAt };
 }
 
 export async function listLinkRows(sellerId: string): Promise<LinkAccountRow[]> {
@@ -116,7 +121,7 @@ export async function upsertLinkSale(sellerId: string, accountId: string, sale: 
   const { error } = await supabase.from(LINK_SALES_TABLE).upsert({
     provider_account_id: accountId, seller_id: sellerId, sale_ref: sale.saleRef, status: sale.status,
     amount_usd_gross_cents: sale.amountUsdGrossCents, disputed: sale.disputed,
-    created_at: sale.occurredAt, updated_at: new Date().toISOString(),
+    ...(sale.occurredAt ? { created_at: sale.occurredAt } : {}), updated_at: new Date().toISOString(),
   }, { onConflict: 'provider_account_id,sale_ref' });
   if (error) throw new BadRequestException(`Não foi possível registrar a venda no roteamento: ${error.message}`);
 }
