@@ -1,4 +1,5 @@
-import { Body, Controller, Get, Post, Query, Req, UseGuards, Headers, Param, HttpCode, HttpStatus } from '@nestjs/common';
+import { Body, Controller, Get, Post, Query, Req, UseGuards, Headers, Param, HttpCode, HttpStatus, Optional, ServiceUnavailableException } from '@nestjs/common';
+import { SellerRoutingService } from '../orchestrator/routing/seller-routing.service';
 import { PaymentService } from './payments.service';
 import { CreatePaymentDto } from './create-payment.dto';
 import { CreateMbwayDto } from './create-mbway.dto';
@@ -13,6 +14,7 @@ export class PaymentController {
   constructor(
     private readonly paymentService: PaymentService,
     private readonly accountRouter: AccountRouterService,
+    @Optional() private readonly sellerRouting?: SellerRoutingService,
   ) { }
 
   @Post('create')
@@ -83,8 +85,39 @@ export class PaymentController {
     @Query('routingKey') routingKey?: string,
     @Query('country') country?: string,
     @Query('currency') currency?: string,
+    @Query('link') link?: string,
   ) {
-    return this.paymentService.getPaymentConfig(req.sellerId as string, { routingKey, country, currency });
+    return this.paymentService.getPaymentConfig(req.sellerId as string, { routingKey, country, currency, link });
+  }
+
+  // ─── Contas por link no roteamento (lojas Shopify) ─────────────────────
+  // O backend do checkout guarda a credencial da loja e chama estas rotas com a
+  // sk_live_ do seller: registrar/desligar a loja e informar cada venda.
+
+  @Post('routing/link-accounts')
+  @UseGuards(ApiKeyGuard)
+  @HttpCode(HttpStatus.OK)
+  registerLinkAccount(@Req() req: Request, @Body() body: any) {
+    return this.requireRouting().registerLinkAccount(req.sellerId as string, body ?? {});
+  }
+
+  @Post('routing/link-accounts/disable')
+  @UseGuards(ApiKeyGuard)
+  @HttpCode(HttpStatus.OK)
+  disableLinkAccount(@Req() req: Request, @Body() body: any) {
+    return this.requireRouting().disableLinkAccount(req.sellerId as string, body ?? {});
+  }
+
+  @Post('routing/link-sales')
+  @UseGuards(ApiKeyGuard)
+  @HttpCode(HttpStatus.OK)
+  recordLinkSale(@Req() req: Request, @Body() body: any) {
+    return this.requireRouting().recordLinkSale(req.sellerId as string, body ?? {});
+  }
+
+  private requireRouting(): SellerRoutingService {
+    if (!this.sellerRouting) throw new ServiceUnavailableException('Roteamento indisponível.');
+    return this.sellerRouting;
   }
 
   // Reserva a conta Clip ANTES de o formulário de cartão ser montado.

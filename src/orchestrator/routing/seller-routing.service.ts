@@ -30,8 +30,10 @@ import {
   RoutingCandidate,
   RoutingContext,
   RoutingGroup,
+  RoutingProvider,
   RoutingStrategy,
   StatsTxRow,
+  accountStage,
   activePause,
   capReached,
   computeStats,
@@ -44,6 +46,9 @@ import {
   groupOfMethod,
   groupOfProvider,
   ineligibility,
+  isLinkAccountId,
+  isLinkProvider,
+  linkModeAllows,
   keptOnDisable,
   normalizeAccountConfig,
   normalizeStrategy,
@@ -54,6 +59,19 @@ import {
   TodayTxRow,
 } from './seller-routing';
 import { notifySellerRoutingPause } from '../../utils/seller-mail';
+import {
+  LinkProvider,
+  disableLinkRow,
+  linkAccountId,
+  listLinkRows,
+  loadLinkSales,
+  parseCurrencies,
+  parseExternalRef,
+  parseLinkProvider,
+  parseLinkSale,
+  upsertLinkRow,
+  upsertLinkSale,
+} from './routing-links';
 import { sellerUsesKoopfyPayments } from '../seller-provider/payment-account-mode';
 
 // ============================================================================
@@ -90,6 +108,9 @@ export interface PoolEntry extends RoutingCandidate {
   /** Whop principal (a que tem carteira e saque). */
   primary: boolean;
   createdAt: string | null;
+  /** Conta por link: id dela no backend do checkout (shopify_payment_accounts.id). */
+  linkRef?: string | null;
+  shopDomain?: string | null;
 }
 
 export interface ResolvedRoutingSettings {
@@ -120,6 +141,13 @@ export interface RoutingConfigPick {
 export type RoutingSalePick =
   | { kind: 'legacy' }
   | { kind: 'account'; entry: PoolEntry & { account: ProviderAccountConfig }; provider: OwnProvider; feePct: number; reason: string };
+
+/** Conta por link escolhida para a sessão (o checkout manda o comprador para ela). */
+export interface RoutingLinkPick {
+  accountId: string;
+  provider: LinkProvider;
+  linkRef: string;
+}
 
 /** Chave de sessão aceitável (id da checkout session), ou null. */
 export function normalizeRoutingKey(value: unknown): string | null {
@@ -200,10 +228,11 @@ export class SellerRoutingService implements OnModuleInit {
    */
   async loadPool(sellerId: string, settings?: ResolvedRoutingSettings): Promise<PoolEntry[]> {
     const resolved = settings ?? (await this.settings(sellerId));
-    const [principal, rows, configs] = await Promise.all([
+    const [principal, rows, configs, links] = await Promise.all([
       this.whopLinked.getRow(sellerId).catch(() => null),
       this.sellerProviders.listRows(sellerId).catch(() => []),
       this.loadConfigs(sellerId),
+      listLinkRows(sellerId).catch(() => []),
     ]);
 
     const entries: Array<Omit<PoolEntry, 'stats' | 'breakerOpen'>> = [];
@@ -248,6 +277,28 @@ export class SellerRoutingService implements OnModuleInit {
       });
     }
 
+    // Contas por link (lojas Shopify): sem credencial no pay; cobrar = mandar o
+    // comprador para o checkout delas. Desligadas ficam de fora.
+    for (const row of links) {
+      if (row.status !== 'active') continue;
+      const id = linkAccountId(row);
+      entries.push({
+        id,
+        provider: row.provider,
+        group: 'card',
+        config: normalizeAccountConfig(configs.get(id), defaultAccountConfig(id, sellerId, row.provider)),
+        account: null,
+        chargeable: true,
+        connection: 'active',
+        accountName: row.display_name ?? row.shop_domain ?? null,
+        mode: null,
+        primary: false,
+        createdAt: row.created_at ?? null,
+        linkRef: row.external_ref,
+        shopDomain: row.shop_domain ?? null,
+      });
+    }
+
     const stats = await this.loadStats(sellerId, entries.map(entry => entry.id), resolved.disputePausePctEffective);
     return entries.map(entry => ({
       ...entry,
@@ -287,6 +338,8 @@ export class SellerRoutingService implements OnModuleInit {
         .limit(STATS_ROW_LIMIT);
       if (error) console.error('[SellerRouting] estatística das contas:', error.message);
       rows = (Array.isArray(data) ? data : []) as unknown as StatsTxRow[];
+      const linkIds = ids.filter(isLinkAccountId);
+      if (linkIds.length) rows = rows.concat(await loadLinkSales(sellerId, linkIds, since, STATS_ROW_LIMIT));
       this.statsCache.set(cacheKey, { at: this.now(), rows });
     }
 
@@ -313,7 +366,9 @@ export class SellerRoutingService implements OnModuleInit {
       // Sem a leitura, o último dia conhecido segura os tetos (melhor que zerar).
       return cached && cached.dayStart === dayStart ? cached.rows : [];
     }
-    const rows = (Array.isArray(data) ? data : []) as unknown as TodayTxRow[];
+    let rows = (Array.isArray(data) ? data : []) as unknown as TodayTxRow[];
+    const linkIds = ids.filter(isLinkAccountId);
+    if (linkIds.length) rows = rows.concat(await loadLinkSales(sellerId, linkIds, new Date(dayStart).toISOString(), STATS_ROW_LIMIT));
     this.todayCache.set(cacheKey, { at: this.now(), dayStart, rows });
     return rows;
   }
@@ -377,7 +432,9 @@ export class SellerRoutingService implements OnModuleInit {
     return {
       card,
       paypal,
-      cardAccounts: pool.filter(entry => entry.group === 'card').length,
+      // Só as contas que esta sessão pode usar: com o link negado, um seller
+      // que só tem lojas Shopify no roteamento segue com o cartão de antes.
+      cardAccounts: pool.filter(entry => entry.group === 'card' && linkModeAllows(entry.provider, ctx.link)).length,
       paypalAccounts: pool.filter(entry => entry.group === 'paypal').length,
       routingKey: key,
     };
@@ -415,15 +472,16 @@ export class SellerRoutingService implements OnModuleInit {
     if (await sellerUsesKoopfyPayments(sellerId)) return null;
 
     const group = groupOfMethod(args.method);
-    const ctx = args.ctx ?? {};
+    const ctx = { ...(args.ctx ?? {}), link: 'deny' as const };
     const pool = await this.loadPool(sellerId, settings);
     this.syncAutoPauses(sellerId, pool, settings);
-    const groupPool = pool.filter(entry => entry.group === group);
+    // Conta por link não cobra pelo formulário: fica fora da venda.
+    const groupPool = pool.filter(entry => entry.group === group && !isLinkProvider(entry.provider));
     if (!groupPool.length) return { kind: 'legacy' };
 
     const done = (entry: PoolEntry, reason: string): RoutingSalePick => {
       if (!entry.account) throw new BadRequestException({ error: 'ROUTING_NO_ACCOUNT', message: 'Conta de pagamento do vendedor indisponível.' });
-      return { kind: 'account', entry: entry as PoolEntry & { account: ProviderAccountConfig }, provider: entry.provider, feePct: settings.feePct, reason };
+      return { kind: 'account', entry: entry as PoolEntry & { account: ProviderAccountConfig }, provider: entry.provider as OwnProvider, feePct: settings.feePct, reason };
     };
     const inGroup = (id: string | null | undefined) => (id ? groupPool.find(entry => entry.id === id) : undefined);
 
@@ -635,7 +693,7 @@ export class SellerRoutingService implements OnModuleInit {
     await this.log(sellerId, 'system', 'routing.account_auto_paused', { account_id: accountId, reason: 'errors' });
   }
 
-  private async writeAccountConfig(sellerId: string, accountId: string, provider: OwnProvider, patch: Record<string, any>) {
+  private async writeAccountConfig(sellerId: string, accountId: string, provider: RoutingProvider, patch: Record<string, any>) {
     const { error } = await supabase.from(ACCOUNTS_TABLE).upsert(
       {
         provider_account_id: accountId,
@@ -647,6 +705,64 @@ export class SellerRoutingService implements OnModuleInit {
       { onConflict: 'provider_account_id' },
     );
     if (error) throw new BadRequestException(`Não foi possível salvar a conta no roteamento: ${error.message}`);
+  }
+
+  // ─── Contas por link (Shopify Payments) ─────────────────────────────────
+
+  /**
+   * O backend do checkout conectou (ou reconectou) uma loja: entra no pool.
+   * Na primeira vez a conta ganha as moedas da loja como filtro (a Shopify só
+   * cobra nas moedas ativas no Markets dela) e, se pedido, o aquecimento.
+   */
+  async registerLinkAccount(sellerId: string, body: Record<string, any>) {
+    const provider = parseLinkProvider(body?.provider);
+    const externalRef = parseExternalRef(body?.externalRef);
+    const currencies = parseCurrencies(body?.currencies);
+    const { row, created } = await upsertLinkRow(sellerId, {
+      provider, externalRef, currencies,
+      displayName: String(body?.name ?? '').trim().slice(0, 120) || null,
+      shopDomain: String(body?.shopDomain ?? '').trim().toLowerCase().slice(0, 120) || null,
+    });
+    const id = linkAccountId(row);
+    const configs = await this.loadConfigs(sellerId);
+    if (!configs.has(id)) {
+      const current = defaultAccountConfig(id, sellerId, provider);
+      const patch = parseAccountPatch({
+        ...(currencies.length ? { currencies } : {}),
+        ...(body?.warmup && typeof body.warmup === 'object' ? { warmup: body.warmup } : {}),
+      }, current, new Date(this.now()).toISOString());
+      await this.writeAccountConfig(sellerId, id, provider, patch);
+    }
+    await this.log(sellerId, 'system', created ? 'routing.link_account_connected' : 'routing.link_account_updated', { account_id: id, provider });
+    return { id, created };
+  }
+
+  async disableLinkAccount(sellerId: string, body: Record<string, any>) {
+    const provider = parseLinkProvider(body?.provider);
+    const row = await disableLinkRow(sellerId, provider, parseExternalRef(body?.externalRef));
+    if (row) await this.log(sellerId, 'system', 'routing.link_account_disconnected', { account_id: linkAccountId(row), provider });
+    return { ok: true };
+  }
+
+  /** Venda (ou estorno/disputa) numa conta por link: conta para tetos e score. */
+  async recordLinkSale(sellerId: string, body: Record<string, any>) {
+    const provider = parseLinkProvider(body?.provider);
+    const externalRef = parseExternalRef(body?.externalRef);
+    const rows = await listLinkRows(sellerId);
+    const row = rows.find(item => item.provider === provider && item.external_ref === externalRef);
+    if (!row) throw new NotFoundException('Conta por link não encontrada.');
+    const id = linkAccountId(row);
+    await upsertLinkSale(sellerId, id, parseLinkSale(body));
+    this.forgetToday(id);
+    for (const key of this.statsCache.keys()) if (key.startsWith(`${sellerId}:`)) this.statsCache.delete(key);
+    return { ok: true, accountId: id };
+  }
+
+  /** Conta por link escolhida no config da sessão, para o checkout. */
+  linkPickOf(pick: RoutingConfigPick | null): RoutingLinkPick | null {
+    const entry = pick?.card;
+    if (!entry || !isLinkProvider(entry.provider) || !entry.linkRef) return null;
+    return { accountId: entry.id, provider: entry.provider as LinkProvider, linkRef: entry.linkRef };
   }
 
   // ─── Painel do seller ──────────────────────────────────────────────────
@@ -679,6 +795,10 @@ export class SellerRoutingService implements OnModuleInit {
           provider: entry.provider,
           group: entry.group,
           primary: entry.primary,
+          // Conta por link: o comprador paga no checkout da loja (Shopify).
+          link: isLinkProvider(entry.provider),
+          ...(entry.shopDomain ? { shopDomain: entry.shopDomain } : {}),
+          stage: accountStage(entry.config, now),
           label: entry.config.label,
           accountName: entry.accountName,
           ...(entry.mode ? { mode: entry.mode } : {}),

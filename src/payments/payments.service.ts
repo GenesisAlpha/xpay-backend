@@ -1708,7 +1708,7 @@ export class PaymentService {
         sellerId: string,
         // Roteamento de contas: chave da sessão do comprador (id da checkout
         // session) e, quando o checkout já sabe, país/moeda para os filtros.
-        routingOpts: { routingKey?: string | null; country?: string | null; currency?: string | null } = {},
+        routingOpts: { routingKey?: string | null; country?: string | null; currency?: string | null; link?: string | null } = {},
     ) {
         const { data: seller } = await supabase
             .from('seller_profiles')
@@ -1815,6 +1815,10 @@ export class PaymentService {
             ? await this.sellerRouting.resolveForConfig(sellerId, normalizeRoutingKey(routingOpts.routingKey), {
                 country: routingOpts.country ?? null,
                 currency: routingOpts.currency ?? null,
+                // Contas por link (lojas Shopify): só quando o checkout avisa que
+                // a oferta cabe no checkout da Shopify ('allow') ou foi vinculada
+                // a ela ('only'). Checkout antigo não manda → nunca por link.
+                link: routingOpts.link === 'allow' || routingOpts.link === 'only' ? routingOpts.link : 'deny',
             }).catch((err: any) => {
                 console.error('[PaymentService] getPaymentConfig: roteamento indisponível:', err?.message)
                 return null
@@ -1832,6 +1836,20 @@ export class PaymentService {
         const paypal = pick.paypalAccounts > 0
             ? (pick.paypal?.account ? paypalPublicConfig(pick.paypal.account) : null)
             : legacy.paypal
+
+        // Conta por link (loja Shopify): a sessão paga no checkout da loja. O
+        // backend do checkout cria o pedido nela; nada de formulário aqui.
+        const linkPick = this.sellerRouting?.linkPickOf(pick) ?? null
+        if (linkPick) {
+            return {
+                ...legacy,
+                provider: 'shopify_payments',
+                methods: [],
+                providerConfig: { provider: 'shopify_payments', cardFlow: 'link' as const, providerAccountId: linkPick.accountId, linkRef: linkPick.linkRef },
+                paypal: null,
+                routing: { ...routing, cardProvider: linkPick.provider },
+            }
+        }
 
         // Sem conta de cartão conectada no roteamento: o cartão segue como antes.
         if (pick.cardAccounts === 0) return { ...legacy, paypal, routing }

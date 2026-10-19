@@ -274,7 +274,7 @@ export class KoopfyIntegrationService {
     const occupying = settings.enabled
       ? []
       : (await this.sellerRouting.loadPool(sellerId, settings).catch(() => []))
-        .filter(entry => entry.group === group && entry.connection === 'active');
+        .filter(entry => entry.group === group && entry.connection === 'active' && entry.provider !== 'shopify');
 
     const choice = connectionChoice({
       routingEnabled: settings.enabled,

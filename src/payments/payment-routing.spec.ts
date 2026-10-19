@@ -1,3 +1,4 @@
+import { SellerRoutingService } from '../orchestrator/routing/seller-routing.service'
 process.env.KOOPFY_PLATFORM_WALLET_REF = process.env.KOOPFY_PLATFORM_WALLET_REF ?? 'wallet-test'
 
 // O pagamento com o roteamento de contas: /payments/config devolve a conta da
@@ -69,7 +70,8 @@ function service(routing: any) {
       success: true, status: 'requires_action', provider: 'whop', accountId: providerAccountId, providerTransactionId: 'ch_1',
     })),
   }
-  svc.sellerRouting = routing
+  // linkPickOf é puro (só lê o pick): o dublê usa o de verdade.
+  svc.sellerRouting = routing ? { linkPickOf: SellerRoutingService.prototype.linkPickOf, ...routing } : routing
   return svc
 }
 
@@ -79,7 +81,7 @@ describe('/payments/config', () => {
   it('roteamento desligado: o mesmo config de antes + routing.enabled=false', async () => {
     const resolveForConfig = jest.fn(async () => null)
     const config = await service({ resolveForConfig }).getPaymentConfig('s-1', { routingKey: 'sess-1' })
-    expect(resolveForConfig).toHaveBeenCalledWith('s-1', 'sess-1', { country: null, currency: null })
+    expect(resolveForConfig).toHaveBeenCalledWith('s-1', 'sess-1', { country: null, currency: null, link: 'deny' })
     expect(config).toEqual({
       active: true,
       provider: 'whop',
@@ -124,6 +126,27 @@ describe('/payments/config', () => {
       resolveForConfig: async () => ({ card: null, paypal: null, cardAccounts: 2, paypalAccounts: 0, routingKey: null }),
     }).getPaymentConfig('s-1')
     expect(config).toMatchObject({ provider: null, methods: [], providerConfig: null, routing: { enabled: true, cardAccountId: null } })
+  })
+})
+
+describe('/payments/config com loja Shopify (conta por link)', () => {
+  it('sessão atribuída à loja: devolve o link, sem formulário nem PayPal', async () => {
+    const resolveForConfig = jest.fn(async () => ({
+      card: { id: 'shopifyp_s1', provider: 'shopify', account: null, linkRef: 'ck-1' },
+      paypal: null, cardAccounts: 2, paypalAccounts: 0, routingKey: 'sess-9',
+    }))
+    const config = await service({ resolveForConfig }).getPaymentConfig('s-1', { routingKey: 'sess-9', link: 'allow' })
+    expect(resolveForConfig).toHaveBeenCalledWith('s-1', 'sess-9', expect.objectContaining({ link: 'allow' }))
+    expect(config).toMatchObject({
+      provider: 'shopify_payments', methods: [], paypal: null,
+      providerConfig: { provider: 'shopify_payments', cardFlow: 'link', providerAccountId: 'shopifyp_s1', linkRef: 'ck-1' },
+      routing: { enabled: true, cardAccountId: 'shopifyp_s1', cardProvider: 'shopify' },
+    })
+  })
+  it('valor de link desconhecido vira deny', async () => {
+    const resolveForConfig = jest.fn(async () => null)
+    await service({ resolveForConfig }).getPaymentConfig('s-1', { routingKey: 'sess-9', link: 'qualquer' })
+    expect(resolveForConfig).toHaveBeenCalledWith('s-1', 'sess-9', expect.objectContaining({ link: 'deny' }))
   })
 })
 

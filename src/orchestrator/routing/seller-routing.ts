@@ -18,6 +18,12 @@ import { isLinkedProviderAccountId } from '../whop/whop-linked';
 import { OwnProvider, isPaypalOwnAccountId, isStripeOwnAccountId, isWhopExtraAccountId } from '../seller-provider/seller-provider-accounts';
 
 export type RoutingStrategy = 'orders_split' | 'revenue_split' | 'priority_cap' | 'score';
+/**
+ * Provedor de uma conta no roteamento. 'shopify' é conta por LINK: o comprador
+ * paga no checkout da loja Shopify do seller (Shopify Payments), não no
+ * formulário da Koopfy. Entra no grupo de cartão, com as mesmas regras.
+ */
+export type RoutingProvider = OwnProvider | 'shopify';
 export type RoutingGroup = 'card' | 'paypal';
 export type RoutingPauseReason = 'manual' | 'disputes' | 'errors';
 
@@ -71,15 +77,36 @@ export function routingDayStartMs(ms: number): number {
 
 // ─── Ids ──────────────────────────────────────────────────────────────────
 
+// Conta por link (seller_link_accounts): `shopifyp_<uuid>`.
+const SHOPIFY_LINK_PREFIX = 'shopifyp_';
+
+export function toShopifyLinkAccountId(rowId: string): string {
+  return `${SHOPIFY_LINK_PREFIX}${rowId}`;
+}
+
+export function isLinkAccountId(id: string | null | undefined): boolean {
+  return typeof id === 'string' && id.startsWith(SHOPIFY_LINK_PREFIX);
+}
+
+export function linkRowIdOf(id: string): string | null {
+  return isLinkAccountId(id) ? id.slice(SHOPIFY_LINK_PREFIX.length) : null;
+}
+
+/** Conta por link (o comprador sai do checkout da Koopfy para pagar)? */
+export function isLinkProvider(provider: RoutingProvider | null | undefined): boolean {
+  return provider === 'shopify';
+}
+
 /** Provedor de uma conta própria pelo prefixo do id, ou null se não é própria. */
-export function ownProviderOfId(id: string | null | undefined): OwnProvider | null {
+export function ownProviderOfId(id: string | null | undefined): RoutingProvider | null {
+  if (isLinkAccountId(id)) return 'shopify';
   if (isLinkedProviderAccountId(id) || isWhopExtraAccountId(id)) return 'whop';
   if (isStripeOwnAccountId(id)) return 'stripe';
   if (isPaypalOwnAccountId(id)) return 'paypal';
   return null;
 }
 
-export function groupOfProvider(provider: OwnProvider): RoutingGroup {
+export function groupOfProvider(provider: RoutingProvider): RoutingGroup {
   return provider === 'paypal' ? 'paypal' : 'card';
 }
 
@@ -139,7 +166,7 @@ export function accountsToReplace(args: {
 export interface RoutingAccountConfig {
   provider_account_id: string;
   seller_id: string;
-  provider: OwnProvider;
+  provider: RoutingProvider;
   label: string | null;
   weight: number;
   priority: number;
@@ -162,7 +189,7 @@ export interface RoutingAccountConfig {
   warmup_max_ticket_usd_cents: number | null;
 }
 
-export function defaultAccountConfig(id: string, sellerId: string, provider: OwnProvider): RoutingAccountConfig {
+export function defaultAccountConfig(id: string, sellerId: string, provider: RoutingProvider): RoutingAccountConfig {
   return {
     provider_account_id: id,
     seller_id: sellerId,
@@ -274,6 +301,19 @@ export function warmupState(config: RoutingAccountConfig, now = Date.now()): War
   };
 }
 
+/**
+ * Fase da conta para o painel: 'warming' enquanto aquece, 'ready_to_scale'
+ * depois que o aquecimento terminou (pode subir os tetos), 'active' sem
+ * aquecimento configurado.
+ */
+export function accountStage(config: RoutingAccountConfig, now = Date.now()): 'warming' | 'ready_to_scale' | 'active' {
+  if (warmupState(config, now)) return 'warming';
+  const started = config.warmup_started_at ? Date.parse(config.warmup_started_at) : NaN;
+  if (Number.isFinite(started) && Number(config.warmup_days) >= 1
+    && routingDayNumber(now) - routingDayNumber(started) >= Number(config.warmup_days)) return 'ready_to_scale';
+  return 'active';
+}
+
 /** Os limites de hoje: o menor entre o teto diário e o do aquecimento. */
 export function effectiveDailyLimits(config: RoutingAccountConfig, now = Date.now()): {
   orders: number | null;
@@ -316,6 +356,8 @@ export interface StatsTxRow {
   whop_dispute?: unknown;
   stripe_dispute?: unknown;
   paypal_dispute?: unknown;
+  /** Venda por link com disputa aberta (routing_link_sales.disputed). */
+  link_dispute?: unknown;
 }
 
 // Estados que significam "o dinheiro entrou em algum momento": estorno e
@@ -356,7 +398,7 @@ export function computeStats(
       stats.failed7d += 1;
     }
     if (status === 'refunded' || status === 'partially_refunded') stats.refunds7d += 1;
-    if (status === 'chargeback' || row.whop_dispute || row.stripe_dispute || row.paypal_dispute) stats.disputes7d += 1;
+    if (status === 'chargeback' || row.whop_dispute || row.stripe_dispute || row.paypal_dispute || row.link_dispute) stats.disputes7d += 1;
   }
 
   for (const [id, stats] of result) {
@@ -435,11 +477,26 @@ export interface RoutingContext {
   currency?: string | null;
   /** Valor da venda em centavos de USD (bruto). */
   amountUsdCents?: number | null;
+  /**
+   * Contas por link nesta sessão: 'deny' (padrão — a oferta não cabe no
+   * checkout da Shopify, ou o checkout é antigo e não sabe mandar o comprador
+   * para lá), 'allow' (entram no sorteio com as demais) ou 'only' (a oferta
+   * foi vinculada à Shopify Payments: só elas).
+   */
+  link?: 'deny' | 'allow' | 'only' | null;
+}
+
+/** A conta pode atender esta sessão pelo tipo (link × formulário)? */
+export function linkModeAllows(provider: RoutingProvider, mode: RoutingContext['link']): boolean {
+  const link = isLinkProvider(provider);
+  if (mode === 'only') return link;
+  if (mode === 'allow') return true;
+  return !link;
 }
 
 export interface RoutingCandidate {
   id: string;
-  provider: OwnProvider;
+  provider: RoutingProvider;
   config: RoutingAccountConfig;
   stats: AccountStats;
   /** Credencial pronta para cobrar (conectada, sem chave recusada). */
@@ -458,7 +515,8 @@ export type IneligibleReason =
   | 'ticket'
   | 'warmup_ticket'
   | 'cap_usd'
-  | 'cap_orders';
+  | 'cap_orders'
+  | 'link_mode';
 
 /**
  * Pausa em vigor: manual (até o seller retomar), disputas (enquanto a taxa
@@ -513,6 +571,7 @@ export function ineligibility(
   opts: { ignoreCaps?: boolean; now?: number } = {},
 ): IneligibleReason | null {
   if (!candidate.chargeable) return 'not_chargeable';
+  if (!linkModeAllows(candidate.provider, ctx.link)) return 'link_mode';
   const pause = activePause(candidate, disputeLimitPct, opts.now);
   if (pause) return `paused_${pause}` as IneligibleReason;
 
@@ -664,7 +723,7 @@ export function isTechnicalFailure(result: any): boolean {
 
 export interface DisableCandidate {
   id: string;
-  provider: OwnProvider;
+  provider: RoutingProvider;
   priority: number;
   createdAt?: string | null;
 }

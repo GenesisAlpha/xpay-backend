@@ -95,9 +95,10 @@ export class OwnAccountFinanceService {
   /** Contas conectadas do seller (inclusive guardadas: o saldo continua lá). */
   async accounts(sellerId: string): Promise<OwnAccountSummary[]> {
     const view = await this.routing.view(sellerId);
-    return view.accounts.map(account => ({
+    // Loja Shopify (conta por link) não tem saldo nem saque na Koopfy.
+    return view.accounts.filter(account => !account.link).map(account => ({
       id: account.id,
-      provider: account.provider,
+      provider: account.provider as OwnAccountSummary['provider'],
       group: account.group,
       primary: account.primary,
       label: account.label,

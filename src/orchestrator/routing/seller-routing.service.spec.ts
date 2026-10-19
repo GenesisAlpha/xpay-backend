@@ -469,3 +469,66 @@ describe('tetos do dia e aquecimento', () => {
     expect(history.events[0]).toMatchObject({ action: 'routing.account_changed', details: { warmup_days: 10, warmup_start_usd_cents: 20000 } })
   })
 })
+
+describe('contas por link (lojas Shopify)', () => {
+  const shop = (id: string, extra: Record<string, any> = {}) => ({
+    id, seller_id: SELLER, provider: 'shopify', external_ref: `ck-${id}`, display_name: `Loja ${id}`,
+    shop_domain: `${id}.myshopify.com`, currencies: ['USD'], status: 'active', created_at: '2026-09-20T00:00:00Z', ...extra,
+  })
+
+  beforeEach(() => {
+    enableRouting({ card_strategy: 'orders_split' })
+    tables.seller_provider_accounts = [providerRow('aaa', 'stripe')]
+    tables.seller_link_accounts = [shop('s1'), shop('s2', { status: 'disabled' })]
+    routingConfig('stripel_aaa', { priority: 2 })
+    routingConfig('shopifyp_s1', { priority: 1, provider: 'shopify' })
+  })
+
+  it('checkout antigo (sem link) nunca recebe loja Shopify', async () => {
+    const pick = await build().resolveForConfig(SELLER, 'sess-1')
+    expect(pick?.card?.id).toBe('stripel_aaa')
+    expect(pick?.cardAccounts).toBe(1)
+  })
+
+  it("'only' escolhe só entre as lojas ativas e devolve a referência do backend", async () => {
+    const svc = build()
+    const pick = await svc.resolveForConfig(SELLER, 'sess-1', { link: 'only' })
+    expect(pick?.card).toMatchObject({ id: 'shopifyp_s1', provider: 'shopify', linkRef: 'ck-s1' })
+    expect(svc.linkPickOf(pick)).toEqual({ accountId: 'shopifyp_s1', provider: 'shopify', linkRef: 'ck-s1' })
+  })
+
+  it("'allow' mistura loja Shopify e Stripe pela estratégia (vendas do dia contam para a loja)", async () => {
+    tables.routing_link_sales = [{ provider_account_id: 'shopifyp_s1', seller_id: SELLER, sale_ref: 'o1', status: 'approved', amount_usd_gross_cents: 5000, disputed: false }]
+    const pick = await build().resolveForConfig(SELLER, 'sess-1', { link: 'allow' })
+    // A loja já tem 1 venda hoje e a Stripe 0: a divisão por pedidos manda para a Stripe.
+    expect(pick?.card?.id).toBe('stripel_aaa')
+    expect(pick?.cardAccounts).toBe(2)
+  })
+
+  it('aquecimento da loja: teto do dia cheio tira a loja do sorteio', async () => {
+    tables.seller_routing_accounts.find(r => r.provider_account_id === 'shopifyp_s1').warmup_started_at = '2026-09-28T03:00:00Z'
+    Object.assign(tables.seller_routing_accounts.find(r => r.provider_account_id === 'shopifyp_s1'), { warmup_days: 7, warmup_start_orders: 1 })
+    tables.routing_link_sales = [{ provider_account_id: 'shopifyp_s1', seller_id: SELLER, sale_ref: 'o1', status: 'approved', amount_usd_gross_cents: 5000, disputed: false }]
+    const pick = await build().resolveForConfig(SELLER, 'sess-1', { link: 'only' })
+    expect(pick?.card).toBeNull()
+    const view = await build().view(SELLER)
+    expect(view.accounts.find((a: any) => a.id === 'shopifyp_s1')).toMatchObject({ link: true, stage: 'warming', capReached: true, shopDomain: 's1.myshopify.com' })
+  })
+
+  it('venda pelo formulário nunca cai numa loja Shopify, mesmo com a sessão atribuída a ela', async () => {
+    const svc = build()
+    await svc.resolveForConfig(SELLER, 'sess-1', { link: 'only' })
+    await expect(svc.resolveForSale(SELLER, { method: 'card', routingKey: 'sess-1' })).rejects.toBeInstanceOf(ConflictException)
+    const sale = await svc.resolveForSale(SELLER, { method: 'card', routingKey: 'sess-1' })
+    expect(sale).toMatchObject({ kind: 'account', provider: 'stripe' })
+  })
+
+  it('registra a venda informada pelo backend e ela entra na estatística', async () => {
+    const svc = build()
+    await svc.recordLinkSale(SELLER, { provider: 'shopify', externalRef: 'ck-s1', saleRef: 'ord-9', status: 'chargeback', amountUsdGrossCents: 4700, disputed: true })
+    expect(tables.routing_link_sales).toEqual([expect.objectContaining({ provider_account_id: 'shopifyp_s1', sale_ref: 'ord-9', status: 'chargeback', disputed: true })])
+    const view = await svc.view(SELLER)
+    expect(view.accounts.find((a: any) => a.id === 'shopifyp_s1')?.stats).toMatchObject({ approved7d: 1, disputes7d: 1 })
+    await expect(svc.recordLinkSale(SELLER, { provider: 'shopify', externalRef: 'ck-s2-x', saleRef: 'o', status: 'approved', amountUsdGrossCents: 1 })).rejects.toThrow('não encontrada')
+  })
+})

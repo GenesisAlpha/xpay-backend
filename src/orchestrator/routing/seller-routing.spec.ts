@@ -505,3 +505,27 @@ describe('edição do aquecimento', () => {
     expect(() => parseAccountPatch({ warmup: 'sim' }, base, nowIso)).toThrow(/warmup/)
   })
 })
+
+describe('contas por link e fase da conta', () => {
+  const { accountStage, linkModeAllows, ownProviderOfId, groupOfProvider, defaultAccountConfig } = require('./seller-routing')
+  it('link: deny (padrão) só formulário, allow os dois, only só link', () => {
+    expect(linkModeAllows('shopify', undefined)).toBe(false)
+    expect(linkModeAllows('stripe', undefined)).toBe(true)
+    expect(linkModeAllows('shopify', 'allow')).toBe(true)
+    expect(linkModeAllows('whop', 'allow')).toBe(true)
+    expect(linkModeAllows('shopify', 'only')).toBe(true)
+    expect(linkModeAllows('stripe', 'only')).toBe(false)
+  })
+  it('id shopifyp_ é Shopify no grupo de cartão', () => {
+    expect(ownProviderOfId('shopifyp_abc')).toBe('shopify')
+    expect(groupOfProvider('shopify')).toBe('card')
+  })
+  it('fase: aquecendo, pronta para escalar e ativa', () => {
+    const base = defaultAccountConfig('shopifyp_x', 's', 'shopify')
+    const started = '2026-10-01T12:00:00Z'
+    const cfg = { ...base, warmup_started_at: started, warmup_days: 7, warmup_start_orders: 3 }
+    expect(accountStage(cfg, Date.parse('2026-10-03T12:00:00Z'))).toBe('warming')
+    expect(accountStage(cfg, Date.parse('2026-10-09T12:00:00Z'))).toBe('ready_to_scale')
+    expect(accountStage(base, Date.parse('2026-10-09T12:00:00Z'))).toBe('active')
+  })
+})
