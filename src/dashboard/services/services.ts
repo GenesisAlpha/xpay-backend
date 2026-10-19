@@ -7,6 +7,7 @@ import { Injectable, BadRequestException, ConflictException, NotFoundException, 
 import { formatBusinessDate } from '../../shared/business-time'
 import { WhopPayoutDestinationsService } from '../../orchestrator/whop/whop-payout-destinations.service'
 import { supabase } from '../../lib/supabase.client'
+import { catalogEnabledMethods, catalogMethodId } from './payment-method-catalog'
 import { invalidateApiKeyCache } from '../../middleware/api-key-cache';
 import * as bcrypt from 'bcrypt';
 import { generateKey, hashKey } from '../../utils/apikeys.utils';
@@ -1209,7 +1210,17 @@ export class PaymentMethodsService {
     const { data: profile } = await supabase
       .from('seller_profiles').select('enabled_methods, config, provider_default').eq('id', sellerId).single()
 
-    const enabledMethods: string[] = profile?.enabled_methods ?? []
+    // Stripe ou Whop própria ativa: cartão e wallets saem por ela.
+    const [{ count: ownStripe }, { count: ownWhop }] = await Promise.all([
+      supabase.from('seller_provider_accounts').select('id', { count: 'exact', head: true })
+        .eq('seller_id', sellerId).eq('provider', 'stripe').eq('status', 'active'),
+      supabase.from('whop_linked_accounts').select('seller_id', { count: 'exact', head: true })
+        .eq('seller_id', sellerId).eq('status', 'active'),
+    ])
+    const enabledMethods = catalogEnabledMethods({
+      enabledMethods: profile?.enabled_methods,
+      ownCardAccount: Boolean(ownStripe) || Boolean(ownWhop),
+    })
     const isWhopSeller = String(profile?.provider_default ?? '').toLowerCase().replace(/provider$/, '') === 'whop'
 
     // Tarifa efetiva (a do seller ou o padrão).
@@ -1235,7 +1246,7 @@ export class PaymentMethodsService {
 
     const metricsByMethod: Record<string, { volume: number; txs: number; approved: number; total: number }> = {}
     for (const k of kpis ?? []) {
-      const method = ({ credit_card: 'card', debit_card: 'card', mbway: 'mb_way', sepa: 'sepa_debit' } as Record<string, string>)[k.method] ?? k.method
+      const method = catalogMethodId(k.method)
       if (!metricsByMethod[method]) metricsByMethod[method] = { volume: 0, txs: 0, approved: 0, total: 0 }
       // 🔥 approved_volume em centavos USD → USD
       metricsByMethod[method].volume += fromCents(k.approved_volume)
@@ -1305,7 +1316,7 @@ export class PaymentMethodsService {
         // Na Whop os métodos padrão são resolvidos automaticamente por país,
         // moeda, dispositivo e elegibilidade do comprador.
         // SPEI não é método da Whop: só vale para quem o tem liberado no cadastro (Clip).
-        enabled: m.id === 'spei' ? enabledMethods.includes('spei') : isWhopSeller || enabledMethods.includes(m.id),
+        enabled: m.id === 'spei' ? enabledMethods.has('spei') : isWhopSeller || enabledMethods.has(m.id),
         volume,           // já convertido via fromCents
         transactions: txs,
         approvalRate: rate,
