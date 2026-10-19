@@ -187,6 +187,8 @@ export interface RoutingAccountConfig {
   warmup_growth_pct: number | null;
   /** Ticket máximo enquanto aquece. */
   warmup_max_ticket_usd_cents: number | null;
+  /** Métodos que a conta oferece no checkout (null = todos os que ela atende). */
+  methods: string[] | null;
 }
 
 export function defaultAccountConfig(id: string, sellerId: string, provider: RoutingProvider): RoutingAccountConfig {
@@ -211,6 +213,7 @@ export function defaultAccountConfig(id: string, sellerId: string, provider: Rou
     warmup_start_usd_cents: null,
     warmup_growth_pct: null,
     warmup_max_ticket_usd_cents: null,
+    methods: null,
   };
 }
 
@@ -238,7 +241,33 @@ export function normalizeAccountConfig(row: any, fallback: RoutingAccountConfig)
     warmup_start_usd_cents: num(row.warmup_start_usd_cents),
     warmup_growth_pct: num(row.warmup_growth_pct),
     warmup_max_ticket_usd_cents: num(row.warmup_max_ticket_usd_cents),
+    methods: Array.isArray(row.methods) && row.methods.length
+      ? Array.from(new Set(row.methods.map((m: any) => canonicalMethod(m)).filter(Boolean))) as string[]
+      : null,
   };
+}
+
+// ─── Métodos por conta ────────────────────────────────────────────────────
+
+/**
+ * Nome único do método: o pay fala 'credit_card'/'debit_card', o checkout
+ * fala 'card'. Tudo do cartão vira 'card'; o resto vai em minúsculas.
+ */
+export function canonicalMethod(value: unknown): string {
+  const m = String(value ?? '').trim().toLowerCase();
+  return m === 'credit_card' || m === 'debit_card' ? 'card' : m;
+}
+
+/** A conta oferece este método? Sem lista configurada, todos os dela. */
+export function methodAllowed(config: Pick<RoutingAccountConfig, 'methods'>, method: unknown): boolean {
+  if (!config.methods?.length) return true;
+  return config.methods.includes(canonicalMethod(method));
+}
+
+/** Os métodos da conta que o seller deixou ligados (mantém a grafia de origem). */
+export function applyAccountMethods<T>(methods: T[], config: Pick<RoutingAccountConfig, 'methods'> | null | undefined): T[] {
+  if (!config?.methods?.length) return methods;
+  return methods.filter(method => methodAllowed(config, method));
 }
 
 // ─── Aquecimento ──────────────────────────────────────────────────────────
@@ -484,6 +513,8 @@ export interface RoutingContext {
    * foi vinculada à Shopify Payments: só elas).
    */
   link?: 'deny' | 'allow' | 'only' | null;
+  /** Método da venda (só no pagamento): a conta precisa oferecê-lo. */
+  method?: string | null;
 }
 
 /** A conta pode atender esta sessão pelo tipo (link × formulário)? */
@@ -516,7 +547,8 @@ export type IneligibleReason =
   | 'warmup_ticket'
   | 'cap_usd'
   | 'cap_orders'
-  | 'link_mode';
+  | 'link_mode'
+  | 'method';
 
 /**
  * Pausa em vigor: manual (até o seller retomar), disputas (enquanto a taxa
@@ -572,6 +604,7 @@ export function ineligibility(
 ): IneligibleReason | null {
   if (!candidate.chargeable) return 'not_chargeable';
   if (!linkModeAllows(candidate.provider, ctx.link)) return 'link_mode';
+  if (ctx.method && !methodAllowed(candidate.config, ctx.method)) return 'method';
   const pause = activePause(candidate, disputeLimitPct, opts.now);
   if (pause) return `paused_${pause}` as IneligibleReason;
 
@@ -801,6 +834,16 @@ export function parseAccountPatch(body: Record<string, any>, current: RoutingAcc
   };
   codes('countries', 'countries', /^[A-Z]{2}$/, 'País');
   codes('currencies', 'currencies', /^[A-Z]{3}$/, 'Moeda');
+  if (has('methods')) {
+    const raw = body.methods;
+    if (raw === null || raw === '' || (Array.isArray(raw) && !raw.length)) patch.methods = null;
+    else {
+      const list = (Array.isArray(raw) ? raw : String(raw).split(',')).map(canonicalMethod).filter(Boolean);
+      const invalid = list.filter(m => !/^[a-z][a-z0-9_]{1,29}$/.test(m));
+      if (invalid.length) errors.push(`Método inválido: ${invalid.join(', ')}.`);
+      else patch.methods = Array.from(new Set(list)).slice(0, 40);
+    }
+  }
 
   if (has('paused')) {
     if (body.paused === true) {

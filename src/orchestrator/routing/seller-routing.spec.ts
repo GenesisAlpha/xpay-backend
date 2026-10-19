@@ -529,3 +529,30 @@ describe('contas por link e fase da conta', () => {
     expect(accountStage(base, Date.parse('2026-10-09T12:00:00Z'))).toBe('active')
   })
 })
+
+describe('métodos por conta', () => {
+  const { canonicalMethod, methodAllowed, applyAccountMethods, parseAccountPatch, defaultAccountConfig, ineligibility, emptyStats } = require('./seller-routing')
+  const base = defaultAccountConfig('stripel_a', 's', 'stripe')
+  it('cartão tem um nome só', () => {
+    expect(canonicalMethod('credit_card')).toBe('card')
+    expect(canonicalMethod('Debit_Card')).toBe('card')
+    expect(canonicalMethod('apple_pay')).toBe('apple_pay')
+  })
+  it('sem lista, tudo; com lista, só os ligados (mantendo a grafia de origem)', () => {
+    expect(applyAccountMethods(['credit_card', 'pix', 'apple_pay'], base)).toEqual(['credit_card', 'pix', 'apple_pay'])
+    const cfg = { ...base, methods: ['card', 'apple_pay'] }
+    expect(applyAccountMethods(['credit_card', 'pix', 'apple_pay'], cfg)).toEqual(['credit_card', 'apple_pay'])
+    expect(methodAllowed(cfg, 'pix')).toBe(false)
+  })
+  it('venda com método desligado não fica na conta', () => {
+    const candidate = { id: 'stripel_a', provider: 'stripe', config: { ...base, methods: ['card'] }, stats: emptyStats(), chargeable: true, breakerOpen: false }
+    expect(ineligibility(candidate, { method: 'pix' }, 0.75)).toBe('method')
+    expect(ineligibility(candidate, { method: 'credit_card' }, 0.75)).toBeNull()
+    expect(ineligibility(candidate, {}, 0.75)).toBeNull()
+  })
+  it('PUT aceita a lista, normaliza e recusa lixo; vazio volta a tudo', () => {
+    expect(parseAccountPatch({ methods: ['credit_card', 'PIX', 'pix'] }, base, 'now')).toEqual({ methods: ['card', 'pix'] })
+    expect(parseAccountPatch({ methods: [] }, base, 'now')).toEqual({ methods: null })
+    expect(() => parseAccountPatch({ methods: ['<script>'] }, base, 'now')).toThrow('Método inválido')
+  })
+})

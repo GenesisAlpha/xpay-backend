@@ -129,6 +129,18 @@ describe('/payments/config', () => {
   })
 })
 
+describe('/payments/config com métodos por conta', () => {
+  it('a conta da sessão só mostra os métodos que o seller deixou ligados nela', async () => {
+    const config = await service({
+      resolveForConfig: async () => ({
+        card: { id: 'stripel_aaa', provider: 'stripe', account: stripeAccount, config: { methods: ['card'] } },
+        paypal: null, cardAccounts: 1, paypalAccounts: 0, routingKey: 'sess-1',
+      }),
+    }).getPaymentConfig('s-1', { routingKey: 'sess-1' })
+    expect(config.methods).toEqual(['credit_card'])
+  })
+})
+
 describe('/payments/config com loja Shopify (conta por link)', () => {
   it('sessão atribuída à loja: devolve o link, sem formulário nem PayPal', async () => {
     const resolveForConfig = jest.fn(async () => ({

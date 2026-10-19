@@ -532,3 +532,27 @@ describe('contas por link (lojas Shopify)', () => {
     await expect(svc.recordLinkSale(SELLER, { provider: 'shopify', externalRef: 'ck-s2-x', saleRef: 'o', status: 'approved', amountUsdGrossCents: 1 })).rejects.toThrow('não encontrada')
   })
 })
+
+describe('métodos por conta no roteamento', () => {
+  beforeEach(() => {
+    enableRouting({ card_strategy: 'priority_cap' })
+    tables.seller_provider_accounts = [providerRow('aaa', 'stripe'), providerRow('bbbb', 'whop')]
+    tables.seller_profiles = [{ id: SELLER, enabled_methods: ['credit_card', 'pix', 'apple_pay', 'paypal'] }]
+    routingConfig('stripel_aaa', { priority: 1, methods: ['card'] })
+    routingConfig('whopa_bbbb', { priority: 2, provider: 'whop' })
+  })
+
+  it('a visão mostra o que cada conta atende e o que está ligado', async () => {
+    const view = await build().view(SELLER)
+    expect(view.accounts.find((a: any) => a.id === 'whopa_bbbb')).toMatchObject({ availableMethods: ['card', 'pix', 'apple_pay'], enabledMethods: null })
+    expect(view.accounts.find((a: any) => a.id === 'stripel_aaa')).toMatchObject({ enabledMethods: ['card'] })
+  })
+
+  it('Pix numa sessão da Stripe só-cartão vai para a Whop (409 e recarrega)', async () => {
+    const svc = build()
+    expect((await svc.resolveForConfig(SELLER, 'sess-1'))?.card?.id).toBe('stripel_aaa')
+    await expect(svc.resolveForSale(SELLER, { method: 'pix', routingKey: 'sess-1' })).rejects.toBeInstanceOf(ConflictException)
+    expect((await svc.resolveForConfig(SELLER, 'sess-1'))?.card?.id).toBe('whopa_bbbb')
+    expect(await svc.resolveForSale(SELLER, { method: 'pix', routingKey: 'sess-1' })).toMatchObject({ kind: 'account', entry: { id: 'whopa_bbbb' } })
+  })
+})

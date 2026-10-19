@@ -35,6 +35,7 @@ import {
   StatsTxRow,
   accountStage,
   activePause,
+  canonicalMethod,
   capReached,
   computeStats,
   computeToday,
@@ -472,7 +473,8 @@ export class SellerRoutingService implements OnModuleInit {
     if (await sellerUsesKoopfyPayments(sellerId)) return null;
 
     const group = groupOfMethod(args.method);
-    const ctx = { ...(args.ctx ?? {}), link: 'deny' as const };
+    // O método entra na escolha: conta com o método desligado não recebe a venda.
+    const ctx = { ...(args.ctx ?? {}), link: 'deny' as const, method: args.method ?? null };
     const pool = await this.loadPool(sellerId, settings);
     this.syncAutoPauses(sellerId, pool, settings);
     // Conta por link não cobra pelo formulário: fica fora da venda.
@@ -777,6 +779,7 @@ export class SellerRoutingService implements OnModuleInit {
       || a.config.priority - b.config.priority
       || String(a.createdAt ?? '').localeCompare(String(b.createdAt ?? ''));
 
+    const available = await this.availableMethods(sellerId, pool);
     return {
       enabled: settings.enabled,
       enabledAt: settings.enabledAt,
@@ -799,6 +802,9 @@ export class SellerRoutingService implements OnModuleInit {
           link: isLinkProvider(entry.provider),
           ...(entry.shopDomain ? { shopDomain: entry.shopDomain } : {}),
           stage: accountStage(entry.config, now),
+          // O que a conta atende (lido dela) e o que o seller deixou ligado (null = tudo).
+          availableMethods: available.get(entry.id) ?? [],
+          enabledMethods: entry.config.methods,
           label: entry.config.label,
           accountName: entry.accountName,
           ...(entry.mode ? { mode: entry.mode } : {}),
@@ -849,6 +855,28 @@ export class SellerRoutingService implements OnModuleInit {
         };
       }),
     };
+  }
+
+  /**
+   * Métodos que cada conta atende: Stripe pela configuração da própria conta
+   * (cartão, carteiras e métodos locais ligados nela), Whop pelos métodos do
+   * seller, PayPal só PayPal e loja Shopify pelo checkout dela.
+   */
+  private async availableMethods(sellerId: string, pool: PoolEntry[]): Promise<Map<string, string[]>> {
+    const { data: seller } = await supabase.from('seller_profiles').select('enabled_methods').eq('id', sellerId).maybeSingle();
+    const sellerMethods: string[] = Array.isArray((seller as any)?.enabled_methods) ? (seller as any).enabled_methods : [];
+    const canon = (list: string[]) => Array.from(new Set(list.map(canonicalMethod).filter(Boolean)));
+    const out = new Map<string, string[]>();
+    await Promise.all(pool.map(async entry => {
+      if (entry.provider === 'paypal') out.set(entry.id, ['paypal']);
+      else if (entry.provider === 'shopify') out.set(entry.id, ['shopify_checkout']);
+      else if (entry.provider === 'stripe') {
+        let read: string[] | null = null;
+        try { read = entry.account ? await this.router.ownStripeMethods(entry.account as any) : null; } catch { read = null; }
+        out.set(entry.id, canon(read ?? ['credit_card', 'apple_pay', 'google_pay']));
+      } else out.set(entry.id, canon(sellerMethods.filter(m => canonicalMethod(m) !== 'paypal')));
+    }));
+    return out;
   }
 
   /**

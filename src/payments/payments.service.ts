@@ -15,6 +15,7 @@ import {
     isStripeOwnAccountId,
     paypalCaptureMismatch,
 } from '../orchestrator/seller-provider/seller-provider-accounts'
+import { applyAccountMethods } from '../orchestrator/routing/seller-routing'
 import { SellerRoutingService, RoutingSalePick, normalizeRoutingKey } from '../orchestrator/routing/seller-routing.service'
 import { ownAccountCommissionUsdCents } from '../orchestrator/routing/seller-routing'
 import { PaypalProvider } from '../orchestrator/providers/paypal.provider'
@@ -1861,7 +1862,8 @@ export class PaymentService {
         return {
             ...legacy,
             provider: cardProvider,
-            methods: !card ? [] : cardProvider === 'stripe' ? await stripeMethods(card) : sellerMethods,
+            // Métodos que o seller deixou ligados nesta conta (roteamento › métodos).
+            methods: !card ? [] : applyAccountMethods(cardProvider === 'stripe' ? await stripeMethods(card) : sellerMethods, pick.card?.config),
             providerConfig: card
                 ? this.buildProviderPublicConfig(
                     cardProvider as string,
