@@ -81,7 +81,12 @@ describe('/payments/config', () => {
   it('roteamento desligado: o mesmo config de antes + routing.enabled=false', async () => {
     const resolveForConfig = jest.fn(async () => null)
     const config = await service({ resolveForConfig }).getPaymentConfig('s-1', { routingKey: 'sess-1' })
-    expect(resolveForConfig).toHaveBeenCalledWith('s-1', 'sess-1', { country: null, currency: null, link: 'deny' })
+    expect(resolveForConfig).toHaveBeenCalledWith(
+      's-1', 'sess-1',
+      { country: null, currency: null, link: 'deny', linkProviders: ['shopify'] },
+      // O cadastro já lido vai junto: a escolha por slot não relê o seller.
+      { sellerMethods: ['credit_card', 'apple_pay'] },
+    )
     expect(config).toEqual({
       active: true,
       provider: 'whop',
@@ -148,7 +153,7 @@ describe('/payments/config com loja Shopify (conta por link)', () => {
       paypal: null, cardAccounts: 2, paypalAccounts: 0, routingKey: 'sess-9',
     }))
     const config = await service({ resolveForConfig }).getPaymentConfig('s-1', { routingKey: 'sess-9', link: 'allow' })
-    expect(resolveForConfig).toHaveBeenCalledWith('s-1', 'sess-9', expect.objectContaining({ link: 'allow' }))
+    expect(resolveForConfig).toHaveBeenCalledWith('s-1', 'sess-9', expect.objectContaining({ link: 'allow' }), expect.anything())
     expect(config).toMatchObject({
       provider: 'shopify_payments', methods: [], paypal: null,
       providerConfig: { provider: 'shopify_payments', cardFlow: 'link', providerAccountId: 'shopifyp_s1', linkRef: 'ck-1' },
@@ -158,7 +163,62 @@ describe('/payments/config com loja Shopify (conta por link)', () => {
   it('valor de link desconhecido vira deny', async () => {
     const resolveForConfig = jest.fn(async () => null)
     await service({ resolveForConfig }).getPaymentConfig('s-1', { routingKey: 'sess-9', link: 'qualquer' })
-    expect(resolveForConfig).toHaveBeenCalledWith('s-1', 'sess-9', expect.objectContaining({ link: 'deny' }))
+    expect(resolveForConfig).toHaveBeenCalledWith('s-1', 'sess-9', expect.objectContaining({ link: 'deny' }), expect.anything())
+  })
+})
+
+describe('/payments/config com routing.slots', () => {
+  const paypal = { id: 'paypall_c', provider: 'paypal', apiKey: 'client-c', config: { mode: 'test' } }
+  const whopPix = { id: 'whopa_pix', provider: 'whop', status: 'active', config: { company_id: 'biz_pix', linked: true } }
+  const entry = (id: string, provider: string, account: any, methods: string[], extra: Record<string, any> = {}) =>
+    ({ id, provider, account, methods, config: { methods: null }, ...extra })
+
+  it('cada slot sai com a conta, os métodos do slot e a credencial do provedor dela; campos antigos pelo cartão', async () => {
+    const card = entry('stripel_aaa', 'stripe', stripeAccount, ['credit_card', 'apple_pay', 'google_pay'])
+    const slots = new Map<string, any>([
+      ['card', card],
+      ['paypal', entry('paypall_c', 'paypal', paypal, ['paypal'])],
+      ['pix', entry('whopa_pix', 'whop', whopPix, ['credit_card', 'pix'])],
+    ])
+    const config: any = await service({
+      resolveForConfig: async () => ({ card, paypal: slots.get('paypal'), cardAccounts: 2, paypalAccounts: 1, routingKey: 'sess-1', slots }),
+    }).getPaymentConfig('s-1', { routingKey: 'sess-1' })
+    // Campos antigos: iguais aos de antes (slot do cartão).
+    expect(config).toMatchObject({
+      provider: 'stripe',
+      providerConfig: { provider: 'stripe', publishableKey: 'pk_live_aaa' },
+      paypal: { clientId: 'client-c' },
+      routing: { cardAccountId: 'stripel_aaa', cardProvider: 'stripe', paypalAccountId: 'paypall_c' },
+    })
+    expect(config.routing.slots).toEqual([
+      { slot: 'card', accountId: 'stripel_aaa', provider: 'stripe', methods: ['credit_card', 'apple_pay', 'google_pay'], providerConfig: expect.objectContaining({ provider: 'stripe', publishableKey: 'pk_live_aaa', providerAccountId: 'stripel_aaa' }) },
+      { slot: 'paypal', accountId: 'paypall_c', provider: 'paypal', methods: ['paypal'], providerConfig: { clientId: 'client-c', mode: 'test', charging: true } },
+      { slot: 'pix', accountId: 'whopa_pix', provider: 'whop', methods: ['pix'], providerConfig: expect.objectContaining({ provider: 'whop', accountId: 'biz_pix' }) },
+    ])
+  })
+
+  it('cartão numa Digistore24: link no cartão e os outros slots continuam', async () => {
+    const card = entry('digistp_d1', 'digistore24', null, ['digistore_checkout'], { linkRef: 'dg-1' })
+    const slots = new Map<string, any>([['card', card], ['paypal', entry('paypall_c', 'paypal', paypal, ['paypal'])]])
+    const resolveForConfig = jest.fn(async () => ({ card, paypal: slots.get('paypal'), cardAccounts: 1, paypalAccounts: 1, routingKey: 'sess-2', slots }))
+    const config: any = await service({ resolveForConfig }).getPaymentConfig('s-1', { routingKey: 'sess-2', link: 'allow', linkProviders: 'shopify,digistore24,lixo' })
+    expect(resolveForConfig).toHaveBeenCalledWith('s-1', 'sess-2', expect.objectContaining({ link: 'allow', linkProviders: ['shopify', 'digistore24'] }), expect.anything())
+    expect(config).toMatchObject({
+      provider: 'digistore24', methods: [], paypal: null,
+      providerConfig: { provider: 'digistore24', cardFlow: 'link', providerAccountId: 'digistp_d1', linkRef: 'dg-1' },
+      routing: { cardAccountId: 'digistp_d1', cardProvider: 'digistore24', paypalAccountId: 'paypall_c' },
+    })
+    expect(config.routing.slots.map((s: any) => [s.slot, s.provider])).toEqual([['card', 'digistore24'], ['paypal', 'paypal']])
+    expect(config.routing.slots[0].providerConfig).toEqual({ provider: 'digistore24', cardFlow: 'link', providerAccountId: 'digistp_d1', linkRef: 'dg-1' })
+  })
+
+  it('pick sem slots (serviço antigo nos testes): slots saem do cartão e do PayPal', async () => {
+    const config: any = await service({
+      resolveForConfig: async () => ({
+        card: entry('whopa_bbb', 'whop', whopExtra, ['credit_card']), paypal: null, cardAccounts: 1, paypalAccounts: 0, routingKey: 'sess-3',
+      }),
+    }).getPaymentConfig('s-1', { routingKey: 'sess-3' })
+    expect(config.routing.slots).toEqual([expect.objectContaining({ slot: 'card', accountId: 'whopa_bbb', provider: 'whop', methods: ['credit_card'] })])
   })
 })
 

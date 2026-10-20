@@ -15,8 +15,8 @@ import {
     isStripeOwnAccountId,
     paypalCaptureMismatch,
 } from '../orchestrator/seller-provider/seller-provider-accounts'
-import { applyAccountMethods } from '../orchestrator/routing/seller-routing'
-import { SellerRoutingService, RoutingSalePick, normalizeRoutingKey } from '../orchestrator/routing/seller-routing.service'
+import { applyAccountMethods, parseLinkProviders, slotOfMethod } from '../orchestrator/routing/seller-routing'
+import { PoolEntry, SellerRoutingService, RoutingSalePick, normalizeRoutingKey } from '../orchestrator/routing/seller-routing.service'
 import { ownAccountCommissionUsdCents } from '../orchestrator/routing/seller-routing'
 import { PaypalProvider } from '../orchestrator/providers/paypal.provider'
 import { validateMbwayPhone } from '../utils/mbway.validator'
@@ -301,6 +301,8 @@ export class PaymentService {
                 orderRef: dto.metadata?.order_number ?? dto.metadata?.orderId ?? null,
                 providerAccountId: dto.providerAccountId ?? null,
                 idempotencyKey: dto.idempotencyKey ?? null,
+                // Já lido com o seller: a escolha por slot não relê o cadastro.
+                sellerMethods: Array.isArray(seller?.enabled_methods) ? seller.enabled_methods : null,
             })
             : null
         const routedOwn = routingSale?.kind === 'account' ? routingSale : null
@@ -1709,7 +1711,9 @@ export class PaymentService {
         sellerId: string,
         // Roteamento de contas: chave da sessão do comprador (id da checkout
         // session) e, quando o checkout já sabe, país/moeda para os filtros.
-        routingOpts: { routingKey?: string | null; country?: string | null; currency?: string | null; link?: string | null } = {},
+        // `linkProviders` (CSV de shopify,digistore24): quais contas por link
+        // podem concorrer ao cartão; sem ele, só Shopify (como antes).
+        routingOpts: { routingKey?: string | null; country?: string | null; currency?: string | null; link?: string | null; linkProviders?: string | null } = {},
     ) {
         const { data: seller } = await supabase
             .from('seller_profiles')
@@ -1820,12 +1824,25 @@ export class PaymentService {
                 // a oferta cabe no checkout da Shopify ('allow') ou foi vinculada
                 // a ela ('only'). Checkout antigo não manda → nunca por link.
                 link: routingOpts.link === 'allow' || routingOpts.link === 'only' ? routingOpts.link : 'deny',
-            }).catch((err: any) => {
+                linkProviders: parseLinkProviders(routingOpts.linkProviders),
+            }, { sellerMethods }).catch((err: any) => {
                 console.error('[PaymentService] getPaymentConfig: roteamento indisponível:', err?.message)
                 return null
             })
             : null
         if (!pick) return { ...legacy, routing: { enabled: false } }
+
+        // Conta de cada slot (cartão e carteiras, PayPal, Pix…), com a mesma
+        // credencial pública que os campos antigos levam para esse provedor.
+        // Checkout novo monta cada método com a conta do seu slot; o antigo
+        // segue nos campos de sempre, calculados pelo slot do cartão.
+        const slotEntries: Array<[string, PoolEntry]> = pick.slots
+            ? [...pick.slots]
+            : ([['card', pick.card], ['paypal', pick.paypal]] as Array<[string, PoolEntry | null]>)
+                .filter((item): item is [string, PoolEntry] => Boolean(item[1]))
+        const slots = slotEntries
+            .map(([slot, entry]) => this.routingSlotConfig(slot, entry, seller.config))
+            .filter((item): item is NonNullable<typeof item> => item !== null)
 
         const routing = {
             enabled: true,
@@ -1833,20 +1850,24 @@ export class PaymentService {
             cardAccountId: pick.card?.id ?? null,
             cardProvider: pick.card?.provider ?? null,
             paypalAccountId: pick.paypal?.id ?? null,
+            slots,
         }
         const paypal = pick.paypalAccounts > 0
             ? (pick.paypal?.account ? paypalPublicConfig(pick.paypal.account) : null)
             : legacy.paypal
 
-        // Conta por link (loja Shopify): a sessão paga no checkout da loja. O
-        // backend do checkout cria o pedido nela; nada de formulário aqui.
+        // Conta por link (loja Shopify, Digistore24): o cartão desta sessão é
+        // pago fora (checkout da loja / formulário Digistore). O backend do
+        // checkout cria o pedido nela; nada de formulário aqui. Os outros
+        // slots seguem em routing.slots.
         const linkPick = this.sellerRouting?.linkPickOf(pick) ?? null
         if (linkPick) {
+            const linkProvider = linkPick.provider === 'digistore24' ? 'digistore24' : 'shopify_payments'
             return {
                 ...legacy,
-                provider: 'shopify_payments',
+                provider: linkProvider,
                 methods: [],
-                providerConfig: { provider: 'shopify_payments', cardFlow: 'link' as const, providerAccountId: linkPick.accountId, linkRef: linkPick.linkRef },
+                providerConfig: { provider: linkProvider, cardFlow: 'link' as const, providerAccountId: linkPick.accountId, linkRef: linkPick.linkRef },
                 paypal: null,
                 routing: { ...routing, cardProvider: linkPick.provider },
             }
@@ -1875,6 +1896,44 @@ export class PaymentService {
                 : null,
             paypal,
             routing,
+        }
+    }
+
+    /**
+     * Um item de routing.slots: a conta do slot, os métodos dela NESTE slot
+     * (grafia do pay, ex.: card → credit_card/apple_pay/google_pay) e a
+     * credencial pública no formato de hoje para o provedor.
+     */
+    private routingSlotConfig(slot: string, entry: PoolEntry, sellerConfig: any) {
+        if (entry.provider === 'shopify' || entry.provider === 'digistore24') {
+            if (!entry.linkRef) return null
+            const provider = entry.provider === 'digistore24' ? 'digistore24' : 'shopify_payments'
+            return {
+                slot,
+                accountId: entry.id,
+                provider,
+                methods: ['credit_card'],
+                providerConfig: { provider, cardFlow: 'link' as const, providerAccountId: entry.id, linkRef: entry.linkRef },
+            }
+        }
+        const account = entry.account
+        if (!account) return null
+        const methods = (entry.methods ?? []).filter(method => slotOfMethod(method) === slot)
+        if (entry.provider === 'paypal') {
+            return { slot, accountId: entry.id, provider: 'paypal', methods: methods.length ? methods : ['paypal'], providerConfig: paypalPublicConfig(account) }
+        }
+        return {
+            slot,
+            accountId: entry.id,
+            provider: entry.provider,
+            methods,
+            providerConfig: this.buildProviderPublicConfig(
+                entry.provider,
+                null,
+                sellerConfig,
+                entry.provider === 'stripe' ? account : null,
+                entry.provider === 'whop' ? account : null,
+            ),
         }
     }
 

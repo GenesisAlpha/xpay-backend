@@ -2,11 +2,17 @@
 // ROTEAMENTO DE CONTAS PRÓPRIAS DO SELLER — regras puras
 // ----------------------------------------------------------------------------
 // Com o roteamento ligado o seller tem várias contas por provedor e a Koopfy
-// escolhe, por sessão do comprador, em qual delas a venda sai. Dois grupos:
+// escolhe, por sessão do comprador, em qual delas a venda sai. O pool é um
+// só; a divisão é por SLOT de método, cada slot com a sua estratégia:
 //
-//   • cartão → Whop (principal `whopl_…` e extras `whopa_…`) e Stripe
-//              (`stripel_…`) misturadas: atendem cartão, pix, apple, google…
-//   • PayPal → contas PayPal (`paypall_…`): só o método `paypal`.
+//   • 'card'   → cartão, Apple Pay e Google Pay juntos ("Cartão e carteiras"):
+//                o mesmo formulário Stripe/Whop desenha os três. Whop
+//                (principal `whopl_…` e extras `whopa_…`), Stripe (`stripel_…`)
+//                e as contas por link (Shopify `shopifyp_…`, Digistore24
+//                `digistp_…`) concorrem aqui;
+//   • 'paypal' → contas PayPal (`paypall_…`): só o método `paypal`;
+//   • os demais (pix, ideal, mbway…) → um slot por método, com as contas que
+//                o oferecem.
 //
 // Tudo aqui é determinístico dado o que entra (métricas, configuração e o
 // sorteio injetado): é o que deixa testar cada estratégia sem banco nem rede.
@@ -19,11 +25,13 @@ import { OwnProvider, isPaypalOwnAccountId, isStripeOwnAccountId, isWhopExtraAcc
 
 export type RoutingStrategy = 'orders_split' | 'revenue_split' | 'priority_cap' | 'score';
 /**
- * Provedor de uma conta no roteamento. 'shopify' é conta por LINK: o comprador
- * paga no checkout da loja Shopify do seller (Shopify Payments), não no
- * formulário da Koopfy. Entra no grupo de cartão, com as mesmas regras.
+ * Provedor de uma conta no roteamento. 'shopify' e 'digistore24' são contas
+ * por LINK: o comprador paga no checkout da loja Shopify do seller (Shopify
+ * Payments) ou no formulário de pedido da Digistore24, não no formulário da
+ * Koopfy. Atendem só o slot do cartão, com as mesmas regras.
  */
-export type RoutingProvider = OwnProvider | 'shopify';
+export type RoutingProvider = OwnProvider | 'shopify' | 'digistore24';
+/** Só o campo `group` do painel antigo: 'paypal' para PayPal, 'card' para o resto. */
 export type RoutingGroup = 'card' | 'paypal';
 export type RoutingPauseReason = 'manual' | 'disputes' | 'errors';
 
@@ -77,48 +85,184 @@ export function routingDayStartMs(ms: number): number {
 
 // ─── Ids ──────────────────────────────────────────────────────────────────
 
-// Conta por link (seller_link_accounts): `shopifyp_<uuid>`.
+// Conta por link (seller_link_accounts): `shopifyp_<uuid>` e `digistp_<uuid>`.
+// O prefixo cabe na regex do backend do checkout (`^[a-z]{4,8}_`).
 const SHOPIFY_LINK_PREFIX = 'shopifyp_';
+const DIGISTORE_LINK_PREFIX = 'digistp_';
 
 export function toShopifyLinkAccountId(rowId: string): string {
   return `${SHOPIFY_LINK_PREFIX}${rowId}`;
 }
 
+export function toDigistoreLinkAccountId(rowId: string): string {
+  return `${DIGISTORE_LINK_PREFIX}${rowId}`;
+}
+
 export function isLinkAccountId(id: string | null | undefined): boolean {
-  return typeof id === 'string' && id.startsWith(SHOPIFY_LINK_PREFIX);
+  return typeof id === 'string' && (id.startsWith(SHOPIFY_LINK_PREFIX) || id.startsWith(DIGISTORE_LINK_PREFIX));
 }
 
 export function linkRowIdOf(id: string): string | null {
-  return isLinkAccountId(id) ? id.slice(SHOPIFY_LINK_PREFIX.length) : null;
+  if (typeof id !== 'string') return null;
+  if (id.startsWith(SHOPIFY_LINK_PREFIX)) return id.slice(SHOPIFY_LINK_PREFIX.length);
+  if (id.startsWith(DIGISTORE_LINK_PREFIX)) return id.slice(DIGISTORE_LINK_PREFIX.length);
+  return null;
 }
 
+/** Provedores por link: o comprador sai do checkout da Koopfy para pagar. */
+export const LINK_PROVIDERS = ['shopify', 'digistore24'] as const;
+
 /** Conta por link (o comprador sai do checkout da Koopfy para pagar)? */
-export function isLinkProvider(provider: RoutingProvider | null | undefined): boolean {
-  return provider === 'shopify';
+export function isLinkProvider(provider: RoutingProvider | string | null | undefined): boolean {
+  return provider === 'shopify' || provider === 'digistore24';
 }
 
 /** Provedor de uma conta própria pelo prefixo do id, ou null se não é própria. */
 export function ownProviderOfId(id: string | null | undefined): RoutingProvider | null {
-  if (isLinkAccountId(id)) return 'shopify';
+  if (typeof id === 'string' && id.startsWith(SHOPIFY_LINK_PREFIX)) return 'shopify';
+  if (typeof id === 'string' && id.startsWith(DIGISTORE_LINK_PREFIX)) return 'digistore24';
   if (isLinkedProviderAccountId(id) || isWhopExtraAccountId(id)) return 'whop';
   if (isStripeOwnAccountId(id)) return 'stripe';
   if (isPaypalOwnAccountId(id)) return 'paypal';
   return null;
 }
 
+/**
+ * `group` do painel antigo (compatibilidade): 'paypal' para conta PayPal,
+ * 'card' para as demais. A escolha não usa mais grupo: usa os slots.
+ */
 export function groupOfProvider(provider: RoutingProvider): RoutingGroup {
   return provider === 'paypal' ? 'paypal' : 'card';
 }
 
-export function groupOfMethod(method: string | null | undefined): RoutingGroup {
-  return String(method ?? '').toLowerCase() === 'paypal' ? 'paypal' : 'card';
+// ─── Slots de método ──────────────────────────────────────────────────────
+
+/** Nome de slot (e de método) aceito: o mesmo formato dos métodos por conta. */
+export const SLOT_NAME_RE = /^[a-z][a-z0-9_]{1,29}$/;
+
+// Cartão e carteiras: o mesmo formulário (Stripe/Whop) desenha os três.
+const CARD_SLOT_METHODS = new Set(['card', 'credit_card', 'debit_card', 'apple_pay', 'google_pay']);
+
+/** Slot de um método: 'card' para cartão e carteiras; o resto é o próprio método. */
+export function slotOfMethod(method: unknown): string {
+  const m = canonicalMethod(method);
+  return CARD_SLOT_METHODS.has(m) ? 'card' : m;
+}
+
+/** Ordem dos slots no painel e na resposta: card, paypal, depois alfabética. */
+export function compareSlots(a: string, b: string): number {
+  const rank = (slot: string) => (slot === 'card' ? 0 : slot === 'paypal' ? 1 : 2);
+  return rank(a) - rank(b) || a.localeCompare(b);
+}
+
+/**
+ * Métodos que a conta oferece de fato: os que ela atende filtrados pelos que
+ * o seller deixou ligados (mantém a grafia de origem). Conta de cartão sem
+ * nada lido atende pelo menos o cartão — é o que ela fazia antes dos slots.
+ */
+export function effectiveMethods(
+  provider: RoutingProvider,
+  available: string[],
+  config: Pick<RoutingAccountConfig, 'methods'> | null | undefined,
+): string[] {
+  const base = available.length ? available : provider === 'paypal' ? ['paypal'] : ['credit_card'];
+  return applyAccountMethods(base, config);
+}
+
+/**
+ * Slots que a conta atende. Contas por link (Shopify, Digistore24) só o
+ * cartão; PayPal só o PayPal; Whop e Stripe os slots dos métodos efetivos.
+ */
+export function slotsOfAccount(provider: RoutingProvider, methods: string[]): string[] {
+  if (isLinkProvider(provider)) return ['card'];
+  if (provider === 'paypal') return ['paypal'];
+  const slots = new Set<string>();
+  for (const method of methods) {
+    const slot = slotOfMethod(method);
+    if (slot && slot !== 'paypal' && SLOT_NAME_RE.test(slot)) slots.add(slot);
+  }
+  return [...slots].sort(compareSlots);
+}
+
+/** Os slots de duas contas se cruzam? (pausa, conexão e desligar contam assim) */
+export function slotsOverlap(a: readonly string[], b: readonly string[]): boolean {
+  return a.some(slot => b.includes(slot));
+}
+
+/** Slots que uma conta atende antes de conectar (sem métodos lidos ainda). */
+export function defaultSlotsOf(provider: RoutingProvider): string[] {
+  return provider === 'paypal' ? ['paypal'] : ['card'];
+}
+
+/**
+ * Estratégia de um slot: a gravada para ele (method_strategies) ou, sem ela,
+ * a do PayPal para o slot 'paypal' e a do cartão para todos os outros.
+ */
+export function strategyOfSlot(
+  settings: { methodStrategies?: Record<string, RoutingStrategy> | null; cardStrategy: RoutingStrategy; paypalStrategy: RoutingStrategy },
+  slot: string,
+): RoutingStrategy {
+  const stored = settings.methodStrategies?.[slot];
+  if (stored) return stored;
+  return slot === 'paypal' ? settings.paypalStrategy : settings.cardStrategy;
+}
+
+/** method_strategies do banco → só os pares válidos. */
+export function normalizeMethodStrategies(raw: unknown): Record<string, RoutingStrategy> {
+  const out: Record<string, RoutingStrategy> = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [slot, value] of Object.entries(raw as Record<string, unknown>)) {
+    const strategy = normalizeStrategy(value, '' as any);
+    if (SLOT_NAME_RE.test(slot) && strategy) out[slot] = strategy;
+  }
+  return out;
+}
+
+/**
+ * `strategies` do PUT do painel → slots a gravar (null = volta ao padrão do
+ * slot). Slot com nome inválido: 400 ROUTING_INVALID_SLOT; estratégia
+ * inválida: 400 ROUTING_INVALID_STRATEGY.
+ */
+export function parseStrategiesPatch(raw: unknown): Record<string, RoutingStrategy | null> {
+  if (raw === undefined || raw === null) return {};
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new BadRequestException({ error: 'ROUTING_INVALID_STRATEGY', message: 'strategies: envie um objeto { slot: estratégia }.' });
+  }
+  const out: Record<string, RoutingStrategy | null> = {};
+  for (const [rawSlot, value] of Object.entries(raw as Record<string, unknown>)) {
+    const slot = String(rawSlot).trim().toLowerCase();
+    if (!SLOT_NAME_RE.test(slot)) {
+      throw new BadRequestException({ error: 'ROUTING_INVALID_SLOT', message: `Forma de pagamento inválida: ${String(rawSlot)}.` });
+    }
+    if (value === null) { out[slot] = null; continue; }
+    const strategy = normalizeStrategy(value, '' as any);
+    if (!strategy) throw new BadRequestException({ error: 'ROUTING_INVALID_STRATEGY', message: `Estratégia inválida: ${String(value)}.` });
+    out[slot] = strategy;
+  }
+  return out;
+}
+
+/**
+ * Atribuição da sessão para um slot: a gravada por slot (method_accounts) ou,
+ * em sessão gravada antes dos slots, as colunas antigas (cartão e PayPal).
+ */
+export function assignedOfSlot(
+  assignment: { card_account_id?: string | null; paypal_account_id?: string | null; method_accounts?: Record<string, string> | null } | null | undefined,
+  slot: string,
+): string | null {
+  if (!assignment) return null;
+  const stored = assignment.method_accounts?.[slot];
+  if (typeof stored === 'string' && stored) return stored;
+  if (slot === 'card') return assignment.card_account_id ?? null;
+  if (slot === 'paypal') return assignment.paypal_account_id ?? null;
+  return null;
 }
 
 // ─── Conectar mais uma conta ──────────────────────────────────────────────
 
 /**
- * O que fazer quando o seller conecta uma conta e já há outra recebendo no
- * mesmo grupo. Sem o roteamento vale UMA conta por grupo, e conectar outra
+ * O que fazer quando o seller conecta uma conta e já há outra recebendo nos
+ * mesmos slots (cartão ou PayPal). Sem o roteamento vale UMA conta por grupo, e conectar outra
  * trocava a atual em silêncio — ele achava que tinha duas e uma delas parava
  * de receber. A decisão agora é dele:
  *
@@ -134,13 +278,29 @@ export function connectionChoice(args: {
   routingEnabled: boolean;
   multiAccount?: unknown;
   replace?: unknown;
-  /** Contas ATIVAS do mesmo grupo (cartão ou PayPal). */
+  /** Contas ATIVAS cujos slots cruzam com os da conta nova (ver occupyingAccounts). */
   occupying: number;
 }): 'proceed' | 'enable' | 'ask' {
   if (args.routingEnabled) return 'proceed';
   if (args.multiAccount === true) return 'enable';
   if (args.replace === true || args.occupying <= 0) return 'proceed';
   return 'ask';
+}
+
+/**
+ * Contas que "já recebem" no lugar da conta nova: ativas, pelo formulário
+ * (conta por link não conta) e com algum slot em comum com os da conta nova
+ * (antes de conectar: cartão para Whop/Stripe, PayPal para PayPal).
+ */
+export function occupyingAccounts<T extends { provider: RoutingProvider; connection: string; slots?: string[] }>(
+  provider: RoutingProvider,
+  pool: T[],
+): T[] {
+  const wanted = defaultSlotsOf(provider);
+  return pool.filter(entry =>
+    entry.connection === 'active'
+    && !isLinkProvider(entry.provider)
+    && slotsOverlap(entry.slots ?? defaultSlotsOf(entry.provider), wanted));
 }
 
 /**
@@ -510,18 +670,38 @@ export interface RoutingContext {
    * Contas por link nesta sessão: 'deny' (padrão — a oferta não cabe no
    * checkout da Shopify, ou o checkout é antigo e não sabe mandar o comprador
    * para lá), 'allow' (entram no sorteio com as demais) ou 'only' (a oferta
-   * foi vinculada à Shopify Payments: só elas).
+   * foi vinculada à Shopify Payments: só elas). Vale só para o slot do cartão
+   * (o único que conta por link atende).
    */
   link?: 'deny' | 'allow' | 'only' | null;
+  /**
+   * Provedores por link que podem concorrer nesta sessão (padrão: só
+   * 'shopify', como antes da Digistore24). O backend manda 'digistore24'
+   * quando a oferta é digital de pagamento único.
+   */
+  linkProviders?: string[] | null;
   /** Método da venda (só no pagamento): a conta precisa oferecê-lo. */
   method?: string | null;
 }
 
+/** Provedores por link do `?linkProviders=` (CSV); sem nada, só Shopify. */
+export function parseLinkProviders(raw: unknown): string[] {
+  const list = (Array.isArray(raw) ? raw : String(raw ?? '').split(','))
+    .map(item => String(item).trim().toLowerCase())
+    .filter(item => (LINK_PROVIDERS as readonly string[]).includes(item));
+  return list.length ? Array.from(new Set(list)) : ['shopify'];
+}
+
 /** A conta pode atender esta sessão pelo tipo (link × formulário)? */
-export function linkModeAllows(provider: RoutingProvider, mode: RoutingContext['link']): boolean {
+export function linkModeAllows(
+  provider: RoutingProvider,
+  mode: RoutingContext['link'],
+  linkProviders?: string[] | null,
+): boolean {
   const link = isLinkProvider(provider);
-  if (mode === 'only') return link;
-  if (mode === 'allow') return true;
+  const allowedLink = link && (linkProviders?.length ? linkProviders : ['shopify']).includes(provider);
+  if (mode === 'only') return allowedLink;
+  if (mode === 'allow') return !link || allowedLink;
   return !link;
 }
 
@@ -603,7 +783,7 @@ export function ineligibility(
   opts: { ignoreCaps?: boolean; now?: number } = {},
 ): IneligibleReason | null {
   if (!candidate.chargeable) return 'not_chargeable';
-  if (!linkModeAllows(candidate.provider, ctx.link)) return 'link_mode';
+  if (!linkModeAllows(candidate.provider, ctx.link, ctx.linkProviders)) return 'link_mode';
   if (ctx.method && !methodAllowed(candidate.config, ctx.method)) return 'method';
   const pause = activePause(candidate, disputeLimitPct, opts.now);
   if (pause) return `paused_${pause}` as IneligibleReason;
@@ -759,27 +939,41 @@ export interface DisableCandidate {
   provider: RoutingProvider;
   priority: number;
   createdAt?: string | null;
+  /**
+   * Slots que a conta ATENDE (os métodos lidos dela, sem o filtro do
+   * roteamento — desligado, o filtro por conta não vale). Sem a lista: cartão,
+   * ou PayPal para conta PayPal.
+   */
+  slots?: string[];
 }
 
 /**
- * Quem fica valendo quando o seller desliga o roteamento: a de maior
- * prioridade de cada provedor e, no cartão, só UMA entre Whop e Stripe (a
- * exclusão Whop×Stripe volta). As Whop extras ficam sempre guardadas: fora do
- * roteamento a Whop é a principal (é ela que tem carteira e saque).
- * Devolve os ids que continuam ativos; o resto vai para 'standby'.
+ * Quem fica valendo quando o seller desliga o roteamento: pela prioridade,
+ * cada conta fica se nenhum slot dela cruza com o de uma conta que já ficou —
+ * no cartão, só UMA entre Whop e Stripe (a exclusão Whop×Stripe volta), e uma
+ * PayPal. As Whop extras ficam sempre guardadas: fora do roteamento a Whop é
+ * a principal (é ela que tem carteira e saque). Conta por link não é linha do
+ * pay e nunca fica. Devolve os ids que continuam ativos; o resto vai para
+ * 'standby'.
  */
 export function keptOnDisable(accounts: DisableCandidate[]): Set<string> {
   const order = (a: DisableCandidate, b: DisableCandidate) =>
     a.priority - b.priority || String(a.createdAt ?? '').localeCompare(String(b.createdAt ?? '')) || a.id.localeCompare(b.id);
   const kept = new Set<string>();
+  const taken: string[] = [];
+  // Sem o roteamento vale uma linha por provedor (a conexão regrava no lugar).
+  const providers = new Set<string>();
 
-  const card = accounts
-    .filter(a => a.provider === 'stripe' || (a.provider === 'whop' && isLinkedProviderAccountId(a.id)))
+  const candidates = accounts
+    .filter(a => a.provider === 'stripe' || a.provider === 'paypal' || (a.provider === 'whop' && isLinkedProviderAccountId(a.id)))
     .sort(order);
-  if (card[0]) kept.add(card[0].id);
-
-  const paypal = accounts.filter(a => a.provider === 'paypal').sort(order);
-  if (paypal[0]) kept.add(paypal[0].id);
+  for (const account of candidates) {
+    const slots = account.slots?.length ? account.slots : defaultSlotsOf(account.provider);
+    if (providers.has(account.provider) || slotsOverlap(slots, taken)) continue;
+    kept.add(account.id);
+    providers.add(account.provider);
+    taken.push(...slots);
+  }
   return kept;
 }
 

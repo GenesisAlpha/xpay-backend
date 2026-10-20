@@ -29,7 +29,6 @@ import {
   BREAKER_COOLDOWN_MS,
   RoutingCandidate,
   RoutingContext,
-  RoutingGroup,
   RoutingProvider,
   RoutingStrategy,
   StatsTxRow,
@@ -44,8 +43,16 @@ import {
   disputeLimitExceeded,
   effectiveDisputePausePct,
   effectiveRoutingFeePct,
-  groupOfMethod,
+  assignedOfSlot,
+  compareSlots,
+  effectiveMethods,
   groupOfProvider,
+  normalizeMethodStrategies,
+  parseStrategiesPatch,
+  slotOfMethod,
+  slotsOfAccount,
+  slotsOverlap,
+  strategyOfSlot,
   ineligibility,
   isLinkAccountId,
   isLinkProvider,
@@ -64,6 +71,7 @@ import {
   LinkProvider,
   disableLinkRow,
   linkAccountId,
+  linkMethodsOf,
   listLinkRows,
   loadLinkSales,
   parseCurrencies,
@@ -99,7 +107,12 @@ const TODAY_TTL_MS = 10 * 1000;
 
 /** Conta no roteamento com o que o painel e a escolha precisam. */
 export interface PoolEntry extends RoutingCandidate {
-  group: RoutingGroup;
+  /** Métodos que a conta atende (lidos dela, grafia de origem). */
+  available: string[];
+  /** Os que ela oferece de fato: `available` filtrado pelos ligados pelo seller. */
+  methods: string[];
+  /** Slots de método que a conta atende (ver slotsOfAccount). */
+  slots: string[];
   /** Pronta para o executeWithProvider (credencial decifrada), ou null. */
   account: ProviderAccountConfig | null;
   /** Situação da conexão: ativa, chave recusada ou guardada (roteamento desligado). */
@@ -109,7 +122,7 @@ export interface PoolEntry extends RoutingCandidate {
   /** Whop principal (a que tem carteira e saque). */
   primary: boolean;
   createdAt: string | null;
-  /** Conta por link: id dela no backend do checkout (shopify_payment_accounts.id). */
+  /** Conta por link: id dela no backend do checkout (shopify_payment_accounts.id / digistore_accounts.id). */
   linkRef?: string | null;
   shopDomain?: string | null;
 }
@@ -120,6 +133,8 @@ export interface ResolvedRoutingSettings {
   feeAcceptedAt: string | null;
   cardStrategy: RoutingStrategy;
   paypalStrategy: RoutingStrategy;
+  /** Estratégia gravada por slot (sem o slot: card_strategy, ou paypal_strategy no 'paypal'). */
+  methodStrategies: Record<string, RoutingStrategy>;
   /** Taxa em vigor (%): a do CRM ou o padrão. */
   feePct: number;
   /** Taxa definida no CRM (null = padrão). */
@@ -131,12 +146,47 @@ export interface ResolvedRoutingSettings {
 }
 
 export interface RoutingConfigPick {
+  /** Conta do slot do cartão (= slots.get('card')). */
   card: PoolEntry | null;
+  /** Conta do slot do PayPal (= slots.get('paypal')). */
   paypal: PoolEntry | null;
-  /** Contas conectadas no grupo (0 = o grupo segue o fluxo de antes). */
+  /** Contas conectadas no slot (0 = o slot segue o fluxo de antes). */
   cardAccounts: number;
   paypalAccounts: number;
   routingKey: string | null;
+  /** Conta escolhida para cada slot oferecido pelo pool nesta sessão. */
+  slots?: Map<string, PoolEntry>;
+}
+
+/** Atribuição da sessão: colunas antigas + a conta de cada slot. */
+interface SessionAssignment {
+  card_account_id: string | null;
+  paypal_account_id: string | null;
+  /** Completo: inclui card/paypal das colunas antigas quando a sessão é de antes dos slots. */
+  method_accounts: Record<string, string>;
+}
+
+/** Opções do caminho quente: o que quem chama já leu do seller. */
+export interface RoutingLoadOptions {
+  /** seller_profiles.enabled_methods (evita reler no config e na venda). */
+  sellerMethods?: string[] | null;
+}
+
+/** Contexto de um slot: o modo link só vale no cartão (o único que conta por link atende). */
+function slotCtx(slot: string, ctx: RoutingContext): RoutingContext {
+  return slot === 'card' ? ctx : { ...ctx, link: 'allow' };
+}
+
+/** A conta concorre neste slot nesta sessão (slot + link mode)? */
+function servesSlot(entry: PoolEntry, slot: string, ctx: RoutingContext): boolean {
+  return entry.slots.includes(slot)
+    && (slot !== 'card' || linkModeAllows(entry.provider, ctx.link, ctx.linkProviders));
+}
+
+function sameMap(a: Record<string, string>, b: Record<string, string>): boolean {
+  const ka = Object.keys(a).sort();
+  const kb = Object.keys(b).sort();
+  return ka.length === kb.length && ka.every((k, i) => k === kb[i] && a[k] === b[k]);
 }
 
 export type RoutingSalePick =
@@ -227,7 +277,7 @@ export class SellerRoutingService implements OnModuleInit {
    * configuração, estatística e situação do breaker. Desconectadas ficam de
    * fora: o seller precisa conectar de novo para voltarem.
    */
-  async loadPool(sellerId: string, settings?: ResolvedRoutingSettings): Promise<PoolEntry[]> {
+  async loadPool(sellerId: string, settings?: ResolvedRoutingSettings, opts: RoutingLoadOptions = {}): Promise<PoolEntry[]> {
     const resolved = settings ?? (await this.settings(sellerId));
     const [principal, rows, configs, links] = await Promise.all([
       this.whopLinked.getRow(sellerId).catch(() => null),
@@ -236,7 +286,7 @@ export class SellerRoutingService implements OnModuleInit {
       listLinkRows(sellerId).catch(() => []),
     ]);
 
-    const entries: Array<Omit<PoolEntry, 'stats' | 'breakerOpen'>> = [];
+    const entries: Array<Omit<PoolEntry, 'stats' | 'breakerOpen' | 'available' | 'methods' | 'slots'>> = [];
 
     if (principal?.whop_account_id && principal.api_key && (principal.status === 'active' || principal.status === 'invalid')) {
       const id = toLinkedProviderAccountId(principal.whop_account_id);
@@ -244,7 +294,6 @@ export class SellerRoutingService implements OnModuleInit {
       entries.push({
         id,
         provider: 'whop',
-        group: 'card',
         config: normalizeAccountConfig(configs.get(id), defaultAccountConfig(id, sellerId, 'whop')),
         account: account ?? null,
         chargeable: Boolean(account) && linkedChargeBlocker(principal) === null,
@@ -264,7 +313,6 @@ export class SellerRoutingService implements OnModuleInit {
       entries.push({
         id,
         provider,
-        group: groupOfProvider(provider),
         config: normalizeAccountConfig(configs.get(id), defaultAccountConfig(id, sellerId, provider)),
         account,
         chargeable: Boolean(account) && providerChargeBlocker(row) === null,
@@ -278,15 +326,15 @@ export class SellerRoutingService implements OnModuleInit {
       });
     }
 
-    // Contas por link (lojas Shopify): sem credencial no pay; cobrar = mandar o
-    // comprador para o checkout delas. Desligadas ficam de fora.
+    // Contas por link (lojas Shopify, contas Digistore24): sem credencial no
+    // pay; cobrar = mandar o comprador para o checkout delas. Desligadas ficam
+    // de fora.
     for (const row of links) {
       if (row.status !== 'active') continue;
       const id = linkAccountId(row);
       entries.push({
         id,
         provider: row.provider,
-        group: 'card',
         config: normalizeAccountConfig(configs.get(id), defaultAccountConfig(id, sellerId, row.provider)),
         account: null,
         chargeable: true,
@@ -300,12 +348,22 @@ export class SellerRoutingService implements OnModuleInit {
       });
     }
 
-    const stats = await this.loadStats(sellerId, entries.map(entry => entry.id), resolved.disputePausePctEffective);
-    return entries.map(entry => ({
-      ...entry,
-      stats: stats.get(entry.id)!,
-      breakerOpen: this.router.accountBreakerOpen(entry.id),
-    }));
+    const [stats, available] = await Promise.all([
+      this.loadStats(sellerId, entries.map(entry => entry.id), resolved.disputePausePctEffective),
+      this.readAccountMethods(sellerId, entries, opts.sellerMethods),
+    ]);
+    return entries.map(entry => {
+      const read = available.get(entry.id) ?? [];
+      const methods = effectiveMethods(entry.provider, read, entry.config);
+      return {
+        ...entry,
+        available: read,
+        methods,
+        slots: slotsOfAccount(entry.provider, methods),
+        stats: stats.get(entry.id)!,
+        breakerOpen: this.router.accountBreakerOpen(entry.id),
+      };
+    });
   }
 
   private async loadConfigs(sellerId: string): Promise<Map<string, any>> {
@@ -383,15 +441,15 @@ export class SellerRoutingService implements OnModuleInit {
   // ─── Escolha da conta ──────────────────────────────────────────────────
 
   private pick(
-    group: RoutingGroup,
+    slot: string,
     pool: PoolEntry[],
     settings: ResolvedRoutingSettings,
     ctx: RoutingContext,
     only?: (entry: PoolEntry) => boolean,
   ): PoolEntry | null {
-    const strategy = group === 'paypal' ? settings.paypalStrategy : settings.cardStrategy;
+    const strategy = strategyOfSlot(settings, slot);
     const eligible = pool.filter(entry =>
-      entry.group === group
+      entry.slots.includes(slot)
       && (!only || only(entry))
       && ineligibility(entry, ctx, settings.disputePausePctEffective, { now: this.now() }) === null);
     return selectAccount(strategy, eligible, ctx, this.random) as PoolEntry | null;
@@ -402,58 +460,76 @@ export class SellerRoutingService implements OnModuleInit {
   }
 
   /**
-   * `/payments/config`: escolhe (ou reaproveita) a conta de cartão e a de
-   * PayPal desta sessão e grava a atribuição. É o momento em que o checkout
-   * monta o formulário — trocar a conta aqui é seguro.
+   * `/payments/config`: escolhe (ou reaproveita) a conta de CADA slot
+   * oferecido pelo pool nesta sessão (cartão e carteiras, PayPal, Pix…) e
+   * grava a atribuição. É o momento em que o checkout monta o formulário —
+   * trocar a conta aqui é seguro.
    * null = roteamento desligado (o config segue como antes).
    */
-  async resolveForConfig(sellerId: string, routingKey: string | null, ctx: RoutingContext = {}): Promise<RoutingConfigPick | null> {
+  async resolveForConfig(
+    sellerId: string,
+    routingKey: string | null,
+    ctx: RoutingContext = {},
+    opts: RoutingLoadOptions = {},
+  ): Promise<RoutingConfigPick | null> {
     const settings = await this.settings(sellerId);
     if (!settings.enabled) return null;
     // Seller na Koopfy Payments: o roteamento é das contas próprias, que não
     // cobram nesse modo. A configuração dele fica guardada para quando voltar.
     if (await sellerUsesKoopfyPayments(sellerId)) return null;
 
-    const pool = await this.loadPool(sellerId, settings);
+    const pool = await this.loadPool(sellerId, settings, opts);
     this.syncAutoPauses(sellerId, pool, settings);
     const key = normalizeRoutingKey(routingKey);
     const assignment = key ? await this.loadAssignment(key, sellerId) : null;
 
-    const reuse = (id: string | null | undefined, group: RoutingGroup) => {
-      const entry = id ? pool.find(item => item.id === id && item.group === group) : undefined;
-      return this.eligible(entry, settings, ctx) ? entry : null;
-    };
-    const card = reuse(assignment?.card_account_id, 'card') ?? this.pick('card', pool, settings, ctx);
-    const paypal = reuse(assignment?.paypal_account_id, 'paypal') ?? this.pick('paypal', pool, settings, ctx);
+    // Slots que o pool oferece nesta sessão: com o link negado, um seller que
+    // só tem lojas Shopify no roteamento segue com o cartão de antes.
+    const offered = Array.from(new Set(pool.flatMap(entry => entry.slots.filter(slot => servesSlot(entry, slot, ctx)))))
+      .sort(compareSlots);
 
-    if (key && (assignment?.card_account_id !== (card?.id ?? null) || assignment?.paypal_account_id !== (paypal?.id ?? null) || !assignment)) {
-      await this.saveAssignment(key, sellerId, { card: card?.id ?? null, paypal: paypal?.id ?? null });
+    const chosen = new Map<string, PoolEntry>();
+    for (const slot of offered) {
+      const sctx = slotCtx(slot, ctx);
+      const reuseId = assignedOfSlot(assignment, slot);
+      const current = reuseId ? pool.find(item => item.id === reuseId && servesSlot(item, slot, ctx)) : undefined;
+      const entry = this.eligible(current, settings, sctx)
+        ? current
+        : this.pick(slot, pool, settings, sctx, item => servesSlot(item, slot, ctx));
+      if (entry) chosen.set(slot, entry);
+    }
+
+    if (key) {
+      const next = Object.fromEntries([...chosen].map(([slot, entry]) => [slot, entry.id]));
+      if (!assignment || !sameMap(assignment.method_accounts, next)) await this.saveAssignment(key, sellerId, next);
     }
 
     return {
-      card,
-      paypal,
-      // Só as contas que esta sessão pode usar: com o link negado, um seller
-      // que só tem lojas Shopify no roteamento segue com o cartão de antes.
-      cardAccounts: pool.filter(entry => entry.group === 'card' && linkModeAllows(entry.provider, ctx.link)).length,
-      paypalAccounts: pool.filter(entry => entry.group === 'paypal').length,
+      card: chosen.get('card') ?? null,
+      paypal: chosen.get('paypal') ?? null,
+      cardAccounts: pool.filter(entry => servesSlot(entry, 'card', ctx)).length,
+      paypalAccounts: pool.filter(entry => entry.slots.includes('paypal')).length,
       routingKey: key,
+      slots: chosen,
     };
   }
 
   /**
-   * createPayment: a conta da venda. Ordem de decisão:
+   * createPayment: a conta da venda, no slot do método (slotOfMethod). Ordem
+   * de decisão:
    *   1. mesma chave de idempotência já cobrada numa conta → ela (é retry);
-   *   2. conta que a sessão recebeu no config (ou que o navegador declarou em
-   *      providerAccountId) → ela, se ainda elegível. Se não é mais, a sessão
-   *      ganha outra conta e responde 409 ROUTING_REASSIGNED: o formulário do
-   *      navegador foi montado com a credencial pública DAQUELA conta (pk da
-   *      Stripe, biz da Whop, client id do PayPal) e não confirmaria em outra;
+   *   2. conta que a sessão recebeu no config para o slot (ou que o navegador
+   *      declarou em providerAccountId) → ela, se ainda elegível. Se não é
+   *      mais, o slot ganha outra conta e responde 409 ROUTING_REASSIGNED: o
+   *      formulário do navegador foi montado com a credencial pública DAQUELA
+   *      conta (pk da Stripe, biz da Whop, client id do PayPal) e não
+   *      confirmaria em outra;
    *   3. sem sessão: o mesmo pedido já tentou numa conta → ela (recusa não
    *      troca de conta — anti card testing — e o reembolso fica num titular só);
-   *   4. escolha nova pela estratégia do grupo.
-   * null = roteamento desligado; { kind: 'legacy' } = o grupo não tem contas
-   * (ex.: só PayPal conectado e venda de cartão) e segue o fluxo de antes.
+   *   4. escolha nova pela estratégia do slot.
+   * null = roteamento desligado; { kind: 'legacy' } = nenhuma conta do pool
+   * oferece o slot (ex.: só PayPal conectado e venda de cartão) e segue o
+   * fluxo de antes.
    */
   async resolveForSale(
     sellerId: string,
@@ -464,6 +540,7 @@ export class SellerRoutingService implements OnModuleInit {
       orderRef?: string | null;
       providerAccountId?: string | null;
       idempotencyKey?: string | null;
+      sellerMethods?: string[] | null;
     },
   ): Promise<RoutingSalePick | null> {
     const settings = await this.settings(sellerId);
@@ -472,20 +549,21 @@ export class SellerRoutingService implements OnModuleInit {
     // cobram nesse modo. A configuração dele fica guardada para quando voltar.
     if (await sellerUsesKoopfyPayments(sellerId)) return null;
 
-    const group = groupOfMethod(args.method);
+    const slot = slotOfMethod(args.method ?? 'card') || 'card';
     // O método entra na escolha: conta com o método desligado não recebe a venda.
     const ctx = { ...(args.ctx ?? {}), link: 'deny' as const, method: args.method ?? null };
-    const pool = await this.loadPool(sellerId, settings);
+    const pool = await this.loadPool(sellerId, settings, { sellerMethods: args.sellerMethods });
     this.syncAutoPauses(sellerId, pool, settings);
     // Conta por link não cobra pelo formulário: fica fora da venda.
-    const groupPool = pool.filter(entry => entry.group === group && !isLinkProvider(entry.provider));
-    if (!groupPool.length) return { kind: 'legacy' };
+    const slotPool = pool.filter(entry => entry.slots.includes(slot) && !isLinkProvider(entry.provider));
+    if (!slotPool.length) return { kind: 'legacy' };
 
     const done = (entry: PoolEntry, reason: string): RoutingSalePick => {
       if (!entry.account) throw new BadRequestException({ error: 'ROUTING_NO_ACCOUNT', message: 'Conta de pagamento do vendedor indisponível.' });
       return { kind: 'account', entry: entry as PoolEntry & { account: ProviderAccountConfig }, provider: entry.provider as OwnProvider, feePct: settings.feePct, reason };
     };
-    const inGroup = (id: string | null | undefined) => (id ? groupPool.find(entry => entry.id === id) : undefined);
+    const inSlot = (id: string | null | undefined) => (id ? slotPool.find(entry => entry.id === id) : undefined);
+    const onlyForms = (entry: PoolEntry) => !isLinkProvider(entry.provider);
 
     // 1. Retry idempotente: o intent/order/sessão já existe naquela conta.
     if (args.idempotencyKey) {
@@ -495,22 +573,30 @@ export class SellerRoutingService implements OnModuleInit {
         .eq('seller_id', sellerId)
         .eq('idempotency_key', args.idempotencyKey)
         .maybeSingle();
-      const entry = inGroup((existing as any)?.provider_account_id);
+      const entry = inSlot((existing as any)?.provider_account_id);
       if (entry?.chargeable) return done(entry, 'idempotency');
     }
 
-    // 2. Conta da sessão (ou a que o navegador montou).
+    // 2. Conta da sessão no slot (ou a que o navegador montou). Sessão gravada
+    // antes dos slots: a conta do cartão valia para todos os métodos dela.
     const key = normalizeRoutingKey(args.routingKey);
     const assignment = key ? await this.loadAssignment(key, sellerId) : null;
-    const assignedId = (group === 'paypal' ? assignment?.paypal_account_id : assignment?.card_account_id)
-      ?? (inGroup(args.providerAccountId) ? args.providerAccountId : null);
+    const legacyCard = slot !== 'card' && slot !== 'paypal' && inSlot(assignment?.card_account_id)
+      ? assignment!.card_account_id
+      : null;
+    const assignedId = assignedOfSlot(assignment, slot)
+      ?? legacyCard
+      ?? (inSlot(args.providerAccountId) ? args.providerAccountId : null);
+    const saveSlot = async (id: string) => {
+      if (key) await this.saveAssignment(key, sellerId, { ...(assignment?.method_accounts ?? {}), [slot]: id });
+    };
     if (assignedId) {
-      const entry = inGroup(assignedId);
+      const entry = inSlot(assignedId);
       if (this.eligible(entry, settings, ctx)) return done(entry, 'session');
 
       // A conta da sessão saiu (pausa, teto, desconexão, filtro): a próxima
-      // carga das formas de pagamento já vem com a nova conta.
-      const next = this.pick(group, pool, settings, ctx);
+      // carga das formas de pagamento já vem com a nova conta neste slot.
+      const next = this.pick(slot, pool, settings, ctx, onlyForms);
       // Nenhuma outra aceita esta venda (ex.: ticket acima do máximo de todas):
       // recarregar não adiantaria — o config, que não conhece o valor, daria a
       // mesma conta de novo e o checkout ficaria preso entre 409s.
@@ -520,51 +606,42 @@ export class SellerRoutingService implements OnModuleInit {
           message: 'Nenhuma conta de pagamento disponível para este pedido agora.',
         });
       }
-      if (key) {
-        await this.saveAssignment(key, sellerId, {
-          card: group === 'card' ? next.id : assignment?.card_account_id ?? null,
-          paypal: group === 'paypal' ? next.id : assignment?.paypal_account_id ?? null,
-        });
-      }
+      await saveSlot(next.id);
       console.warn(
-        `[SellerRouting] seller ${sellerId}: conta ${assignedId} da sessão ${key ?? '(sem chave)'} não é mais elegível `
+        `[SellerRouting] seller ${sellerId}: conta ${assignedId} (slot ${slot}) da sessão ${key ?? '(sem chave)'} não é mais elegível `
         + `→ ${next.id}; checkout recarrega (409)`,
       );
       throw new ConflictException({ error: 'ROUTING_REASSIGNED', message: ROUTING_REASSIGNED_MESSAGE });
     }
 
-    // 3. Sem sessão: o pedido já tentou numa conta própria deste grupo.
+    // 3. Sem sessão: o pedido já tentou numa conta própria deste slot.
     if (args.orderRef) {
       const sticky = await this.router.resolveStickyAccountAnyProvider({ sellerId, orderRef: args.orderRef }).catch(() => null);
-      const entry = inGroup(sticky?.accountId);
+      const entry = inSlot(sticky?.accountId);
       if (entry && ineligibility(entry, ctx, settings.disputePausePctEffective, { ignoreCaps: true, now: this.now() }) === null) {
         return done(entry, 'order');
       }
     }
 
     // 4. Escolha nova.
-    const chosen = this.pick(group, pool, settings, ctx);
+    const chosen = this.pick(slot, pool, settings, ctx, onlyForms);
     if (!chosen) {
       throw new BadRequestException({
         error: 'ROUTING_NO_ACCOUNT',
         message: 'Nenhuma conta de pagamento disponível para este pedido agora.',
       });
     }
-    if (key) {
-      await this.saveAssignment(key, sellerId, {
-        card: group === 'card' ? chosen.id : assignment?.card_account_id ?? null,
-        paypal: group === 'paypal' ? chosen.id : assignment?.paypal_account_id ?? null,
-      });
-    }
+    await saveSlot(chosen.id);
     return done(chosen, 'strategy');
   }
 
   // ─── Atribuição por sessão ─────────────────────────────────────────────
 
-  private async loadAssignment(key: string, sellerId: string): Promise<{ card_account_id: string | null; paypal_account_id: string | null } | null> {
+  private async loadAssignment(key: string, sellerId: string): Promise<SessionAssignment | null> {
+    // select('*'): antes da migration dos slots a coluna method_accounts não existe.
     const { data, error } = await supabase
       .from(ASSIGNMENTS_TABLE)
-      .select('routing_key, seller_id, card_account_id, paypal_account_id, expires_at')
+      .select('*')
       .eq('routing_key', key)
       .maybeSingle();
     if (error) {
@@ -575,10 +652,19 @@ export class SellerRoutingService implements OnModuleInit {
     if (!row || row.seller_id !== sellerId) return null;
     const expires = Date.parse(String(row.expires_at ?? ''));
     if (Number.isFinite(expires) && expires <= this.now()) return null;
-    return { card_account_id: row.card_account_id ?? null, paypal_account_id: row.paypal_account_id ?? null };
+
+    const map: Record<string, string> = {};
+    const stored = row.method_accounts && typeof row.method_accounts === 'object' && !Array.isArray(row.method_accounts)
+      ? row.method_accounts : {};
+    for (const [slot, id] of Object.entries(stored)) if (typeof id === 'string' && id) map[slot] = id;
+    // Sessão de antes dos slots: as colunas antigas valem para cartão e PayPal.
+    if (!map.card && row.card_account_id) map.card = row.card_account_id;
+    if (!map.paypal && row.paypal_account_id) map.paypal = row.paypal_account_id;
+    return { card_account_id: row.card_account_id ?? null, paypal_account_id: row.paypal_account_id ?? null, method_accounts: map };
   }
 
-  private async saveAssignment(key: string, sellerId: string, ids: { card: string | null; paypal: string | null }) {
+  /** Grava a conta de cada slot; card/paypal espelham nas colunas antigas. */
+  private async saveAssignment(key: string, sellerId: string, accounts: Record<string, string>) {
     // Chave de outro seller (colisão improvável de id de sessão): não
     // sobrescreve — a sessão dele segue com a conta dele.
     const { data: current } = await supabase
@@ -589,17 +675,21 @@ export class SellerRoutingService implements OnModuleInit {
     if ((current as any)?.seller_id && (current as any).seller_id !== sellerId) return;
 
     const now = this.now();
-    const { error } = await supabase.from(ASSIGNMENTS_TABLE).upsert(
-      {
-        routing_key: key,
-        seller_id: sellerId,
-        card_account_id: ids.card,
-        paypal_account_id: ids.paypal,
-        created_at: new Date(now).toISOString(),
-        expires_at: new Date(now + ASSIGNMENT_TTL_MS).toISOString(),
-      },
-      { onConflict: 'routing_key' },
-    );
+    const row: Record<string, any> = {
+      routing_key: key,
+      seller_id: sellerId,
+      card_account_id: accounts.card ?? null,
+      paypal_account_id: accounts.paypal ?? null,
+      method_accounts: accounts,
+      created_at: new Date(now).toISOString(),
+      expires_at: new Date(now + ASSIGNMENT_TTL_MS).toISOString(),
+    };
+    let { error } = await supabase.from(ASSIGNMENTS_TABLE).upsert(row, { onConflict: 'routing_key' });
+    if (error && /method_accounts/.test(error.message ?? '')) {
+      // Migration dos slots pendente: grava só as colunas antigas.
+      const { method_accounts: _ignored, ...legacy } = row;
+      ({ error } = await supabase.from(ASSIGNMENTS_TABLE).upsert(legacy, { onConflict: 'routing_key' }));
+    }
     if (error) console.error('[SellerRouting] gravação da atribuição:', error.message);
   }
 
@@ -649,7 +739,7 @@ export class SellerRoutingService implements OnModuleInit {
 
     const remaining = pool.filter(other =>
       other.id !== entry.id
-      && other.group === entry.group
+      && slotsOverlap(other.slots, entry.slots)
       && other.chargeable
       && other.connection === 'active'
       && !activePause(other, settings.disputePausePctEffective, this.now())).length;
@@ -709,7 +799,7 @@ export class SellerRoutingService implements OnModuleInit {
     if (error) throw new BadRequestException(`Não foi possível salvar a conta no roteamento: ${error.message}`);
   }
 
-  // ─── Contas por link (Shopify Payments) ─────────────────────────────────
+  // ─── Contas por link (Shopify Payments, Digistore24) ───────────────────
 
   /**
    * O backend do checkout conectou (ou reconectou) uma loja: entra no pool.
@@ -774,12 +864,17 @@ export class SellerRoutingService implements OnModuleInit {
     const settings = await this.settings(sellerId);
     const pool = await this.loadPool(sellerId, settings);
     const now = this.now();
+    const group = (entry: PoolEntry) => groupOfProvider(entry.provider);
     const order = (a: PoolEntry, b: PoolEntry) =>
-      (a.group === b.group ? 0 : a.group === 'card' ? -1 : 1)
+      (group(a) === group(b) ? 0 : group(a) === 'card' ? -1 : 1)
       || a.config.priority - b.config.priority
       || String(a.createdAt ?? '').localeCompare(String(b.createdAt ?? ''));
 
-    const available = await this.availableMethods(sellerId, pool);
+    const accounts = [...pool].sort(order);
+    // Slots com pelo menos uma conta: card, paypal, depois em ordem alfabética.
+    const slotNames = Array.from(new Set(accounts.flatMap(entry => entry.slots))).sort(compareSlots);
+    const strategies = Object.fromEntries(slotNames.map(slot => [slot, strategyOfSlot(settings, slot)]));
+    const canon = (list: string[]) => Array.from(new Set(list.map(canonicalMethod).filter(Boolean)));
     return {
       enabled: settings.enabled,
       enabledAt: settings.enabledAt,
@@ -790,20 +885,29 @@ export class SellerRoutingService implements OnModuleInit {
       paypalStrategy: settings.paypalStrategy,
       disputePausePct: settings.disputePausePct,
       disputePausePctEffective: settings.disputePausePctEffective,
-      accounts: [...pool].sort(order).map(entry => {
+      // Estratégia em vigor de cada slot que aparece em `slots`.
+      strategies,
+      slots: slotNames.map(slot => ({
+        slot,
+        strategy: strategies[slot],
+        accountIds: accounts.filter(entry => entry.slots.includes(slot)).map(entry => entry.id),
+      })),
+      accounts: accounts.map(entry => {
         const pause = activePause(entry, settings.disputePausePctEffective, now);
         const limits = effectiveDailyLimits(entry.config, now);
         return {
           id: entry.id,
           provider: entry.provider,
-          group: entry.group,
+          // Compatibilidade com o painel antigo: 'paypal' para PayPal, 'card' para o resto.
+          group: group(entry),
+          slots: entry.slots,
           primary: entry.primary,
-          // Conta por link: o comprador paga no checkout da loja (Shopify).
+          // Conta por link: o comprador paga no checkout da loja (Shopify) ou no formulário da Digistore24.
           link: isLinkProvider(entry.provider),
           ...(entry.shopDomain ? { shopDomain: entry.shopDomain } : {}),
           stage: accountStage(entry.config, now),
           // O que a conta atende (lido dela) e o que o seller deixou ligado (null = tudo).
-          availableMethods: available.get(entry.id) ?? [],
+          availableMethods: canon(entry.available),
           enabledMethods: entry.config.methods,
           label: entry.config.label,
           accountName: entry.accountName,
@@ -858,23 +962,32 @@ export class SellerRoutingService implements OnModuleInit {
   }
 
   /**
-   * Métodos que cada conta atende: Stripe pela configuração da própria conta
-   * (cartão, carteiras e métodos locais ligados nela), Whop pelos métodos do
-   * seller, PayPal só PayPal e loja Shopify pelo checkout dela.
+   * Métodos que cada conta atende (grafia de origem): Stripe pela configuração
+   * da própria conta (cartão, carteiras e métodos locais ligados nela, em
+   * cache de 10 min no SellerProviderAccountsService), Whop pelos métodos do
+   * seller, PayPal só PayPal e conta por link pelo checkout dela.
+   * `sellerMethods` vem de quem já leu o seller (config e venda).
    */
-  private async availableMethods(sellerId: string, pool: PoolEntry[]): Promise<Map<string, string[]>> {
-    const { data: seller } = await supabase.from('seller_profiles').select('enabled_methods').eq('id', sellerId).maybeSingle();
-    const sellerMethods: string[] = Array.isArray((seller as any)?.enabled_methods) ? (seller as any).enabled_methods : [];
-    const canon = (list: string[]) => Array.from(new Set(list.map(canonicalMethod).filter(Boolean)));
+  private async readAccountMethods(
+    sellerId: string,
+    pool: Array<Pick<PoolEntry, 'id' | 'provider' | 'account'>>,
+    sellerMethodsKnown?: string[] | null,
+  ): Promise<Map<string, string[]>> {
     const out = new Map<string, string[]>();
+    if (!pool.length) return out;
+    let sellerMethods: string[] = Array.isArray(sellerMethodsKnown) ? sellerMethodsKnown : [];
+    if (!Array.isArray(sellerMethodsKnown) && pool.some(entry => entry.provider === 'whop')) {
+      const { data: seller } = await supabase.from('seller_profiles').select('enabled_methods').eq('id', sellerId).maybeSingle();
+      sellerMethods = Array.isArray((seller as any)?.enabled_methods) ? (seller as any).enabled_methods : [];
+    }
     await Promise.all(pool.map(async entry => {
       if (entry.provider === 'paypal') out.set(entry.id, ['paypal']);
-      else if (entry.provider === 'shopify') out.set(entry.id, ['shopify_checkout']);
+      else if (isLinkProvider(entry.provider)) out.set(entry.id, linkMethodsOf(entry.provider as LinkProvider));
       else if (entry.provider === 'stripe') {
         let read: string[] | null = null;
         try { read = entry.account ? await this.router.ownStripeMethods(entry.account as any) : null; } catch { read = null; }
-        out.set(entry.id, canon(read ?? ['credit_card', 'apple_pay', 'google_pay']));
-      } else out.set(entry.id, canon(sellerMethods.filter(m => canonicalMethod(m) !== 'paypal')));
+        out.set(entry.id, read ?? ['credit_card', 'apple_pay', 'google_pay']);
+      } else out.set(entry.id, sellerMethods.filter(m => canonicalMethod(m) !== 'paypal'));
     }));
     return out;
   }
@@ -920,12 +1033,15 @@ export class SellerRoutingService implements OnModuleInit {
   }
 
   /**
-   * PUT /integration/koopfy/routing — o seller liga/desliga e escolhe as
-   * estratégias. Ligar pela primeira vez exige o aceite da taxa.
+   * PUT /integration/koopfy/routing — o seller liga/desliga e escolhe a
+   * estratégia de cada slot (`strategies`, merge parcial; null volta ao
+   * padrão do slot). `cardStrategy`/`paypalStrategy` seguem aceitos como
+   * apelido de `strategies.card`/`strategies.paypal`, e gravar card/paypal
+   * espelha nas colunas antigas. Ligar pela primeira vez exige o aceite da taxa.
    */
   async update(
     sellerId: string,
-    body: { enabled?: unknown; acceptFee?: unknown; cardStrategy?: unknown; paypalStrategy?: unknown },
+    body: { enabled?: unknown; acceptFee?: unknown; cardStrategy?: unknown; paypalStrategy?: unknown; strategies?: unknown },
     actor: string | null,
   ) {
     const current = await readRoutingSettings(sellerId);
@@ -933,12 +1049,25 @@ export class SellerRoutingService implements OnModuleInit {
     const nowIso = new Date(this.now()).toISOString();
 
     const patch: Record<string, any> = {};
-    for (const [field, column] of [['cardStrategy', 'card_strategy'], ['paypalStrategy', 'paypal_strategy']] as const) {
+    const changed: Record<string, RoutingStrategy | null> = {};
+    for (const [field, slot] of [['cardStrategy', 'card'], ['paypalStrategy', 'paypal']] as const) {
       const raw = body?.[field];
       if (raw === undefined || raw === null || raw === '') continue;
       const normalized = normalizeStrategy(raw, '' as any);
       if (!normalized) throw new BadRequestException({ error: 'ROUTING_INVALID_STRATEGY', message: `Estratégia inválida: ${String(raw)}.` });
-      patch[column] = normalized;
+      changed[slot] = normalized;
+    }
+    // `strategies` manda sobre o apelido quando os dois vêm.
+    Object.assign(changed, parseStrategiesPatch(body?.strategies));
+    if (Object.keys(changed).length) {
+      const next: Record<string, RoutingStrategy> = { ...resolved.methodStrategies };
+      for (const [slot, strategy] of Object.entries(changed)) {
+        if (strategy) next[slot] = strategy;
+        else delete next[slot];
+      }
+      patch.method_strategies = next;
+      if (changed.card) patch.card_strategy = changed.card;
+      if (changed.paypal) patch.paypal_strategy = changed.paypal;
     }
 
     const wantsEnabled = typeof body?.enabled === 'boolean' ? body.enabled : undefined;
@@ -961,7 +1090,11 @@ export class SellerRoutingService implements OnModuleInit {
       await this.writeSettings(sellerId, patch, actor);
       if (patch.enabled === true) await this.applyEnable(sellerId);
       if (patch.enabled === false) await this.applyDisable(sellerId);
-      await this.log(sellerId, actor, 'routing.settings_changed', { ...patch });
+      const { method_strategies: _stored, ...logged } = patch;
+      await this.log(sellerId, actor, 'routing.settings_changed', {
+        ...logged,
+        ...(Object.keys(changed).length ? { strategies: changed } : {}),
+      });
     }
     return this.view(sellerId);
   }
@@ -986,6 +1119,8 @@ export class SellerRoutingService implements OnModuleInit {
       provider: entry.provider,
       priority: entry.config.priority,
       createdAt: entry.createdAt,
+      // O que a conta atende, sem o filtro do roteamento (desligado, ele não vale).
+      slots: slotsOfAccount(entry.provider, effectiveMethods(entry.provider, entry.available, null)),
     })));
     const rows = await this.sellerProviders.listRows(sellerId);
     const toStandby = rows
@@ -1041,10 +1176,13 @@ export class SellerRoutingService implements OnModuleInit {
   // ─── Internos ──────────────────────────────────────────────────────────
 
   private async writeSettings(sellerId: string, patch: Record<string, any>, actor: string | null) {
-    const { error } = await supabase.from(SETTINGS_TABLE).upsert(
-      { seller_id: sellerId, ...patch, updated_by: actor, updated_at: new Date(this.now()).toISOString() },
-      { onConflict: 'seller_id' },
-    );
+    const row = { seller_id: sellerId, ...patch, updated_by: actor, updated_at: new Date(this.now()).toISOString() };
+    let { error } = await supabase.from(SETTINGS_TABLE).upsert(row, { onConflict: 'seller_id' });
+    if (error && 'method_strategies' in row && /method_strategies/.test(error.message ?? '')) {
+      // Migration dos slots pendente: o apelido (card/paypal) ainda grava nas colunas antigas.
+      const { method_strategies: _ignored, ...legacy } = row;
+      ({ error } = await supabase.from(SETTINGS_TABLE).upsert(legacy, { onConflict: 'seller_id' }));
+    }
     if (error) throw new BadRequestException(`Não foi possível salvar o roteamento: ${error.message}`);
   }
 
@@ -1078,6 +1216,7 @@ export function resolveSettings(row: RoutingSettingsRow | null): ResolvedRouting
     feeAcceptedAt: row?.fee_accepted_at ?? null,
     cardStrategy: normalizeStrategy(row?.card_strategy),
     paypalStrategy: normalizeStrategy(row?.paypal_strategy),
+    methodStrategies: normalizeMethodStrategies(row?.method_strategies),
     feePct: effectiveRoutingFeePct(routingFeePct),
     routingFeePct: Number.isFinite(routingFeePct as number) ? routingFeePct : null,
     disputePausePct: Number.isFinite(disputePausePct as number) ? disputePausePct : null,
@@ -1092,7 +1231,7 @@ const HISTORY_DETAIL_KEYS = [
   'label', 'weight', 'priority', 'daily_cap_usd_cents', 'daily_cap_orders',
   'min_ticket_usd_cents', 'max_ticket_usd_cents', 'countries', 'currencies', 'paused_at', 'pause_reason',
   'warmup_started_at', 'warmup_days', 'warmup_start_orders', 'warmup_start_usd_cents', 'warmup_growth_pct',
-  'warmup_max_ticket_usd_cents',
+  'warmup_max_ticket_usd_cents', 'methods', 'strategies', 'slot',
   'reason', 'disputes_7d', 'approved_7d', 'limit_pct', 'provider', 'mode', 'amount_cents', 'currency', 'routing', 'hostname',
 ] as const;
 

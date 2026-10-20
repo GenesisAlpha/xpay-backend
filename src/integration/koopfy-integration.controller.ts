@@ -221,7 +221,8 @@ export class KoopfyIntegrationController {
     return this.svc.routingView(req.sellerCtx);
   }
 
-  // Body: { enabled?, acceptFee?, cardStrategy?, paypalStrategy? }
+  // Body: { enabled?, acceptFee?, strategies?: { [slot]: estratégia | null }, cardStrategy?, paypalStrategy? }
+  // (cardStrategy/paypalStrategy = apelidos de strategies.card/strategies.paypal)
   @Put('routing')
   @UseGuards(CrossServiceJwtGuard)
   updateRouting(@Req() req: any, @Body() body: any) {

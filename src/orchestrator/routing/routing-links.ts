@@ -1,8 +1,10 @@
 // ============================================================================
 // CONTAS POR LINK NO ROTEAMENTO — leituras e gravações
 // ----------------------------------------------------------------------------
-// Conta por link = o comprador paga fora do checkout da Koopfy (hoje: loja
-// Shopify do seller, no checkout da Shopify com Shopify Payments). O pay não
+// Conta por link = o comprador paga fora do checkout da Koopfy: loja Shopify
+// do seller (checkout da Shopify com Shopify Payments) ou conta Digistore24
+// (formulário de pedido padrão da conta, só em oferta digital de pagamento
+// único — quem decide é o backend, pelo `linkProviders` do config). O pay não
 // tem credencial nem cobra nela: o backend do checkout registra a conta aqui e
 // informa cada venda (aprovada, estornada, disputada), que alimenta a mesma
 // estatística e os mesmos tetos das contas que o pay cobra.
@@ -10,12 +12,13 @@
 
 import { BadRequestException } from '@nestjs/common';
 import { supabase } from '../../lib/supabase.client';
-import { StatsTxRow, TodayTxRow, toShopifyLinkAccountId } from './seller-routing';
+import { StatsTxRow, TodayTxRow, toDigistoreLinkAccountId, toShopifyLinkAccountId } from './seller-routing';
 
 export const LINK_ACCOUNTS_TABLE = 'seller_link_accounts';
 export const LINK_SALES_TABLE = 'routing_link_sales';
 
-export type LinkProvider = 'shopify';
+export type LinkProvider = 'shopify' | 'digistore24';
+const LINK_PROVIDER_LIST: LinkProvider[] = ['shopify', 'digistore24'];
 export type LinkSaleStatus = 'approved' | 'refunded' | 'partially_refunded' | 'chargeback';
 
 export interface LinkAccountRow {
@@ -34,12 +37,17 @@ const REF_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const SALE_STATUSES: LinkSaleStatus[] = ['approved', 'refunded', 'partially_refunded', 'chargeback'];
 
 export function linkAccountId(row: Pick<LinkAccountRow, 'id' | 'provider'>): string {
-  return toShopifyLinkAccountId(row.id);
+  return row.provider === 'digistore24' ? toDigistoreLinkAccountId(row.id) : toShopifyLinkAccountId(row.id);
+}
+
+/** Métodos que a conta por link atende (o checkout dela): só o slot do cartão. */
+export function linkMethodsOf(provider: LinkProvider): string[] {
+  return provider === 'digistore24' ? ['digistore_checkout'] : ['shopify_checkout'];
 }
 
 export function parseLinkProvider(value: unknown): LinkProvider {
-  if (value !== 'shopify') throw new BadRequestException('Provedor por link inválido.');
-  return value;
+  if (!LINK_PROVIDER_LIST.includes(value as LinkProvider)) throw new BadRequestException('Provedor por link inválido.');
+  return value as LinkProvider;
 }
 
 export function parseExternalRef(value: unknown): string {

@@ -22,6 +22,8 @@ export interface RoutingSettingsRow {
   fee_accepted_at: string | null;
   card_strategy: string | null;
   paypal_strategy: string | null;
+  /** Estratégia por slot de método ({ slot: estratégia }); ausente antes da migration. */
+  method_strategies?: Record<string, string> | null;
   routing_fee_pct: number | string | null;
   dispute_pause_pct: number | string | null;
   updated_by?: string | null;

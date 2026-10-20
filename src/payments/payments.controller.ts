@@ -86,13 +86,16 @@ export class PaymentController {
     @Query('country') country?: string,
     @Query('currency') currency?: string,
     @Query('link') link?: string,
+    // CSV de shopify,digistore24: contas por link que podem concorrer ao cartão (padrão: shopify).
+    @Query('linkProviders') linkProviders?: string,
   ) {
-    return this.paymentService.getPaymentConfig(req.sellerId as string, { routingKey, country, currency, link });
+    return this.paymentService.getPaymentConfig(req.sellerId as string, { routingKey, country, currency, link, linkProviders });
   }
 
-  // ─── Contas por link no roteamento (lojas Shopify) ─────────────────────
-  // O backend do checkout guarda a credencial da loja e chama estas rotas com a
-  // sk_live_ do seller: registrar/desligar a loja e informar cada venda.
+  // ─── Contas por link no roteamento (lojas Shopify, Digistore24) ────────
+  // O backend do checkout guarda a credencial da conta e chama estas rotas com a
+  // sk_live_ do seller (`provider`: 'shopify' | 'digistore24'): registrar/
+  // desligar a conta e informar cada venda.
 
   @Post('routing/link-accounts')
   @UseGuards(ApiKeyGuard)

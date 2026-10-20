@@ -516,9 +516,20 @@ describe('contas por link e fase da conta', () => {
     expect(linkModeAllows('shopify', 'only')).toBe(true)
     expect(linkModeAllows('stripe', 'only')).toBe(false)
   })
-  it('id shopifyp_ é Shopify no grupo de cartão', () => {
+  it('id shopifyp_ é Shopify e digistp_ é Digistore24, as duas no grupo de cartão (campo antigo)', () => {
     expect(ownProviderOfId('shopifyp_abc')).toBe('shopify')
+    expect(ownProviderOfId('digistp_abc')).toBe('digistore24')
     expect(groupOfProvider('shopify')).toBe('card')
+    expect(groupOfProvider('digistore24')).toBe('card')
+    expect(groupOfProvider('paypal')).toBe('paypal')
+  })
+  it('link providers: sem lista vale só Shopify; Digistore24 só quando o checkout manda', () => {
+    expect(linkModeAllows('digistore24', 'allow')).toBe(false)
+    expect(linkModeAllows('digistore24', 'allow', ['shopify', 'digistore24'])).toBe(true)
+    expect(linkModeAllows('shopify', 'only', ['digistore24'])).toBe(false)
+    expect(linkModeAllows('digistore24', 'only', ['digistore24'])).toBe(true)
+    expect(linkModeAllows('stripe', 'allow', ['digistore24'])).toBe(true)
+    expect(linkModeAllows('digistore24', undefined, ['digistore24'])).toBe(false)
   })
   it('fase: aquecendo, pronta para escalar e ativa', () => {
     const base = defaultAccountConfig('shopifyp_x', 's', 'shopify')
@@ -554,5 +565,80 @@ describe('métodos por conta', () => {
     expect(parseAccountPatch({ methods: ['credit_card', 'PIX', 'pix'] }, base, 'now')).toEqual({ methods: ['card', 'pix'] })
     expect(parseAccountPatch({ methods: [] }, base, 'now')).toEqual({ methods: null })
     expect(() => parseAccountPatch({ methods: ['<script>'] }, base, 'now')).toThrow('Método inválido')
+  })
+})
+
+describe('slots de método', () => {
+  const s = require('./seller-routing')
+  it('cartão e carteiras num slot só; o resto é o próprio método', () => {
+    for (const m of ['card', 'credit_card', 'Debit_Card', 'apple_pay', 'google_pay']) expect(s.slotOfMethod(m)).toBe('card')
+    expect(s.slotOfMethod('paypal')).toBe('paypal')
+    expect(s.slotOfMethod('PIX')).toBe('pix')
+    expect(s.slotOfMethod('ideal')).toBe('ideal')
+  })
+  it('slots da conta: link só cartão, PayPal só PayPal, Whop/Stripe pelos métodos efetivos', () => {
+    expect(s.slotsOfAccount('shopify', ['shopify_checkout'])).toEqual(['card'])
+    expect(s.slotsOfAccount('digistore24', ['digistore_checkout'])).toEqual(['card'])
+    expect(s.slotsOfAccount('paypal', ['paypal'])).toEqual(['paypal'])
+    expect(s.slotsOfAccount('stripe', ['ideal', 'credit_card', 'apple_pay', 'bancontact'])).toEqual(['card', 'bancontact', 'ideal'])
+    const cfg = { ...s.defaultAccountConfig('whopa_x', 's', 'whop'), methods: ['pix'] }
+    expect(s.slotsOfAccount('whop', s.effectiveMethods('whop', ['credit_card', 'pix'], cfg))).toEqual(['pix'])
+    // Whop sem nada lido atende pelo menos o cartão (como antes dos slots).
+    expect(s.effectiveMethods('whop', [], null)).toEqual(['credit_card'])
+  })
+  it('estratégia do slot: a gravada, senão paypal_strategy no PayPal e card_strategy no resto', () => {
+    const settings = { cardStrategy: 'priority_cap', paypalStrategy: 'score', methodStrategies: { pix: 'revenue_split' } }
+    expect(s.strategyOfSlot(settings, 'card')).toBe('priority_cap')
+    expect(s.strategyOfSlot(settings, 'paypal')).toBe('score')
+    expect(s.strategyOfSlot(settings, 'pix')).toBe('revenue_split')
+    expect(s.strategyOfSlot(settings, 'ideal')).toBe('priority_cap')
+    expect(s.normalizeMethodStrategies({ pix: 'score', 'X!': 'score', card: 'lixo' })).toEqual({ pix: 'score' })
+  })
+  it('PUT strategies: valida slot e estratégia; null remove', () => {
+    expect(s.parseStrategiesPatch({ PIX: 'score', card: null })).toEqual({ pix: 'score', card: null })
+    expect(() => s.parseStrategiesPatch({ 'pi x': 'score' })).toThrow()
+    try { s.parseStrategiesPatch({ 'pi x': 'score' }) } catch (e: any) { expect(e.getResponse()).toMatchObject({ error: 'ROUTING_INVALID_SLOT' }) }
+    try { s.parseStrategiesPatch({ pix: 'x' }) } catch (e: any) { expect(e.getResponse()).toMatchObject({ error: 'ROUTING_INVALID_STRATEGY' }) }
+  })
+  it('atribuição do slot: method_accounts, senão as colunas antigas no cartão e no PayPal', () => {
+    const a = { card_account_id: 'stripel_a', paypal_account_id: 'paypall_b', method_accounts: { pix: 'whopa_c' } }
+    expect(s.assignedOfSlot(a, 'card')).toBe('stripel_a')
+    expect(s.assignedOfSlot(a, 'paypal')).toBe('paypall_b')
+    expect(s.assignedOfSlot(a, 'pix')).toBe('whopa_c')
+    expect(s.assignedOfSlot(a, 'ideal')).toBeNull()
+    expect(s.assignedOfSlot(null, 'card')).toBeNull()
+  })
+  it('linkProviders do config: CSV filtrado, padrão Shopify', () => {
+    expect(s.parseLinkProviders(undefined)).toEqual(['shopify'])
+    expect(s.parseLinkProviders('digistore24, SHOPIFY,lixo')).toEqual(['digistore24', 'shopify'])
+    expect(s.parseLinkProviders('lixo')).toEqual(['shopify'])
+  })
+  it('conta por link: ids e prefixo', () => {
+    expect(s.toDigistoreLinkAccountId('u1')).toBe('digistp_u1')
+    expect(s.isLinkAccountId('digistp_u1')).toBe(true)
+    expect(s.linkRowIdOf('digistp_u1')).toBe('u1')
+    expect(s.linkRowIdOf('shopifyp_u2')).toBe('u2')
+    // O prefixo cabe na regex do backend do checkout.
+    expect(/^[a-z]{4,8}_/.test('digistp_u1')).toBe(true)
+  })
+  it('conta que já recebe: só ativas, pelo formulário, com slot em comum', () => {
+    const pool = [
+      { id: 'whopl_1', provider: 'whop', connection: 'active', slots: ['card', 'pix'] },
+      { id: 'stripel_i', provider: 'stripe', connection: 'active', slots: ['ideal'] },
+      { id: 'shopifyp_1', provider: 'shopify', connection: 'active', slots: ['card'] },
+      { id: 'paypall_1', provider: 'paypal', connection: 'active', slots: ['paypal'] },
+      { id: 'stripel_s', provider: 'stripe', connection: 'standby', slots: ['card'] },
+    ]
+    expect(s.occupyingAccounts('stripe', pool).map((e: any) => e.id)).toEqual(['whopl_1'])
+    expect(s.occupyingAccounts('paypal', pool).map((e: any) => e.id)).toEqual(['paypall_1'])
+  })
+  it('desligar conta sobreposição de slots e uma por provedor', () => {
+    const kept = s.keptOnDisable([
+      { id: 'stripel_a', provider: 'stripe', priority: 1, slots: ['card', 'ideal'] },
+      { id: 'stripel_b', provider: 'stripe', priority: 2, slots: ['bancontact'] },
+      { id: 'whopl_biz', provider: 'whop', priority: 3, slots: ['card', 'pix'] },
+      { id: 'paypall_a', provider: 'paypal', priority: 9, slots: ['paypal'] },
+    ])
+    expect([...kept].sort()).toEqual(['paypall_a', 'stripel_a'])
   })
 })

@@ -37,13 +37,15 @@ jest.mock('../../lib/supabase.client', () => ({
         maybeSingle: async () => ({ data: rows()[0] ?? null, error: null }),
         then: (resolve: any) => resolve({ data: rows(), error: null }),
         insert: async (row: any) => { (tables[table] ??= []).push(row); return { error: null } },
-        upsert: async (row: any, opts: { onConflict: string }) => {
+        upsert: (row: any, opts: { onConflict: string }) => {
           const keys = opts.onConflict.split(',')
           const list = (tables[table] ??= [])
-          const found = list.find(r => keys.every(k => r[k] === row[k]))
+          let found = list.find(r => keys.every(k => r[k] === row[k]))
           if (found) Object.assign(found, row)
-          else list.push({ ...row })
-          return { error: null }
+          else { found = { ...row }; if (table === 'seller_link_accounts' && !found.id) found.id = `row${list.length + 1}`; list.push(found) }
+          const result = { error: null }
+          // upsert(...).select('*').single() (contas por link) e await direto.
+          return { ...result, then: (resolve: any) => resolve(result), select: () => ({ single: async () => ({ data: found, error: null }) }) }
         },
         update: (patch: any) => ({
           eq: async (column: string, value: any) => {
@@ -548,11 +550,165 @@ describe('métodos por conta no roteamento', () => {
     expect(view.accounts.find((a: any) => a.id === 'stripel_aaa')).toMatchObject({ enabledMethods: ['card'] })
   })
 
-  it('Pix numa sessão da Stripe só-cartão vai para a Whop (409 e recarrega)', async () => {
+  it('Stripe só-cartão: o cartão fica na Stripe e o Pix já sai da Whop no config (sem 409)', async () => {
     const svc = build()
-    expect((await svc.resolveForConfig(SELLER, 'sess-1'))?.card?.id).toBe('stripel_aaa')
-    await expect(svc.resolveForSale(SELLER, { method: 'pix', routingKey: 'sess-1' })).rejects.toBeInstanceOf(ConflictException)
-    expect((await svc.resolveForConfig(SELLER, 'sess-1'))?.card?.id).toBe('whopa_bbbb')
-    expect(await svc.resolveForSale(SELLER, { method: 'pix', routingKey: 'sess-1' })).toMatchObject({ kind: 'account', entry: { id: 'whopa_bbbb' } })
+    const pick = await svc.resolveForConfig(SELLER, 'sess-1')
+    expect(pick?.card?.id).toBe('stripel_aaa')
+    expect(pick?.slots?.get('pix')?.id).toBe('whopa_bbbb')
+    expect(tables.routing_assignments[0]).toMatchObject({ card_account_id: 'stripel_aaa', method_accounts: { card: 'stripel_aaa', pix: 'whopa_bbbb' } })
+    expect(await svc.resolveForSale(SELLER, { method: 'pix', routingKey: 'sess-1' })).toMatchObject({ kind: 'account', reason: 'session', entry: { id: 'whopa_bbbb' } })
+    expect(await svc.resolveForSale(SELLER, { method: 'card', routingKey: 'sess-1' })).toMatchObject({ kind: 'account', reason: 'session', entry: { id: 'stripel_aaa' } })
+  })
+})
+
+describe('slots de método', () => {
+  beforeEach(() => {
+    tables.seller_provider_accounts = [providerRow('aaa', 'stripe'), providerRow('bbbb', 'whop'), providerRow('ccccc', 'paypal')]
+    tables.seller_profiles = [{ id: SELLER, enabled_methods: ['credit_card', 'apple_pay', 'pix', 'paypal'] }]
+    routingConfig('stripel_aaa', { priority: 1 })
+    routingConfig('whopa_bbbb', { priority: 2, provider: 'whop' })
+  })
+
+  it('cada slot usa a sua estratégia; sem a dele, card_strategy (e paypal_strategy no PayPal)', async () => {
+    // Cartão em cascata (Stripe primeiro); Pix só a Whop atende.
+    enableRouting({ card_strategy: 'priority_cap', method_strategies: { pix: 'score' } })
+    const svc = build()
+    const view: any = await svc.view(SELLER)
+    expect(view.strategies).toEqual({ card: 'priority_cap', paypal: 'orders_split', pix: 'score' })
+    expect(view.slots).toEqual([
+      { slot: 'card', strategy: 'priority_cap', accountIds: ['stripel_aaa', 'whopa_bbbb'] },
+      { slot: 'paypal', strategy: 'orders_split', accountIds: ['paypall_ccccc'] },
+      { slot: 'pix', strategy: 'score', accountIds: ['whopa_bbbb'] },
+    ])
+    expect(view.accounts.map((a: any) => [a.id, a.group, a.slots])).toEqual([
+      ['stripel_aaa', 'card', ['card']],
+      ['whopa_bbbb', 'card', ['card', 'pix']],
+      ['paypall_ccccc', 'paypal', ['paypal']],
+    ])
+
+    // card em cascata → Stripe; com method_strategies.card = orders_split e a
+    // Stripe já com uma venda hoje, a Whop recebe o cartão.
+    tables.seller_routing_settings[0].method_strategies = { card: 'orders_split' }
+    tables.transactions = [{ seller_id: SELLER, provider_account_id: 'stripel_aaa', status: 'approved', amount_usd_gross_cents: 1000 }]
+    expect((await build().resolveForConfig(SELLER, 'sess-x'))?.card?.id).toBe('whopa_bbbb')
+  })
+
+  it('reaproveita a conta de cada slot e a reatribuição reescreve só o slot da venda', async () => {
+    enableRouting()
+    const svc = build()
+    await svc.resolveForConfig(SELLER, 'sess-1')
+    expect(tables.routing_assignments[0].method_accounts).toEqual({ card: 'stripel_aaa', paypal: 'paypall_ccccc', pix: 'whopa_bbbb' })
+
+    // A Whop sai do ar no Pix (pausa manual): a venda de Pix pede recarga, o cartão não muda.
+    Object.assign(tables.seller_routing_accounts.find(r => r.provider_account_id === 'whopa_bbbb'), { paused_at: '2026-09-28T11:00:00Z', pause_reason: 'manual' })
+    // Nenhuma outra conta oferece Pix: erro claro (não 409 em loop) e a sessão segue igual.
+    const err = await svc.resolveForSale(SELLER, { method: 'pix', routingKey: 'sess-1' }).catch(e => e)
+    expect(err).toBeInstanceOf(BadRequestException)
+    expect(err.getResponse()).toMatchObject({ error: 'ROUTING_NO_ACCOUNT' })
+    expect(await svc.resolveForSale(SELLER, { method: 'credit_card', routingKey: 'sess-1' })).toMatchObject({ reason: 'session', entry: { id: 'stripel_aaa' } })
+    expect(tables.routing_assignments[0].method_accounts).toEqual({ card: 'stripel_aaa', paypal: 'paypall_ccccc', pix: 'whopa_bbbb' })
+  })
+
+  it('reatribuição por slot: troca só o slot da venda e espelha nas colunas antigas', async () => {
+    enableRouting()
+    tables.seller_provider_accounts.push(providerRow('dddddd', 'whop'))
+    routingConfig('whopa_dddddd', { priority: 3, provider: 'whop' })
+    const svc = build()
+    await svc.resolveForConfig(SELLER, 'sess-1')
+    expect(tables.routing_assignments[0].method_accounts.pix).toBe('whopa_bbbb')
+    Object.assign(tables.seller_routing_accounts.find(r => r.provider_account_id === 'whopa_bbbb'), { paused_at: '2026-09-28T11:00:00Z', pause_reason: 'manual' })
+    const err = await svc.resolveForSale(SELLER, { method: 'pix', routingKey: 'sess-1' }).catch(e => e)
+    expect(err).toBeInstanceOf(ConflictException)
+    expect(tables.routing_assignments[0]).toMatchObject({
+      card_account_id: 'stripel_aaa', paypal_account_id: 'paypall_ccccc',
+      method_accounts: { card: 'stripel_aaa', paypal: 'paypall_ccccc', pix: 'whopa_dddddd' },
+    })
+  })
+
+  it('sessão gravada antes dos slots: as colunas antigas valem (e a conta do cartão atende o Pix dela)', async () => {
+    enableRouting()
+    tables.routing_assignments = [{ routing_key: 'old', seller_id: SELLER, card_account_id: 'whopa_bbbb', paypal_account_id: 'paypall_ccccc', expires_at: '2026-09-29T00:00:00Z' }]
+    const svc = build()
+    expect(await svc.resolveForSale(SELLER, { method: 'pix', routingKey: 'old' })).toMatchObject({ reason: 'session', entry: { id: 'whopa_bbbb' } })
+    expect((await svc.resolveForConfig(SELLER, 'old'))?.card?.id).toBe('whopa_bbbb')
+  })
+
+  it('slot que nenhuma conta oferece segue o fluxo de antes', async () => {
+    enableRouting()
+    expect(await build().resolveForSale(SELLER, { method: 'mbway' })).toEqual({ kind: 'legacy' })
+  })
+
+  it('PUT strategies: merge por slot, espelho nas colunas antigas, apelidos e erros', async () => {
+    enableRouting()
+    const svc = build()
+    let view: any = await svc.update(SELLER, { strategies: { pix: 'score', card: 'revenue_split' } }, 'seller:u')
+    expect(tables.seller_routing_settings[0]).toMatchObject({ card_strategy: 'revenue_split', method_strategies: { pix: 'score', card: 'revenue_split' } })
+    expect(view).toMatchObject({ cardStrategy: 'revenue_split', strategies: { card: 'revenue_split', pix: 'score', paypal: 'orders_split' } })
+
+    view = await svc.update(SELLER, { paypalStrategy: 'priority_cap' }, 'seller:u')
+    expect(tables.seller_routing_settings[0]).toMatchObject({ paypal_strategy: 'priority_cap', method_strategies: { pix: 'score', card: 'revenue_split', paypal: 'priority_cap' } })
+    expect(view.paypalStrategy).toBe('priority_cap')
+
+    // null volta ao padrão do slot (card_strategy).
+    view = await svc.update(SELLER, { strategies: { pix: null } }, 'seller:u')
+    expect(view.strategies.pix).toBe('revenue_split')
+
+    const badSlot = await svc.update(SELLER, { strategies: { 'Pix!': 'score' } }, null).catch(e => e)
+    expect(badSlot.getResponse()).toMatchObject({ error: 'ROUTING_INVALID_SLOT' })
+    const badStrategy = await svc.update(SELLER, { strategies: { pix: 'aleatorio' } }, null).catch(e => e)
+    expect(badStrategy.getResponse()).toMatchObject({ error: 'ROUTING_INVALID_STRATEGY' })
+
+    const { events } = await svc.history(SELLER)
+    expect(events.find(e => e.details.strategies && (e.details.strategies as any).pix === 'score')).toBeTruthy()
+  })
+})
+
+describe('Digistore24 por link', () => {
+  it('ids, provedor e métodos da conta por link', () => {
+    const links = require('./routing-links')
+    expect(links.linkAccountId({ id: 'u1', provider: 'digistore24' })).toBe('digistp_u1')
+    expect(links.linkAccountId({ id: 'u1', provider: 'shopify' })).toBe('shopifyp_u1')
+    expect(links.parseLinkProvider('digistore24')).toBe('digistore24')
+    expect(() => links.parseLinkProvider('hotmart')).toThrow()
+    expect(links.linkMethodsOf('digistore24')).toEqual(['digistore_checkout'])
+  })
+
+  beforeEach(() => {
+    enableRouting({ card_strategy: 'priority_cap' })
+    tables.seller_provider_accounts = [providerRow('aaa', 'stripe'), providerRow('ccccc', 'paypal')]
+    routingConfig('stripel_aaa', { priority: 2 })
+  })
+
+  it('registra, entra no pool com digistp_, só no cartão, e concorre só quando o checkout permite', async () => {
+    const svc = build()
+    const { id, created } = await svc.registerLinkAccount(SELLER, { provider: 'digistore24', externalRef: 'dg-acc-1', name: 'Digistore', currencies: ['eur', 'usd'] })
+    expect(created).toBe(true)
+    expect(id).toBe('digistp_row1')
+    expect(tables.seller_routing_accounts.find(r => r.provider_account_id === id)).toMatchObject({ provider: 'digistore24', currencies: ['EUR', 'USD'] })
+    tables.seller_routing_accounts.find(r => r.provider_account_id === id).priority = 1
+
+    const view: any = await svc.view(SELLER)
+    expect(view.accounts.find((a: any) => a.id === id)).toMatchObject({ provider: 'digistore24', link: true, group: 'card', slots: ['card'], availableMethods: ['digistore_checkout'] })
+
+    // Sem linkProviders (checkout antigo) a Digistore não entra, nem com link=allow.
+    expect((await svc.resolveForConfig(SELLER, 's1', { link: 'allow' }))?.card?.id).toBe('stripel_aaa')
+    const pick = await svc.resolveForConfig(SELLER, 's2', { link: 'allow', linkProviders: ['shopify', 'digistore24'] })
+    expect(pick?.card).toMatchObject({ id, provider: 'digistore24', linkRef: 'dg-acc-1' })
+    expect(svc.linkPickOf(pick)).toEqual({ accountId: id, provider: 'digistore24', linkRef: 'dg-acc-1' })
+    // O PayPal continua na sessão mesmo com o cartão por link.
+    expect(pick?.paypal?.id).toBe('paypall_ccccc')
+    // 'only': cartão só por link; os outros slots seguem.
+    const only = await svc.resolveForConfig(SELLER, 's3', { link: 'only', linkProviders: ['digistore24'] })
+    expect([only?.card?.id, only?.paypal?.id]).toEqual([id, 'paypall_ccccc'])
+  })
+
+  it('venda informada e desligar', async () => {
+    const svc = build()
+    const { id } = await svc.registerLinkAccount(SELLER, { provider: 'digistore24', externalRef: 'dg-acc-1' })
+    await svc.recordLinkSale(SELLER, { provider: 'digistore24', externalRef: 'dg-acc-1', saleRef: 'D-1', status: 'approved', amountUsdGrossCents: 3900 })
+    expect(tables.routing_link_sales).toEqual([expect.objectContaining({ provider_account_id: id, sale_ref: 'D-1' })])
+    // A Shopify com a mesma referência não é a Digistore.
+    await expect(svc.recordLinkSale(SELLER, { provider: 'shopify', externalRef: 'dg-acc-1', saleRef: 'x', status: 'approved', amountUsdGrossCents: 1 })).rejects.toThrow('não encontrada')
+    await expect(svc.registerLinkAccount(SELLER, { provider: 'hotmart', externalRef: 'x' })).rejects.toThrow('Provedor por link inválido')
   })
 })

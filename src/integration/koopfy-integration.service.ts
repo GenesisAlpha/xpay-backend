@@ -34,9 +34,9 @@ import { ActivationRequestsService } from '../activation/activation-requests.ser
 import { WhopConnectService } from '../orchestrator/whop/whop-connect.service';
 import { WhopLinkedAccountsService, sellerMayOperate } from '../orchestrator/whop/whop-linked.service';
 import { isLinkedProviderAccountId, sellerExternalProviderView, toLinkedProviderAccountId } from '../orchestrator/whop/whop-linked';
-import { accountsToReplace, connectionChoice, defaultRoutingFeePct } from '../orchestrator/routing/seller-routing';
+import { accountsToReplace, connectionChoice, defaultRoutingFeePct, occupyingAccounts } from '../orchestrator/routing/seller-routing';
 import { SellerProviderAccountsService } from '../orchestrator/seller-provider/seller-provider-accounts.service';
-import { SellerRoutingService } from '../orchestrator/routing/seller-routing.service';
+import { PoolEntry, SellerRoutingService } from '../orchestrator/routing/seller-routing.service';
 import { OwnAccountFinanceService } from '../orchestrator/own-finance/own-account-finance.service';
 import { OwnPaymentDomainsService } from '../orchestrator/own-finance/own-payment-domains.service';
 import { OwnAccountPermissionsService } from '../orchestrator/own-finance/own-account-permissions.service';
@@ -259,7 +259,7 @@ export class KoopfyIntegrationService {
 
   /**
    * Antes de conectar uma conta: o que fazer com a que já recebe no mesmo
-   * grupo (ver `connectionChoice`). `multiAccount` liga o roteamento (com o
+   * slot (ver `connectionChoice`). `multiAccount` liga o roteamento (com o
    * aceite da taxa), `replace` troca a atual, e sem nenhum dos dois o painel
    * recebe 409 ROUTING_CHOICE_REQUIRED, com a taxa, para perguntar.
    */
@@ -270,11 +270,11 @@ export class KoopfyIntegrationService {
     actor: string,
   ): Promise<{ enabledRouting: boolean; replaceIds: string[] }> {
     const settings = await this.sellerRouting.settings(sellerId);
-    const group = provider === 'paypal' ? 'paypal' : 'card';
+    // Quem "já recebe": contas ativas pelo formulário com algum slot em comum
+    // com a nova (cartão para Whop/Stripe, PayPal para PayPal).
     const occupying = settings.enabled
       ? []
-      : (await this.sellerRouting.loadPool(sellerId, settings).catch(() => []))
-        .filter(entry => entry.group === group && entry.connection === 'active' && entry.provider !== 'shopify');
+      : occupyingAccounts(provider, await this.sellerRouting.loadPool(sellerId, settings).catch((): PoolEntry[] => []));
 
     const choice = connectionChoice({
       routingEnabled: settings.enabled,
@@ -285,7 +285,7 @@ export class KoopfyIntegrationService {
     if (choice === 'proceed') {
       return {
         enabledRouting: false,
-        replaceIds: accountsToReplace({ provider, replace: body?.replace, routingEnabled: settings.enabled, occupying }),
+        replaceIds: accountsToReplace({ provider, replace: body?.replace, routingEnabled: settings.enabled, occupying: occupying as Array<{ id: string; provider: SellerProviderKind | 'whop' }> }),
       };
     }
     if (choice === 'enable') {
