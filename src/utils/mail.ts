@@ -11,6 +11,9 @@ const BRAND = {
     purple: '#8B5CF6',
     purpleDark: '#6D28D9',
     gradient: 'linear-gradient(135deg, #8B5CF6, #6D28D9)',
+    // Cabeçalho da logo: roxo escuro sólido. O degradê claro sumia no Gmail e
+    // no Outlook (não aceitam gradiente) e a logo branca ficava sem contraste.
+    headerBg: '#1e1038',
     bg: '#0a0a0f',
     card: '#16161f',
     cardInner: '#1e1e2a',
@@ -229,7 +232,7 @@ export class MailService {
 
           <!-- Header -->
           <tr>
-            <td style="background:${BRAND.gradient};padding:32px 40px;text-align:center;">
+            <td bgcolor="${BRAND.headerBg}" style="background-color:${BRAND.headerBg};background-image:linear-gradient(135deg, #2e1065, ${BRAND.headerBg});padding:32px 40px;text-align:center;">
               <div style="display:inline-flex;align-items:center;gap:10px;">
                 <div style="background:rgba(255,255,255,0.2);border-radius:10px;padding:8px;display:inline-block;">
                   <span style="color:#fff;font-size:20px;">${icon}</span>

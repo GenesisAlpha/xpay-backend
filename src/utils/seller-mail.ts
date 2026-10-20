@@ -25,6 +25,12 @@ import { supabase } from '../lib/supabase.client';
  * aparece em branco no lugar — o e-mail continua identificado.
  */
 const KOOPFY_EMAIL_LOGO_URL = process.env.EMAIL_LOGO_URL || 'https://app.koopfy.com/assets/images/logo-koopfy.png';
+// Fundo do cabeçalho: roxo escuro em três camadas. `bgcolor` para o Outlook,
+// background-color para o resto e a mesma cor como background-image, que o
+// modo escuro do app do Gmail não inverte. Só com CSS o fundo some ou clareia,
+// e a logo branca fica sem contraste.
+const KOOPFY_EMAIL_HEADER_BG = '#1e1038';
+const KOOPFY_EMAIL_HEADER_ATTRS = `bgcolor="${KOOPFY_EMAIL_HEADER_BG}" style="background-color:${KOOPFY_EMAIL_HEADER_BG};background-image:linear-gradient(${KOOPFY_EMAIL_HEADER_BG},${KOOPFY_EMAIL_HEADER_BG});padding:18px 32px"`;
 const KOOPFY_EMAIL_LOGO_TAG = `<img src="${KOOPFY_EMAIL_LOGO_URL}" alt="Koopfy" width="115" height="28" style="display:block;border:0;outline:none;text-decoration:none;height:28px;width:115px;color:#ffffff;font-size:18px;font-weight:800">`;
 
 export type PayoutEmailEvent = 'requested' | 'approved' | 'rejected' | 'completed' | 'failed';
@@ -323,7 +329,7 @@ function renderEmail(o: {
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f5;padding:28px 12px">
 <tr><td align="center">
 <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="width:100%;max-width:600px;background:#ffffff;border:1px solid ${LINE};border-radius:16px;overflow:hidden">
-<tr><td style="background:#0b0b12;padding:18px 32px">
+<tr><td ${KOOPFY_EMAIL_HEADER_ATTRS}>
 ${KOOPFY_EMAIL_LOGO_TAG}
 </td></tr>
 <tr><td style="padding:28px 32px 8px">
