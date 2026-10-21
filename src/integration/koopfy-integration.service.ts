@@ -54,7 +54,14 @@ import {
   SubscriptionMembershipRow,
   SubscriptionTransactionRow,
 } from './subscription-report';
-import { PaymentAccountMode, parsePaymentAccountMode, readPaymentAccountMode, writePaymentAccountMode } from '../orchestrator/seller-provider/payment-account-mode';
+import {
+  PaymentAccountMode,
+  parsePaymentAccountMode,
+  readPaymentAccountMode,
+  selectExternalAfterConnect,
+  writePaymentAccountMode,
+} from '../orchestrator/seller-provider/payment-account-mode';
+import { listLinkRows } from '../orchestrator/routing/routing-links';
 
 /**
  * Moeda de exibição da carteira. `wallet_balance` guarda centavos sem moeda —
@@ -123,19 +130,26 @@ export class KoopfyIntegrationService {
   async paymentAccountView(ctx: SellerCtx) {
     if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
     const sellerId = ctx.seller.id;
-    const [chosen, counts, linked, profile] = await Promise.all([
+    const [chosen, counts, linked, profile, linkRows] = await Promise.all([
       readPaymentAccountMode(sellerId),
       this.sellerProviders.connectedCounts(sellerId).catch(() => ({ whop: 0, stripe: 0, paypal: 0 })),
       this.whopLinked.status(sellerId).catch(() => null),
       supabase.from('seller_profiles').select('status, provider_default').eq('id', sellerId).maybeSingle(),
+      listLinkRows(sellerId).catch(() => []),
     ]);
     const whopPrincipal = Boolean(sellerExternalProviderView(linked)?.connected);
+    // Lojas Shopify e contas Digistore24 que o backend do checkout registrou
+    // também são provedor externo (contas por link).
+    const linkActive = (provider: 'shopify' | 'digistore24') =>
+      linkRows.filter(row => row.provider === provider && row.status === 'active').length;
     const accounts = {
       whop: counts.whop + (whopPrincipal ? 1 : 0),
       stripe: counts.stripe,
       paypal: counts.paypal,
+      shopify: linkActive('shopify'),
+      digistore24: linkActive('digistore24'),
     };
-    const externalAvailable = accounts.whop + accounts.stripe + accounts.paypal > 0;
+    const externalAvailable = Object.values(accounts).some(count => count > 0);
     const status = String((profile.data as any)?.status ?? ctx.seller.status ?? '');
     const koopfyProvider = (profile.data as any)?.provider_default ?? null;
     // Koopfy Payments exige conta aprovada e provedor configurado pela Koopfy.
@@ -167,7 +181,7 @@ export class KoopfyIntegrationService {
     if (mode === 'external' && !view.external.available) {
       throw new BadRequestException({
         code: 'PAYMENT_ACCOUNT_EXTERNAL_UNAVAILABLE',
-        message: 'Conecte uma conta (Stripe, Whop ou PayPal) antes de escolher o provedor externo.',
+        message: 'Conecte uma conta (Stripe, Whop, PayPal, Shopify ou Digistore24) antes de escolher o provedor externo.',
       });
     }
     try {
@@ -318,10 +332,14 @@ export class KoopfyIntegrationService {
     sellerId: string,
     prepared: { enabledRouting: boolean; replaceIds: string[] },
     actor: string,
+    provider: 'whop' | SellerProviderKind,
     connect: () => Promise<T>,
   ): Promise<T> {
     try {
       const connected = await connect();
+      // Conectar é escolher o provedor externo (payment-account-mode.ts). Só
+      // depois do sucesso; a função nunca lança, então não desfaz a conexão.
+      await selectExternalAfterConnect(sellerId, actor, provider);
       // Apple Pay / Google Pay: o checkout da Koopfy entra na conta dele agora,
       // em segundo plano — a conexão não espera nem falha por isso.
       void this.ownDomains.registerPlatformHostsEverywhere(sellerId);
@@ -403,7 +421,7 @@ export class KoopfyIntegrationService {
     const { sellerId, userId } = await this.sellerForConnection(email, accountSellerId);
     const actor = `seller:${userId}`;
     const prepared = await this.prepareConnection(sellerId, provider, body ?? {}, actor);
-    await this.connectWithChoice(sellerId, prepared, actor, () => provider === 'stripe'
+    await this.connectWithChoice(sellerId, prepared, actor, provider, () => provider === 'stripe'
       ? this.sellerProviders.connectStripe(
         sellerId,
         { secretKey: body?.secretKey, publishableKey: body?.publishableKey, label: body?.label ?? null },
@@ -445,7 +463,7 @@ export class KoopfyIntegrationService {
 
     // Com o roteamento ligado e a principal já conectada, outra company entra
     // como conta Whop EXTRA (whopa_…) — ver WhopLinkedAccountsService.connect.
-    await this.connectWithChoice(sellerId, prepared, actor, () =>
+    await this.connectWithChoice(sellerId, prepared, actor, 'whop', () =>
       this.whopLinked.connect(sellerId, apiKey, actor, { label, replacing: prepared.replaceIds.length > 0 }));
     // Mesma visão do /status (campos da Whop + `providers`).
     return this.externalProviderStatus(sellerId);

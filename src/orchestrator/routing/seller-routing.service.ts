@@ -81,7 +81,7 @@ import {
   upsertLinkRow,
   upsertLinkSale,
 } from './routing-links';
-import { sellerUsesKoopfyPayments } from '../seller-provider/payment-account-mode';
+import { selectExternalAfterConnect, sellerUsesKoopfyPayments } from '../seller-provider/payment-account-mode';
 
 // ============================================================================
 // ROTEAMENTO DE CONTAS PRÓPRIAS DO SELLER
@@ -826,7 +826,22 @@ export class SellerRoutingService implements OnModuleInit {
       await this.writeAccountConfig(sellerId, id, provider, patch);
     }
     await this.log(sellerId, 'system', created ? 'routing.link_account_connected' : 'routing.link_account_updated', { account_id: id, provider });
+    // Conectar a loja é escolher o provedor externo (payment-account-mode.ts):
+    // sem isto, quem estava na Koopfy Payments ficava com a loja fora do pool.
+    // Nunca lança — a conta já está registrada.
+    await selectExternalAfterConnect(sellerId, 'system', provider);
     return { id, created };
+  }
+
+  /**
+   * Conta própria conectada no backend do checkout que não entra no pool (a
+   * Digistore24 antes do produto padrão): só registra a escolha do provedor
+   * externo. Mesmo efeito de conectar Whop/Stripe/PayPal aqui.
+   */
+  async selectExternalForLinkConnect(sellerId: string, body: Record<string, any>) {
+    const provider = parseLinkProvider(body?.provider);
+    const previous = await selectExternalAfterConnect(sellerId, 'system', provider);
+    return { ok: true, mode: 'external' as const, changed: previous !== undefined };
   }
 
   async disableLinkAccount(sellerId: string, body: Record<string, any>) {

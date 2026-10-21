@@ -64,6 +64,7 @@ import { BadRequestException, ConflictException } from '@nestjs/common'
 import { SellerRoutingService } from './seller-routing.service'
 import { AccountRouterService } from '../router/account-router.service'
 import { ownAccountIdOfRow } from '../seller-provider/seller-provider-accounts'
+import { forgetPaymentAccountMode } from '../seller-provider/payment-account-mode'
 
 const SELLER = 's-1'
 
@@ -125,6 +126,7 @@ function routingConfig(id: string, fields: Record<string, any>) {
 beforeEach(() => {
   for (const key of Object.keys(tables)) delete tables[key]
   delete process.env.ROUTING_FEE_PCT_DEFAULT
+  forgetPaymentAccountMode()
 })
 
 describe('roteamento desligado', () => {
@@ -710,5 +712,46 @@ describe('Digistore24 por link', () => {
     // A Shopify com a mesma referência não é a Digistore.
     await expect(svc.recordLinkSale(SELLER, { provider: 'shopify', externalRef: 'dg-acc-1', saleRef: 'x', status: 'approved', amountUsdGrossCents: 1 })).rejects.toThrow('não encontrada')
     await expect(svc.registerLinkAccount(SELLER, { provider: 'hotmart', externalRef: 'x' })).rejects.toThrow('Provedor por link inválido')
+  })
+})
+
+describe('conectar conta por link escolhe o provedor externo', () => {
+  const choice = () => tables.seller_profiles?.find(row => row.id === SELLER)?.config?.payment_account
+  const autoLogs = () => (tables.crm_action_log ?? []).filter(row => row.action === 'seller_provider.payment_account')
+  const flush = () => new Promise(resolve => setImmediate(resolve))
+
+  it('seller na Koopfy Payments: registrar a loja grava external, sem perder o resto da config', async () => {
+    tables.seller_profiles = [{ id: SELLER, config: { payment_account: 'koopfy', other: 1 } }]
+    await build().registerLinkAccount(SELLER, { provider: 'shopify', externalRef: 'shop-1', name: 'Loja' })
+    await flush()
+    expect(tables.seller_profiles[0].config).toEqual({ payment_account: 'external', other: 1 })
+    expect(autoLogs()).toEqual([expect.objectContaining({ payload: expect.objectContaining({ mode: 'external', previous: 'koopfy', reason: 'connected', source: 'shopify' }) })])
+  })
+
+  it('nunca escolheu: passa a external; já era external: nada muda nem vai ao histórico', async () => {
+    tables.seller_profiles = [{ id: SELLER, config: null }]
+    await build().registerLinkAccount(SELLER, { provider: 'digistore24', externalRef: 'dg-1' })
+    expect(choice()).toBe('external')
+    await flush()
+    expect(autoLogs()).toHaveLength(1)
+    await build().registerLinkAccount(SELLER, { provider: 'digistore24', externalRef: 'dg-1' })
+    await flush()
+    expect(autoLogs()).toHaveLength(1)
+  })
+
+  it('registro recusado não mexe na escolha', async () => {
+    tables.seller_profiles = [{ id: SELLER, config: { payment_account: 'koopfy' } }]
+    await expect(build().registerLinkAccount(SELLER, { provider: 'hotmart', externalRef: 'x' })).rejects.toThrow('Provedor por link inválido')
+    expect(choice()).toBe('koopfy')
+  })
+
+  it('Digistore24 conectada fora do pool: só a escolha', async () => {
+    tables.seller_profiles = [{ id: SELLER, config: { payment_account: 'koopfy' } }]
+    const svc = build()
+    expect(await svc.selectExternalForLinkConnect(SELLER, { provider: 'digistore24' })).toEqual({ ok: true, mode: 'external', changed: true })
+    expect(choice()).toBe('external')
+    expect(tables.seller_link_accounts ?? []).toEqual([])
+    expect(await svc.selectExternalForLinkConnect(SELLER, { provider: 'digistore24' })).toEqual({ ok: true, mode: 'external', changed: false })
+    await expect(svc.selectExternalForLinkConnect(SELLER, { provider: 'hotmart' })).rejects.toThrow('Provedor por link inválido')
   })
 })

@@ -111,6 +111,15 @@ export class PaymentController {
     return this.requireRouting().disableLinkAccount(req.sellerId as string, body ?? {});
   }
 
+  // Conta conectada no backend do checkout fora do pool (Digistore24 sem o
+  // produto padrão): conectar escolhe o provedor externo.
+  @Post('routing/link-accounts/connected')
+  @UseGuards(ApiKeyGuard)
+  @HttpCode(HttpStatus.OK)
+  linkAccountConnected(@Req() req: Request, @Body() body: any) {
+    return this.requireRouting().selectExternalForLinkConnect(req.sellerId as string, body ?? {});
+  }
+
   @Post('routing/link-sales')
   @UseGuards(ApiKeyGuard)
   @HttpCode(HttpStatus.OK)

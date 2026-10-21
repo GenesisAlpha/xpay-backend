@@ -79,3 +79,46 @@ export function forgetPaymentAccountMode(sellerId?: string): void {
   if (sellerId) cache.delete(sellerId);
   else cache.clear();
 }
+
+/**
+ * O seller acabou de conectar uma conta própria (Whop, Stripe, PayPal, loja
+ * Shopify, Digistore24): conectar é escolher o provedor externo. Sem isto a
+ * escolha antiga ('koopfy', ou nenhuma) ficava valendo e Pagamentos não
+ * mostrava o provedor externo em uso.
+ *
+ * Só depois da conexão dar certo, e nunca derruba a conexão: falha aqui vai
+ * para o log. Devolve o modo anterior (null = nunca escolheu) ou undefined
+ * quando nada foi gravado (já era 'external', ou a gravação falhou).
+ */
+export async function selectExternalAfterConnect(
+  sellerId: string,
+  actor: string,
+  source: string,
+): Promise<PaymentAccountMode | null | undefined> {
+  if (!sellerId) return undefined;
+  try {
+    // Lê do banco, não do cache: a escolha pode ter mudado em outra instância.
+    forgetPaymentAccountMode(sellerId);
+    const previous = await readPaymentAccountMode(sellerId);
+    if (previous === 'external') return undefined;
+    await writePaymentAccountMode(sellerId, 'external');
+    // Mesma trilha da escolha pela tela; falha aqui não desfaz nada.
+    void Promise.resolve(supabase.from('crm_action_log').insert({
+      seller_id: sellerId,
+      manager_id: null,
+      action: 'seller_provider.payment_account',
+      resource_type: 'seller',
+      resource_id: sellerId,
+      payload: { actor, mode: 'external', previous, reason: 'connected', source },
+      created_at: new Date().toISOString(),
+    })).then((result: any) => {
+      if (result?.error) console.error('[PaymentAccount] histórico da escolha automática:', result.error.message);
+    }, (err: any) => console.error('[PaymentAccount] histórico da escolha automática:', err?.message));
+    return previous;
+  } catch (err: any) {
+    // A conexão já deu certo: o seller pode escolher pela tela.
+    forgetPaymentAccountMode(sellerId);
+    console.error(`[PaymentAccount] provedor externo não selecionado para ${sellerId} após conectar (${source}):`, err?.message);
+    return undefined;
+  }
+}
