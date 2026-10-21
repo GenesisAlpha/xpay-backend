@@ -24,6 +24,7 @@ import {
   isStripeOwnAccountId,
   isWhopExtraAccountId,
   normalizeCommissionPct,
+  ownSaleCommissionPct,
   ownAccountIdOfRow,
   ownProviderConflict,
   providerChargeBlocker,
@@ -36,6 +37,7 @@ import {
   stripeEnabledMethodsFrom,
 } from './seller-provider-accounts';
 import { sellerUsesKoopfyPayments } from './payment-account-mode';
+import { getSellerFees } from '../../shared/fee.calculator';
 
 // ============================================================================
 // CONTAS STRIPE E PAYPAL PRÓPRIAS DO SELLER (provedor externo)
@@ -831,10 +833,13 @@ async function loadLinkedRow(sellerId: string): Promise<any | null> {
 
 /** Quais contas próprias estão cobrando agora. */
 export async function ownAccountsCharging(sellerId: string): Promise<{ whop: boolean; stripe: boolean; paypal: boolean; commissionPct: number }> {
-  const [linked, rows, koopfy] = await Promise.all([loadLinkedRow(sellerId), loadSellerProviderRows(sellerId), sellerUsesKoopfyPayments(sellerId)]);
+  const [linked, rows, koopfy, fees] = await Promise.all([
+    loadLinkedRow(sellerId), loadSellerProviderRows(sellerId), sellerUsesKoopfyPayments(sellerId), getSellerFees(sellerId),
+  ]);
+  const commissionPct = ownSaleCommissionPct(fees, linked?.commission_pct);
   // Seller escolheu a Koopfy Payments: as contas próprias seguem conectadas,
   // mas nenhuma cobra (ver payment-account-mode.ts).
-  if (koopfy) return { whop: false, stripe: false, paypal: false, commissionPct: normalizeCommissionPct(linked?.commission_pct) };
+  if (koopfy) return { whop: false, stripe: false, paypal: false, commissionPct };
   const charging = (provider: SellerProviderRowKind) =>
     rows.some(row => row.provider === provider && providerChargeBlocker(row) === null);
   return {
@@ -843,16 +848,18 @@ export async function ownAccountsCharging(sellerId: string): Promise<{ whop: boo
     whop: (Boolean(linked) && linkedChargeBlocker(linked as WhopLinkedAccountRow) === null) || charging('whop'),
     stripe: charging('stripe'),
     paypal: charging('paypal'),
-    commissionPct: normalizeCommissionPct(linked?.commission_pct),
+    commissionPct,
   };
 }
 
 /**
- * Comissão da Koopfy (%) sobre venda em conta própria: o percentual do CRM
- * (whop_linked_accounts.commission_pct, em qualquer status) ou 3%.
+ * Comissão da Koopfy (%) sobre venda em conta própria: a taxa de checkout
+ * única quando o plano ou o CRM já a gravaram; antes disso, o percentual do
+ * CRM (whop_linked_accounts.commission_pct, em qualquer status) ou 3%.
  */
 export async function ownAccountCommissionPct(sellerId: string): Promise<number> {
-  return normalizeCommissionPct((await loadLinkedRow(sellerId))?.commission_pct);
+  const [linked, fees] = await Promise.all([loadLinkedRow(sellerId), getSellerFees(sellerId)]);
+  return ownSaleCommissionPct(fees, linked?.commission_pct);
 }
 
 /**

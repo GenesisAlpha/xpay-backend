@@ -82,3 +82,13 @@ export function feeChanges(before: FeeSettings, after: FeeSettings) {
       .map((f) => [f.column, { from: before[f.key], to: after[f.key] }]),
   )
 }
+
+/**
+ * Colunas da taxa de checkout quando o CRM a alterou: origem 'crm' e a hora.
+ * Sem mudança no "Checkout (%)" não toca na origem — o plano (ou o 'legacy')
+ * continua valendo.
+ */
+export function checkoutFeeWrite(before: FeeSettings, after: FeeSettings, now = new Date()) {
+  if (before.checkoutFeePct === after.checkoutFeePct) return {}
+  return { checkout_fee_source: 'crm' as const, checkout_fee_updated_at: now.toISOString() }
+}

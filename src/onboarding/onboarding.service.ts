@@ -1,6 +1,6 @@
 import { Injectable, BadRequestException } from '@nestjs/common'
 import { supabase } from '../lib/supabase.client'
-import { DEFAULT_FEE_SETTINGS, sellerFeesRow } from '../shared/fee.calculator'
+import { onboardingFeeRow } from '../shared/fee.calculator'
 import { StorageService } from '../lib/storage.service'
 import { DocumentsDto, RequirementsDto } from './onboarding.dto'
 import { ActivationRequestsService } from '../activation/activation-requests.service'
@@ -134,10 +134,17 @@ export class OnboardingService {
 
     // ─── 5. Provisiona seller_fees (tarifas por risco) ─────────────────────────
     // Tarifa padrão; o CRM confirma ou ajusta na aprovação.
+    // Seller novo nasce com a taxa de checkout do plano gratuito (origem
+    // 'plan'); quem já tinha linha mantém a taxa e a origem que tinha.
+    const { data: existingFees } = await supabase
+      .from('seller_fees')
+      .select('checkout_fee_pct, checkout_fee_source, checkout_fee_updated_at')
+      .eq('seller_id', sellerProfile.id)
+      .maybeSingle()
     await supabase.from('seller_fees').upsert({
       seller_id:         sellerProfile.id,
       risk_level:        dto.overallRiskLevel,
-      ...sellerFeesRow(DEFAULT_FEE_SETTINGS),
+      ...onboardingFeeRow(existingFees),
       anticipation_days: 0,
       updated_at:        new Date().toISOString(),
     }, { onConflict: 'seller_id' })

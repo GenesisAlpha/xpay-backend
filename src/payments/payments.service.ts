@@ -17,7 +17,7 @@ import {
 } from '../orchestrator/seller-provider/seller-provider-accounts'
 import { applyAccountMethods, parseLinkProviders, slotOfMethod } from '../orchestrator/routing/seller-routing'
 import { PoolEntry, SellerRoutingService, RoutingSalePick, normalizeRoutingKey } from '../orchestrator/routing/seller-routing.service'
-import { ownAccountCommissionUsdCents } from '../orchestrator/routing/seller-routing'
+import { ownAccountCommissionUsdCents, ownAccountFeeLines } from '../orchestrator/routing/seller-routing'
 import { PaypalProvider } from '../orchestrator/providers/paypal.provider'
 import { validateMbwayPhone } from '../utils/mbway.validator'
 import { RetrieveResponse } from '../orchestrator/providers/provider.types'
@@ -359,6 +359,8 @@ export class PaymentService {
                 commission_pct: ownAccountPct,
                 routing_fee_pct: routingFeePct,
                 commission_usd_cents: ownAccountCommissionUsdCents(grossUSDcents, ownAccountPct as number, routingFeePct),
+                // Uma linha por taxa (checkout e roteamento), para o extrato.
+                ...ownAccountFeeLines(grossUSDcents, ownAccountPct as number, routingFeePct),
             }
             : null
         const fxFeeUSDcents = saleFees.fxFeeCents

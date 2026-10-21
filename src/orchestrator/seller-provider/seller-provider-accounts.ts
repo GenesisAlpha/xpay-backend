@@ -18,6 +18,7 @@
 // ============================================================================
 
 import { DEFAULT_LINKED_COMMISSION_PCT, isLinkedProviderAccountId } from '../whop/whop-linked';
+import { type CheckoutFeeSource, checkoutFeeIsUnified } from '../../shared/checkout-fee-source';
 
 export type OwnProvider = 'whop' | 'stripe' | 'paypal';
 export type SellerProviderKind = 'stripe' | 'paypal';
@@ -207,6 +208,23 @@ export function normalizeCommissionPct(raw: unknown): number {
   // null/ausente = padrão (Number(null) seria 0% e a Koopfy não cobraria nada).
   const pct = raw === null || raw === undefined || raw === '' ? NaN : Number(raw);
   return Number.isFinite(pct) && pct >= 0 ? pct : DEFAULT_LINKED_COMMISSION_PCT;
+}
+
+/**
+ * Comissão da Koopfy (%) numa venda pela conta própria do seller — sem a taxa
+ * de roteamento, que vem por fora (só com o roteamento ligado).
+ *
+ *   • Taxa de checkout única ('plan' ou 'crm'): seller_fees.checkout_fee_pct,
+ *     a mesma de toda venda.
+ *   • 'legacy' (ou sem linha em seller_fees): o que cobrava antes — o
+ *     percentual do CRM em whop_linked_accounts ou 3%.
+ */
+export function ownSaleCommissionPct(
+  fees: { checkoutFeeSource: CheckoutFeeSource; checkoutFeePct: number } | null | undefined,
+  linkedCommissionPct: unknown,
+): number {
+  if (fees && checkoutFeeIsUnified(fees)) return fees.checkoutFeePct;
+  return normalizeCommissionPct(linkedCommissionPct);
 }
 
 // ─── O que o painel vê ─────────────────────────────────────────────────────

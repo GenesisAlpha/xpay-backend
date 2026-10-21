@@ -897,6 +897,21 @@ export function effectiveDisputePausePct(overridePct: unknown): number {
  * bruto × (comissão do seller + taxa de roteamento) ÷ 100. Com o roteamento
  * desligado a taxa de roteamento é 0 e o valor é o de sempre.
  */
+/**
+ * As linhas da venda em conta própria, cada uma com o seu valor: a taxa de
+ * checkout e a de roteamento (0 com o roteamento desligado). O total que vira
+ * débito continua sendo ownAccountCommissionUsdCents (pode diferir um
+ * centavo da soma das linhas pelo arredondamento).
+ */
+export function ownAccountFeeLines(grossUsdCents: number, commissionPct: number, routingFeePct: number) {
+  const gross = Math.max(0, Math.round(Number(grossUsdCents) || 0));
+  const line = (pct: number) => (gross > 0 && pct > 0 ? Math.round((gross * pct) / 100) : 0);
+  return {
+    checkout_fee_usd_cents: line(Number(commissionPct) || 0),
+    routing_fee_usd_cents: line(Number(routingFeePct) || 0),
+  };
+}
+
 export function ownAccountCommissionUsdCents(grossUsdCents: number, commissionPct: number, routingFeePct: number): number {
   const gross = Math.max(0, Math.round(Number(grossUsdCents) || 0));
   const pct = (Number(commissionPct) || 0) + (Number(routingFeePct) || 0);

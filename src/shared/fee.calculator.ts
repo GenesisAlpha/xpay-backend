@@ -32,10 +32,16 @@ export interface FeeSettings {
   anticipationFeePct: number
 }
 
+import { type CheckoutFeeSource, PLAN_FREE_CHECKOUT_FEE_PCT, normalizeCheckoutFeeSource } from './checkout-fee-source'
+export * from './checkout-fee-source'
+
 export interface SellerFees extends FeeSettings {
   sellerId: string
   riskLevel: string | null
+  checkoutFeeSource: CheckoutFeeSource
+  checkoutFeeUpdatedAt: string | null
 }
+
 
 export const DEFAULT_FEE_SETTINGS: FeeSettings = {
   fxFeePct: 2,
@@ -55,8 +61,13 @@ export const DEFAULT_FEE_SETTINGS: FeeSettings = {
   anticipationFeePct: 4.99,
 }
 
-/** Tarifa de quem não tem linha em seller_fees (a mesma para venda e renovação). */
-export const DEFAULT_SELLER_FEES: SellerFees = { sellerId: '', riskLevel: null, ...DEFAULT_FEE_SETTINGS }
+/**
+ * Tarifa de quem não tem linha em seller_fees (a mesma para venda e
+ * renovação). Sem linha é seller antigo: a taxa de checkout é 'legacy'.
+ */
+export const DEFAULT_SELLER_FEES: SellerFees = {
+  sellerId: '', riskLevel: null, ...DEFAULT_FEE_SETTINGS, checkoutFeeSource: 'legacy', checkoutFeeUpdatedAt: null,
+}
 
 /** Soma das porcentagens da venda (sem câmbio) — o "x%" mostrado nas telas e e-mails. */
 export function saleFeePct(fees: FeeSettings): number {
@@ -82,6 +93,27 @@ export function sellerFeesRow(fees: FeeSettings) {
     fee_percentage: saleFeePct(fees),
     anticipation_enabled: fees.anticipationEnabled,
     anticipation_fee_pct: fees.anticipationFeePct,
+  }
+}
+
+/**
+ * Linha de seller_fees do onboarding. Sem linha (seller novo): o padrão com a
+ * taxa de checkout do gratuito, origem 'plan'. Com linha (reenvio): o padrão
+ * de sempre, mas a taxa de checkout e a origem que já estavam.
+ */
+export function onboardingFeeRow(existing: Record<string, any> | null | undefined, now = new Date()) {
+  if (!existing) {
+    return {
+      ...sellerFeesRow({ ...DEFAULT_FEE_SETTINGS, checkoutFeePct: PLAN_FREE_CHECKOUT_FEE_PCT }),
+      checkout_fee_source: 'plan' as const,
+      checkout_fee_updated_at: now.toISOString(),
+    }
+  }
+  const checkout = num(existing.checkout_fee_pct, DEFAULT_FEE_SETTINGS.checkoutFeePct)
+  return {
+    ...sellerFeesRow({ ...DEFAULT_FEE_SETTINGS, checkoutFeePct: checkout }),
+    checkout_fee_source: normalizeCheckoutFeeSource(existing.checkout_fee_source),
+    checkout_fee_updated_at: existing.checkout_fee_updated_at ?? null,
   }
 }
 
@@ -118,6 +150,8 @@ export function sellerFeesFromRow(data: Record<string, any>): SellerFees {
     payoutFxFeePct: num(data.payout_fx_fee_pct, D.payoutFxFeePct),
     anticipationEnabled: data.anticipation_enabled === true,
     anticipationFeePct: num(data.anticipation_fee_pct, D.anticipationFeePct),
+    checkoutFeeSource: normalizeCheckoutFeeSource(data.checkout_fee_source),
+    checkoutFeeUpdatedAt: data.checkout_fee_updated_at ? String(data.checkout_fee_updated_at) : null,
   }
 }
 

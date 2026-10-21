@@ -14,7 +14,7 @@ import { ClipAccountsService } from '../orchestrator/clip/clip-accounts.service'
 import { WebhookService } from '../webhooks/webhook.service'
 import { notifySellerAccount } from '../utils/seller-mail'
 import { DEFAULT_FEE_SETTINGS, getSellerFees, sellerFeesRow, type FeeSettings } from '../shared/fee.calculator'
-import { FEE_FIELDS, FEE_TOGGLES, feeChanges, parseFeeSettings } from './fee-config'
+import { FEE_FIELDS, FEE_TOGGLES, checkoutFeeWrite, feeChanges, parseFeeSettings } from './fee-config'
 import { SellerPayoutAccountService } from '../payouts/seller-payout-account.service'
 import * as bcrypt from 'bcrypt'
 import { LoginAttemptLimiter } from './crm-login-limiter'
@@ -500,6 +500,8 @@ export class CrmService {
     const currentFees = await getSellerFees(sellerId)
     const fees: FeeSettings = parseFeeSettings(dto.fees ?? dto.feeOverride, currentFees ?? DEFAULT_FEE_SETTINGS)
     const customized = Object.keys(feeChanges(DEFAULT_FEE_SETTINGS, fees)).length > 0
+    // "Checkout (%)" mudado na aprovação é escrita do CRM: vale para toda venda.
+    const checkoutFromCrm = checkoutFeeWrite(currentFees ?? DEFAULT_FEE_SETTINGS, fees)
 
     // 🔥 1. Atualiza seller_profile — new Date() para timestamps
     const { error: profileError } = await supabase
@@ -529,6 +531,7 @@ export class CrmService {
         seller_id: sellerId,
         risk_level: dto.riskLevel,
         ...sellerFeesRow(fees),
+        ...checkoutFromCrm,
         anticipation_days: 0,
         overridden_by: customized ? managerId : null,
         override_notes: customized ? (dto.notes ?? null) : null,
@@ -783,6 +786,9 @@ export class CrmService {
       seller_id: sellerId,
       risk_level: before?.riskLevel ?? profile.risk_level ?? 'WHITE',
       ...sellerFeesRow(after),
+      // Editou "Checkout (%)": a taxa da equipe passa a valer em toda venda,
+      // até a próxima troca de plano.
+      ...checkoutFeeWrite(base, after),
       overridden_by: managerId,
       override_notes: notes,
       updated_at: new Date(),

@@ -237,7 +237,7 @@ describe('createPayment', () => {
     const svc = service({ resolveForSale: jest.fn(async () => null) })
     const res = await svc.createPayment(dto())
     expect(svc.accountRouter.resolveOwnRoute).toHaveBeenCalledWith('s-1', 'whop')
-    expect(res.own_account).toEqual({ provider: 'whop', commission_pct: 3, routing_fee_pct: 0, commission_usd_cents: 300 })
+    expect(res.own_account).toEqual({ provider: 'whop', commission_pct: 3, routing_fee_pct: 0, commission_usd_cents: 300, checkout_fee_usd_cents: 300, routing_fee_usd_cents: 0 })
     expect(res.routing).toBeUndefined()
   })
 
@@ -254,7 +254,7 @@ describe('createPayment', () => {
     expect(svc.accountRouter.resolveOwnRoute).not.toHaveBeenCalled()
     expect(svc.accountRouter.executeWithProvider).toHaveBeenCalledWith(expect.objectContaining({ providerAccountId: 'whopa_bbb' }))
     // 100 USD × (3% + 0,8%) = 3,80 USD.
-    expect(res.own_account).toEqual({ provider: 'whop', commission_pct: 3, routing_fee_pct: 0.8, commission_usd_cents: 380 })
+    expect(res.own_account).toEqual({ provider: 'whop', commission_pct: 3, routing_fee_pct: 0.8, commission_usd_cents: 380, checkout_fee_usd_cents: 300, routing_fee_usd_cents: 80 })
     expect(res.routing).toEqual({ enabled: true, account_id: 'whopa_bbb', provider: 'whop' })
     const tx = inserts.find(i => i.table === 'transactions')!.row
     expect(tx.metadata.own_account).toMatchObject({ routing_fee_pct: 0.8, commission_usd_cents: 380 })
