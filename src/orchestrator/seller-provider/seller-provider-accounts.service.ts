@@ -831,15 +831,37 @@ async function loadLinkedRow(sellerId: string): Promise<any | null> {
   return data ?? null;
 }
 
+/**
+ * Contas por link (loja Shopify com Shopify Payments, Digistore24) ativas no
+ * roteamento. O pay não cobra nelas — o comprador paga no checkout da loja —,
+ * mas são contas PRÓPRIAS do seller do mesmo jeito: o dinheiro nunca passa
+ * pela Koopfy. Tabela ausente (migration não aplicada) = nenhuma.
+ */
+export async function activeLinkAccountProviders(sellerId: string): Promise<string[]> {
+  if (!sellerId) return [];
+  try {
+    const { data, error } = await supabase
+      .from('seller_link_accounts')
+      .select('provider, status')
+      .eq('seller_id', sellerId)
+      .eq('status', 'active');
+    if (error || !Array.isArray(data)) return [];
+    return Array.from(new Set(data.filter((row: any) => row?.status === 'active').map((row: any) => String(row.provider))));
+  } catch {
+    return [];
+  }
+}
+
 /** Quais contas próprias estão cobrando agora. */
-export async function ownAccountsCharging(sellerId: string): Promise<{ whop: boolean; stripe: boolean; paypal: boolean; commissionPct: number }> {
-  const [linked, rows, koopfy, fees] = await Promise.all([
+export async function ownAccountsCharging(sellerId: string): Promise<{ whop: boolean; stripe: boolean; paypal: boolean; link: boolean; commissionPct: number }> {
+  const [linked, rows, koopfy, fees, linkProviders] = await Promise.all([
     loadLinkedRow(sellerId), loadSellerProviderRows(sellerId), sellerUsesKoopfyPayments(sellerId), getSellerFees(sellerId),
+    activeLinkAccountProviders(sellerId),
   ]);
   const commissionPct = ownSaleCommissionPct(fees, linked?.commission_pct);
   // Seller escolheu a Koopfy Payments: as contas próprias seguem conectadas,
   // mas nenhuma cobra (ver payment-account-mode.ts).
-  if (koopfy) return { whop: false, stripe: false, paypal: false, commissionPct };
+  if (koopfy) return { whop: false, stripe: false, paypal: false, link: false, commissionPct };
   const charging = (provider: SellerProviderRowKind) =>
     rows.some(row => row.provider === provider && providerChargeBlocker(row) === null);
   return {
@@ -848,6 +870,9 @@ export async function ownAccountsCharging(sellerId: string): Promise<{ whop: boo
     whop: (Boolean(linked) && linkedChargeBlocker(linked as WhopLinkedAccountRow) === null) || charging('whop'),
     stripe: charging('stripe'),
     paypal: charging('paypal'),
+    // Loja Shopify / Digistore24 no roteamento: não entra em resolveOwnSale (o
+    // pay não cobra nelas), só conta como conta própria para operar.
+    link: linkProviders.length > 0,
     commissionPct,
   };
 }
@@ -882,10 +907,20 @@ export async function resolveOwnSale(args: {
   return provider ? { provider, commissionPct: state.commissionPct } : null;
 }
 
-/** Alguma conta própria (Whop, Stripe ou PayPal) cobrando? */
+/**
+ * Alguma conta própria cobrando? Whop, Stripe, PayPal ou conta por link
+ * (Shopify Payments, Digistore24). Como a Stripe e o PayPal próprios, a conta
+ * por link não depende da liberação do modo externo no CRM.
+ */
 export async function sellerChargesOnAnyOwnAccount(sellerId: string): Promise<boolean> {
   const state = await ownAccountsCharging(sellerId);
-  return state.whop || state.stripe || state.paypal;
+  return state.whop || state.stripe || state.paypal || state.link;
+}
+
+/** Conta por link (Shopify, Digistore24) ativa e o seller no provedor externo? */
+export async function sellerChargesOnLinkAccount(sellerId: string): Promise<boolean> {
+  const [koopfy, providers] = await Promise.all([sellerUsesKoopfyPayments(sellerId), activeLinkAccountProviders(sellerId)]);
+  return !koopfy && providers.length > 0;
 }
 
 /** Stripe própria conectada? A Whop própria não pode ligar junto. */

@@ -35,7 +35,7 @@ import { WhopConnectService } from '../orchestrator/whop/whop-connect.service';
 import { WhopLinkedAccountsService, sellerMayOperate } from '../orchestrator/whop/whop-linked.service';
 import { isLinkedProviderAccountId, sellerExternalProviderView, toLinkedProviderAccountId } from '../orchestrator/whop/whop-linked';
 import { accountsToReplace, connectionChoice, defaultRoutingFeePct, occupyingAccounts } from '../orchestrator/routing/seller-routing';
-import { SellerProviderAccountsService } from '../orchestrator/seller-provider/seller-provider-accounts.service';
+import { SellerProviderAccountsService, sellerChargesOnLinkAccount } from '../orchestrator/seller-provider/seller-provider-accounts.service';
 import { PoolEntry, SellerRoutingService } from '../orchestrator/routing/seller-routing.service';
 import { OwnAccountFinanceService } from '../orchestrator/own-finance/own-account-finance.service';
 import { OwnPaymentDomainsService } from '../orchestrator/own-finance/own-payment-domains.service';
@@ -906,14 +906,17 @@ export class KoopfyIntegrationService {
    */
   private async connectedActivationBlocker(sellerId: string): Promise<string | null> {
     try {
-      const [requirements, external] = await Promise.all([
+      const [requirements, external, link] = await Promise.all([
         this.whopConnect.getSellerRequirements(sellerId),
         this.externalProviderStatus(sellerId).catch(() => null),
+        // Loja Shopify / Digistore24 no roteamento também é conta própria:
+        // a venda sai por ela, não pela conta conectada da Whop.
+        sellerChargesOnLinkAccount(sellerId).catch(() => false),
       ]);
       return connectedActivationBlocker({
         required: Boolean(requirements?.connected?.required),
         status: requirements?.connected?.status ?? null,
-        externalProviderConnected: Boolean((external as any)?.connected),
+        externalProviderConnected: Boolean((external as any)?.connected) || link,
       });
     } catch (err: any) {
       // Sem conseguir ler a situação, não trava a ativação por uma falha

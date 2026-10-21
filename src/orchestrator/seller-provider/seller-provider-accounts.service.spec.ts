@@ -50,6 +50,7 @@ import {
   SellerProviderAccountsService,
   ownAccountCommissionPct,
   resolveOwnSale,
+  sellerChargesOnLinkAccount,
 } from './seller-provider-accounts.service'
 
 const crypto = {
@@ -256,6 +257,29 @@ describe('comissão e venda em conta própria', () => {
     expect(await sellerMayOperate({ id: 's-1', status: 'pending_review' })).toBe(false)
     tables.seller_provider_accounts = [{ seller_id: 's-1', provider: 'paypal', status: 'active', secret_enc: 'x', public_key: 'cid' }]
     expect(await sellerMayOperate({ id: 's-1', status: 'pending_review' })).toBe(true)
+  })
+
+  it('seller em análise opera com a loja Shopify / Digistore24 ativa no roteamento', async () => {
+    expect(await sellerMayOperate({ id: 's-link', status: 'pending_review' })).toBe(false)
+    tables.seller_link_accounts = [{ seller_id: 's-link', provider: 'shopify', status: 'disabled' }]
+    expect(await sellerMayOperate({ id: 's-link', status: 'pending_review' })).toBe(false)
+    tables.seller_link_accounts = [{ seller_id: 's-link', provider: 'shopify', status: 'active' }]
+    expect(await sellerMayOperate({ id: 's-link', status: 'pending_review' })).toBe(true)
+    expect(await sellerChargesOnLinkAccount('s-link')).toBe(true)
+    tables.seller_link_accounts = [{ seller_id: 's-link', provider: 'digistore24', status: 'active' }]
+    expect(await sellerMayOperate({ id: 's-link', status: 'pending_review' })).toBe(true)
+    // Recusado e suspenso continuam travados, como nas outras contas próprias.
+    expect(await sellerMayOperate({ id: 's-link', status: 'rejected' })).toBe(false)
+    expect(await sellerMayOperate({ id: 's-link', status: 'suspended' })).toBe(false)
+    // A loja não vira provedor de venda do pay: resolveOwnSale segue sem conta própria.
+    expect(await resolveOwnSale({ sellerId: 's-link', providerDefault: null, method: 'card' })).toBeNull()
+  })
+
+  it('loja por link não conta com a Koopfy Payments escolhida', async () => {
+    tables.seller_profiles = [{ id: 's-link-k', config: { payment_account: 'koopfy' } }]
+    tables.seller_link_accounts = [{ seller_id: 's-link-k', provider: 'shopify', status: 'active' }]
+    expect(await sellerMayOperate({ id: 's-link-k', status: 'pending_review' })).toBe(false)
+    expect(await sellerChargesOnLinkAccount('s-link-k')).toBe(false)
   })
 
   it('CRM define a comissão mesmo sem conta Whop conectada', async () => {
