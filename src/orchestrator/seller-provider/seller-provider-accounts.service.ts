@@ -20,6 +20,7 @@ import {
   SellerProviderKind,
   SellerProviderRowKind,
   chooseOwnSaleProvider,
+  whopIsCardDefault,
   isPaypalOwnAccountId,
   isStripeOwnAccountId,
   isWhopExtraAccountId,
@@ -853,7 +854,7 @@ export async function activeLinkAccountProviders(sellerId: string): Promise<stri
 }
 
 /** Quais contas próprias estão cobrando agora. */
-export async function ownAccountsCharging(sellerId: string): Promise<{ whop: boolean; stripe: boolean; paypal: boolean; link: boolean; commissionPct: number }> {
+export async function ownAccountsCharging(sellerId: string): Promise<{ whop: boolean; stripe: boolean; paypal: boolean; link: boolean; commissionPct: number; whopIsCardDefault?: boolean }> {
   const [linked, rows, koopfy, fees, linkProviders] = await Promise.all([
     loadLinkedRow(sellerId), loadSellerProviderRows(sellerId), sellerUsesKoopfyPayments(sellerId), getSellerFees(sellerId),
     activeLinkAccountProviders(sellerId),
@@ -861,13 +862,15 @@ export async function ownAccountsCharging(sellerId: string): Promise<{ whop: boo
   const commissionPct = ownSaleCommissionPct(fees, linked?.commission_pct);
   // Seller escolheu a Koopfy Payments: as contas próprias seguem conectadas,
   // mas nenhuma cobra (ver payment-account-mode.ts).
-  if (koopfy) return { whop: false, stripe: false, paypal: false, link: false, commissionPct };
+  if (koopfy) return { whop: false, stripe: false, paypal: false, link: false, commissionPct, whopIsCardDefault: false };
   const charging = (provider: SellerProviderRowKind) =>
     rows.some(row => row.provider === provider && providerChargeBlocker(row) === null);
+  const mainWhopCharging = Boolean(linked) && linkedChargeBlocker(linked as WhopLinkedAccountRow) === null;
   return {
+    whopIsCardDefault: whopIsCardDefault(mainWhopCharging, rows),
     // Whop extra (roteamento) também conta: fora do roteamento ela fica em
     // 'standby' e não cobra, então só pesa com o roteamento ligado.
-    whop: (Boolean(linked) && linkedChargeBlocker(linked as WhopLinkedAccountRow) === null) || charging('whop'),
+    whop: mainWhopCharging || charging('whop'),
     stripe: charging('stripe'),
     paypal: charging('paypal'),
     // Loja Shopify / Digistore24 no roteamento: não entra em resolveOwnSale (o
@@ -903,6 +906,7 @@ export async function resolveOwnSale(args: {
     whopCharging: state.whop,
     stripeCharging: state.stripe,
     paypalCharging: state.paypal,
+    whopIsCardDefault: state.whopIsCardDefault,
   });
   return provider ? { provider, commissionPct: state.commissionPct } : null;
 }

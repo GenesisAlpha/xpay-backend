@@ -15,6 +15,7 @@ import {
   ineligibility,
   isTechnicalFailure,
   keptOnDisable,
+  keptWithDefault,
   ownAccountCommissionUsdCents,
   ownProviderOfId,
   parseAccountPatch,
@@ -289,6 +290,43 @@ describe('desligar o roteamento', () => {
     ]);
     // Whop extra nunca fica (fora do roteamento a Whop é a principal).
     expect([...kept].sort()).toEqual(['paypall_b', 'stripel_a']);
+  });
+});
+
+describe('trocar conta padrão (roteamento desligado)', () => {
+  const pool = [
+    { id: 'whopl_biz_1', provider: 'whop' as const, priority: 5 },
+    { id: 'whopa_x', provider: 'whop' as const, priority: 1, standby: true },
+    { id: 'stripel_a', provider: 'stripe' as const, priority: 2 },
+    { id: 'stripel_b', provider: 'stripe' as const, priority: 9, standby: true },
+    { id: 'paypall_a', provider: 'paypal' as const, priority: 50, standby: true },
+    { id: 'paypall_b', provider: 'paypal' as const, priority: 3 },
+  ];
+
+  it('a Stripe guardada passa a valer e a outra Stripe sai; o PayPal segue', () => {
+    expect([...keptWithDefault(pool, 'stripel_b')!].sort()).toEqual(['paypall_b', 'stripel_b']);
+  });
+
+  it('a Whop principal no lugar da Stripe', () => {
+    expect([...keptWithDefault(pool, 'whopl_biz_1')!].sort()).toEqual(['paypall_b', 'whopl_biz_1']);
+  });
+
+  it('trocar o PayPal não mexe no cartão', () => {
+    expect([...keptWithDefault(pool, 'paypall_a')!].sort()).toEqual(['paypall_a', 'stripel_a']);
+  });
+
+  it('Stripe só com Pix não tira a do cartão', () => {
+    const kept = keptWithDefault([
+      { id: 'stripel_a', provider: 'stripe', priority: 1, slots: ['card'] },
+      { id: 'stripel_pix', provider: 'stripe', priority: 2, slots: ['pix'], standby: true },
+    ], 'stripel_pix');
+    // Uma linha por provedor fora do roteamento: a escolhida fica, a outra Stripe sai.
+    expect([...kept!]).toEqual(['stripel_pix']);
+  });
+
+  it('Whop extra e conta desconhecida não podem ser a padrão', () => {
+    expect(keptWithDefault(pool, 'whopa_x')).toBeNull();
+    expect(keptWithDefault(pool, 'nada')).toBeNull();
   });
 });
 

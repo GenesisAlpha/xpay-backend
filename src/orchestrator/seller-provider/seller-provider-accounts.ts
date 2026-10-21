@@ -182,8 +182,10 @@ export function ownProviderConflict(
  * Por qual conta própria a venda sai, ou null quando segue o fluxo da Koopfy.
  *
  *   • método `paypal` → PayPal próprio, se cobrando;
- *   • qualquer outro  → Stripe própria (se cobrando), senão a Whop própria —
- *     esta só quando o provider do seller é a Whop, como sempre foi.
+ *   • qualquer outro  → a Whop principal quando o seller a escolheu como conta
+ *     padrão do cartão (whopIsCardDefault); senão a Stripe própria (se
+ *     cobrando), senão a Whop própria — esta só quando o provider do seller é
+ *     a Whop, como sempre foi.
  */
 export function chooseOwnSaleProvider(args: {
   method?: string | null;
@@ -191,12 +193,32 @@ export function chooseOwnSaleProvider(args: {
   whopCharging: boolean;
   stripeCharging: boolean;
   paypalCharging: boolean;
+  /** Roteamento desligado e o seller escolheu a Whop principal para o cartão. */
+  whopIsCardDefault?: boolean;
 }): OwnProvider | null {
   const method = String(args.method ?? '').toLowerCase();
   if (method === 'paypal') return args.paypalCharging ? 'paypal' : null;
+  // A escolha explícita vale mais que a preferência antiga pela Stripe.
+  if (args.whopIsCardDefault && args.whopCharging) return 'whop';
   if (args.stripeCharging) return 'stripe';
   if (String(args.providerDefault ?? '').toLowerCase() === 'whop' && args.whopCharging) return 'whop';
   return null;
+}
+
+/**
+ * A Whop principal é a conta padrão do cartão? Com o roteamento desligado só
+ * uma conta cobra o cartão: quando o seller escolhe a Whop principal (Trocar
+ * conta, ou ela ficou ao desligar o roteamento), as Stripes vão para 'standby'.
+ * Whop cobrando + Stripe guardada + nenhuma Stripe cobrando = a escolha foi a Whop.
+ */
+export function whopIsCardDefault(
+  mainWhopCharging: boolean,
+  rows: Array<Pick<SellerProviderAccountRow, 'provider' | 'status' | 'secret_enc' | 'public_key' | 'last_error'>>,
+): boolean {
+  if (!mainWhopCharging) return false;
+  const stripes = rows.filter(row => row.provider === 'stripe');
+  return stripes.some(row => row.status === 'standby' && Boolean(row.secret_enc))
+    && !stripes.some(row => providerChargeBlocker(row) === null);
 }
 
 /**

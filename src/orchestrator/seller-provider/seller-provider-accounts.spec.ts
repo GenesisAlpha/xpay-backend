@@ -19,6 +19,7 @@ import {
   toStripeOwnAccountId,
   validatePaypalCredentials,
   validateStripeKeys,
+  whopIsCardDefault,
 } from './seller-provider-accounts';
 
 const row = (over: Partial<SellerProviderAccountRow> = {}): SellerProviderAccountRow => ({
@@ -138,6 +139,32 @@ describe('chooseOwnSaleProvider', () => {
 
   it('sem conta própria cobrando, segue o fluxo da Koopfy', () => {
     expect(chooseOwnSaleProvider({ ...none, method: 'card', providerDefault: 'whop' })).toBeNull();
+  });
+
+  it('Whop principal escolhida como padrão do cartão vence a Stripe e o provider_default', () => {
+    expect(chooseOwnSaleProvider({ ...none, method: 'card', providerDefault: 'stripe', whopCharging: true, stripeCharging: true, whopIsCardDefault: true })).toBe('whop');
+    expect(chooseOwnSaleProvider({ ...none, method: 'pix', whopCharging: true, whopIsCardDefault: true })).toBe('whop');
+    // PayPal segue a conta PayPal escolhida.
+    expect(chooseOwnSaleProvider({ ...none, method: 'paypal', whopCharging: true, paypalCharging: true, whopIsCardDefault: true })).toBe('paypal');
+    // Whop sem cobrar (chave recusada): não força nada.
+    expect(chooseOwnSaleProvider({ ...none, method: 'card', stripeCharging: true, whopIsCardDefault: true })).toBe('stripe');
+  });
+});
+
+describe('whopIsCardDefault', () => {
+  const stripe = (status: SellerProviderAccountRow['status']) => row({ provider: 'stripe', status });
+  it('Whop cobrando e a Stripe guardada = a Whop é a padrão do cartão', () => {
+    expect(whopIsCardDefault(true, [stripe('standby')])).toBe(true);
+  });
+  it('com uma Stripe cobrando, a Stripe é a padrão', () => {
+    expect(whopIsCardDefault(true, [stripe('standby'), stripe('active')])).toBe(false);
+  });
+  it('sem Stripe guardada fica como sempre foi (provider_default)', () => {
+    expect(whopIsCardDefault(true, [])).toBe(false);
+    expect(whopIsCardDefault(true, [stripe('disabled')])).toBe(false);
+  });
+  it('Whop principal sem cobrar nunca é a padrão', () => {
+    expect(whopIsCardDefault(false, [stripe('standby')])).toBe(false);
   });
 });
 

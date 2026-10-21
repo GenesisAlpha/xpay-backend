@@ -237,6 +237,14 @@ export class KoopfyIntegrationController {
     return this.svc.updateRoutingAccount(req.sellerCtx, accountId, body ?? {});
   }
 
+  // Roteamento desligado: a conta que recebe as vendas (as que dividem slot
+  // com ela ficam guardadas). Com o roteamento ligado, 400 ROUTING_ENABLED.
+  @Post('routing/accounts/:accountId/default')
+  @UseGuards(CrossServiceJwtGuard)
+  setDefaultRoutingAccount(@Req() req: any, @Param('accountId') accountId: string) {
+    return this.svc.setDefaultRoutingAccount(req.sellerCtx, accountId);
+  }
+
   // O que mudou nas contas e no roteamento (conexões, ajustes, pausas, saques).
   @Get('routing/history')
   @UseGuards(CrossServiceJwtGuard)

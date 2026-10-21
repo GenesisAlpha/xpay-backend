@@ -972,16 +972,44 @@ export interface DisableCandidate {
  * 'standby'.
  */
 export function keptOnDisable(accounts: DisableCandidate[]): Set<string> {
-  const order = (a: DisableCandidate, b: DisableCandidate) =>
-    a.priority - b.priority || String(a.createdAt ?? '').localeCompare(String(b.createdAt ?? '')) || a.id.localeCompare(b.id);
+  return keepInOrder([...accounts].filter(canChargeOutsideRouting).sort(byDisableOrder));
+}
+
+const byDisableOrder = (a: DisableCandidate, b: DisableCandidate) =>
+  a.priority - b.priority || String(a.createdAt ?? '').localeCompare(String(b.createdAt ?? '')) || a.id.localeCompare(b.id);
+
+/** Fora do roteamento cobram Stripe, PayPal e a Whop PRINCIPAL; Whop extra e conta por link não. */
+function canChargeOutsideRouting(account: Pick<DisableCandidate, 'id' | 'provider'>): boolean {
+  return account.provider === 'stripe' || account.provider === 'paypal' || (account.provider === 'whop' && isLinkedProviderAccountId(account.id));
+}
+
+export interface DefaultCandidate extends DisableCandidate {
+  /** Guardada agora ('standby'): só entra no lugar de quem cruza com a escolhida. */
+  standby?: boolean;
+}
+
+/**
+ * "Trocar conta padrão" com o roteamento desligado: a escolhida passa a
+ * valer e sai quem divide slot com ela (no cartão, só UMA entre Whop e
+ * Stripe; uma PayPal). O resto fica como está: quem já recebia em outro
+ * slot continua e as guardadas seguem guardadas. Devolve os ids que ficam
+ * ativos; null = a conta não pode ser a padrão (Whop extra, conta por link).
+ */
+export function keptWithDefault(accounts: DefaultCandidate[], chosenId: string): Set<string> | null {
+  const chosen = accounts.find(account => account.id === chosenId);
+  if (!chosen || !canChargeOutsideRouting(chosen)) return null;
+  const others = accounts
+    .filter(account => account.id !== chosenId && !account.standby && canChargeOutsideRouting(account))
+    .sort(byDisableOrder);
+  return keepInOrder([chosen, ...others]);
+}
+
+/** Na ordem dada, cada conta fica se o provedor e os slots dela ainda estão livres. */
+function keepInOrder(candidates: DisableCandidate[]): Set<string> {
   const kept = new Set<string>();
   const taken: string[] = [];
   // Sem o roteamento vale uma linha por provedor (a conexão regrava no lugar).
   const providers = new Set<string>();
-
-  const candidates = accounts
-    .filter(a => a.provider === 'stripe' || a.provider === 'paypal' || (a.provider === 'whop' && isLinkedProviderAccountId(a.id)))
-    .sort(order);
   for (const account of candidates) {
     const slots = account.slots?.length ? account.slots : defaultSlotsOf(account.provider);
     if (providers.has(account.provider) || slotsOverlap(slots, taken)) continue;

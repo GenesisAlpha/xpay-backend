@@ -220,6 +220,11 @@ export class KoopfyIntegrationService {
     return this.sellerRouting.updateAccount(ctx.seller.id, accountId, body ?? {}, `seller:${ctx.userId}`);
   }
 
+  setDefaultRoutingAccount(ctx: SellerCtx, accountId: string) {
+    if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
+    return this.sellerRouting.setDefaultAccount(ctx.seller.id, accountId, `seller:${ctx.userId}`);
+  }
+
   routingHistory(ctx: SellerCtx, limit?: unknown) {
     if (!ctx.seller) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
     return this.sellerRouting.history(ctx.seller.id, limit);

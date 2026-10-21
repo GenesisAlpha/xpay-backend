@@ -58,6 +58,7 @@ import {
   isLinkProvider,
   linkModeAllows,
   keptOnDisable,
+  keptWithDefault,
   normalizeAccountConfig,
   normalizeStrategy,
   ownProviderOfId,
@@ -1142,6 +1143,55 @@ export class SellerRoutingService implements OnModuleInit {
       .filter(row => (row.status === 'active' || row.status === 'invalid') && !kept.has(ownAccountIdOfRow(row)))
       .map(row => row.id);
     if (toStandby.length) await this.sellerProviders.setRowsStatus(sellerId, toStandby, 'standby');
+  }
+
+  /**
+   * POST /integration/koopfy/routing/accounts/:accountId/default — com o
+   * roteamento desligado, escolhe a conta que recebe: ela volta a 'active' e
+   * quem divide slot com ela vai para 'standby' (guardada, com a configuração
+   * intacta). Um padrão por método: no cartão só UMA entre a Whop principal
+   * e as Stripes; no PayPal, uma PayPal. A Whop principal não é linha de
+   * seller_provider_accounts: escolhida, as Stripes do cartão vão para
+   * 'standby' e a venda sai pela Whop (whopIsCardDefault). Shopify e
+   * Digistore24 ficam de fora: valem nas ofertas vinculadas.
+   */
+  async setDefaultAccount(sellerId: string, accountId: string, actor: string | null) {
+    const settings = await this.settings(sellerId);
+    if (settings.enabled) {
+      throw new BadRequestException({
+        error: 'ROUTING_ENABLED',
+        message: 'Com o roteamento ligado as vendas se dividem entre as contas. Ajuste a divisão no Roteamento.',
+      });
+    }
+    const pool = await this.loadPool(sellerId, settings);
+    const entry = pool.find(item => item.id === accountId);
+    if (!entry) throw new NotFoundException('Conta não encontrada.');
+    if (entry.connection === 'invalid') {
+      throw new BadRequestException('A chave desta conta foi recusada. Reconecte a conta antes de usá-la como padrão.');
+    }
+    const kept = keptWithDefault(
+      pool.filter(item => !isLinkProvider(item.provider)).map(item => ({
+        id: item.id,
+        provider: item.provider,
+        priority: item.config.priority,
+        createdAt: item.createdAt,
+        standby: item.connection === 'standby',
+        slots: slotsOfAccount(item.provider, effectiveMethods(item.provider, item.available, null)),
+      })),
+      accountId,
+    );
+    if (!kept) {
+      throw new BadRequestException('Esta conta só recebe com o roteamento ligado. Escolha uma Stripe, um PayPal ou a Whop principal.');
+    }
+    const rows = await this.sellerProviders.listRows(sellerId);
+    const toActive = rows.filter(row => row.status === 'standby' && kept.has(ownAccountIdOfRow(row))).map(row => row.id);
+    const toStandby = rows
+      .filter(row => (row.status === 'active' || row.status === 'invalid') && !kept.has(ownAccountIdOfRow(row)))
+      .map(row => row.id);
+    if (toActive.length) await this.sellerProviders.setRowsStatus(sellerId, toActive, 'active');
+    if (toStandby.length) await this.sellerProviders.setRowsStatus(sellerId, toStandby, 'standby');
+    await this.log(sellerId, actor, 'routing.default_account_changed', { account_id: accountId });
+    return this.view(sellerId);
   }
 
   /** PUT /integration/koopfy/routing/accounts/:accountId */
