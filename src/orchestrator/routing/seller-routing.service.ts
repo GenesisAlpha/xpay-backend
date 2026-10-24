@@ -73,6 +73,7 @@ import {
   disableLinkRow,
   linkAccountId,
   linkMethodsOf,
+  findLinkRow,
   listLinkRows,
   loadLinkSales,
   parseCurrencies,
@@ -811,6 +812,8 @@ export class SellerRoutingService implements OnModuleInit {
     const provider = parseLinkProvider(body?.provider);
     const externalRef = parseExternalRef(body?.externalRef);
     const currencies = parseCurrencies(body?.currencies);
+    // Moedas que a loja tinha antes: se o filtro da conta ainda é esse (automático), acompanha as novas.
+    const before = await findLinkRow(sellerId, provider, externalRef);
     const { row, created } = await upsertLinkRow(sellerId, {
       provider, externalRef, currencies,
       displayName: String(body?.name ?? '').trim().slice(0, 120) || null,
@@ -825,6 +828,18 @@ export class SellerRoutingService implements OnModuleInit {
         ...(body?.warmup && typeof body.warmup === 'object' ? { warmup: body.warmup } : {}),
       }, current, new Date(this.now()).toISOString());
       await this.writeAccountConfig(sellerId, id, provider, patch);
+    } else if (currencies.length) {
+      // Reconexão com moedas novas no Markets: o filtro que veio da loja acompanha.
+      // Filtro editado à mão pelo seller (diferente do que a loja tinha) fica como está.
+      const config = configs.get(id);
+      const same = (a: unknown, b: unknown) => {
+        const left = (Array.isArray(a) ? a : []).map(String).sort().join(','); const right = (Array.isArray(b) ? b : []).map(String).sort().join(',');
+        return left === right;
+      };
+      if (same(config?.currencies, before?.currencies) && !same(config?.currencies, currencies)) {
+        const current = normalizeAccountConfig(config, defaultAccountConfig(id, sellerId, provider));
+        await this.writeAccountConfig(sellerId, id, provider, parseAccountPatch({ currencies }, current, new Date(this.now()).toISOString()));
+      }
     }
     await this.log(sellerId, 'system', created ? 'routing.link_account_connected' : 'routing.link_account_updated', { account_id: id, provider });
     // Conectar a loja é escolher o provedor externo (payment-account-mode.ts):
