@@ -135,10 +135,10 @@ export async function upsertLinkSale(sellerId: string, accountId: string, sale: 
 }
 
 /** Vendas por link desde `sinceIso`, no formato das transações do roteamento. */
-export async function loadLinkSales(sellerId: string, ids: string[], sinceIso: string, limit: number): Promise<Array<StatsTxRow & TodayTxRow>> {
+export async function loadLinkSales(sellerId: string, ids: string[], sinceIso: string, limit: number): Promise<Array<StatsTxRow & TodayTxRow & { created_at?: string | null }>> {
   if (!ids.length) return [];
   const { data, error } = await supabase.from(LINK_SALES_TABLE)
-    .select('provider_account_id, status, amount_usd_gross_cents, disputed')
+    .select('provider_account_id, status, amount_usd_gross_cents, disputed, created_at')
     .eq('seller_id', sellerId).in('provider_account_id', ids).gte('created_at', sinceIso).limit(limit);
   if (error) {
     console.error('[RoutingLinks] vendas por link:', error.message);
@@ -149,5 +149,6 @@ export async function loadLinkSales(sellerId: string, ids: string[], sinceIso: s
     status: row.status,
     amount_usd_gross_cents: row.amount_usd_gross_cents,
     link_dispute: row.disputed === true || undefined,
+    created_at: row.created_at ?? null,
   }));
 }

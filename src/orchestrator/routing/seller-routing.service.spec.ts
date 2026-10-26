@@ -755,3 +755,54 @@ describe('conectar conta por link escolhe o provedor externo', () => {
     await expect(svc.selectExternalForLinkConnect(SELLER, { provider: 'hotmart' })).rejects.toThrow('Provedor por link inválido')
   })
 })
+
+describe('simulador e série do painel', () => {
+  beforeEach(() => {
+    enableRouting()
+    tables.seller_provider_accounts = [providerRow('aaa', 'stripe'), providerRow('bbbb', 'whop'), providerRow('ccccc', 'paypal')]
+    routingConfig('stripel_aaa', { priority: 1, countries: ['PT'] })
+    routingConfig('whopa_bbbb', { priority: 2, provider: 'whop' })
+  })
+
+  it('simula a venda com as regras da escolha real, sem gravar atribuição', async () => {
+    const svc = build()
+    const pt = await svc.simulate(SELLER, { method: 'card', country: 'PT' })
+    expect(pt).toMatchObject({ enabled: true, slot: 'card', strategy: 'priority_cap', chosenId: 'stripel_aaa' })
+    const br = await svc.simulate(SELLER, { method: 'card', country: 'br' })
+    expect(br.chosenId).toBe('whopa_bbbb')
+    expect(br.accounts).toEqual(expect.arrayContaining([
+      { id: 'stripel_aaa', reason: 'country' },
+      { id: 'whopa_bbbb', reason: null },
+      { id: 'paypall_ccccc', reason: 'not_in_slot' },
+    ]))
+    const paypal = await svc.simulate(SELLER, { method: 'paypal' })
+    expect(paypal).toMatchObject({ slot: 'paypal', chosenId: 'paypall_ccccc' })
+    expect(tables.routing_assignments).toBeUndefined()
+  })
+
+  it('simulador recusa país e valor inválidos', async () => {
+    await expect(build().simulate(SELLER, { country: 'Portugal' })).rejects.toBeInstanceOf(BadRequestException)
+    await expect(build().simulate(SELLER, { amountUsdCents: -5 })).rejects.toBeInstanceOf(BadRequestException)
+  })
+
+  it('score: cada conta volta com a chance dela', async () => {
+    enableRouting({ card_strategy: 'score' })
+    const result = await build().simulate(SELLER, { method: 'card', country: 'PT' })
+    const chances = result.accounts.filter((a: any) => a.chance != null).map((a: any) => a.chance)
+    expect(chances.length).toBe(2)
+    expect(chances.reduce((sum: number, c: number) => sum + c, 0)).toBeCloseTo(1, 2)
+  })
+
+  it('série: vendas por conta e por dia de Brasília', async () => {
+    tables.transactions = [
+      { seller_id: SELLER, provider_account_id: 'stripel_aaa', status: 'approved', amount_usd_gross_cents: 1000, created_at: '2026-09-28T10:00:00Z' },
+      { seller_id: SELLER, provider_account_id: 'stripel_aaa', status: 'failed', amount_usd_gross_cents: 500, created_at: '2026-09-28T02:00:00Z' },
+      { seller_id: SELLER, provider_account_id: 'whopa_bbbb', status: 'chargeback', amount_usd_gross_cents: 700, created_at: '2026-09-27T12:00:00Z' },
+    ]
+    const series = await build().series(SELLER, 3)
+    expect(series.days).toEqual(['2026-09-26', '2026-09-27', '2026-09-28'])
+    // 02:00 UTC do dia 28 ainda é dia 27 em Brasília.
+    expect(series.accounts.stripel_aaa).toEqual({ orders: [0, 1, 1], approved: [0, 0, 1], revenueUsdCents: [0, 0, 1000], disputes: [0, 0, 0] })
+    expect(series.accounts.whopa_bbbb).toEqual({ orders: [0, 1, 0], approved: [0, 1, 0], revenueUsdCents: [0, 700, 0], disputes: [0, 1, 0] })
+  })
+})

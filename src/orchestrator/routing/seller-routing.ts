@@ -602,6 +602,54 @@ export function computeStats(
   return result;
 }
 
+// ─── Série diária ─────────────────────────────────────────────────────────
+
+export interface SeriesTxRow extends StatsTxRow {
+  created_at?: string | null;
+}
+
+export interface AccountSeries {
+  orders: number[];
+  approved: number[];
+  revenueUsdCents: number[];
+  disputes: number[];
+}
+
+/**
+ * Pedidos, aprovadas, faturamento (USD bruto) e disputas por conta e por dia
+ * de Brasília, do dia que começa em `firstDayStartMs` até `days` dias depois.
+ * Mesmas regras do resumo de 7 dias (computeStats). `days` sai como
+ * "AAAA-MM-DD" do dia de Brasília.
+ */
+export function computeSeries(
+  rows: SeriesTxRow[],
+  accountIds: string[],
+  firstDayStartMs: number,
+  days: number,
+): { days: string[]; accounts: Record<string, AccountSeries> } {
+  const firstDay = routingDayNumber(firstDayStartMs);
+  const labels = Array.from({ length: days }, (_, i) => new Date((firstDay + i) * DAY_MS).toISOString().slice(0, 10));
+  const accounts: Record<string, AccountSeries> = {};
+  for (const id of accountIds) {
+    accounts[id] = { orders: Array(days).fill(0), approved: Array(days).fill(0), revenueUsdCents: Array(days).fill(0), disputes: Array(days).fill(0) };
+  }
+  for (const row of rows) {
+    const series = row.provider_account_id ? accounts[row.provider_account_id] : undefined;
+    const at = Date.parse(String(row.created_at ?? ''));
+    if (!series || !Number.isFinite(at)) continue;
+    const index = routingDayNumber(at) - firstDay;
+    if (index < 0 || index >= days) continue;
+    const status = String(row.status ?? '').toLowerCase();
+    series.orders[index] += 1;
+    if (APPROVED_STATES.has(status)) {
+      series.approved[index] += 1;
+      series.revenueUsdCents[index] += Math.max(0, Math.round(Number(row.amount_usd_gross_cents ?? 0) || 0));
+    }
+    if (status === 'chargeback' || row.whop_dispute || row.stripe_dispute || row.paypal_dispute || row.link_dispute) series.disputes[index] += 1;
+  }
+  return { days: labels, accounts };
+}
+
 export interface TodayTxRow {
   provider_account_id: string | null;
   status: string | null;

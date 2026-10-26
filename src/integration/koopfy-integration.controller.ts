@@ -245,6 +245,21 @@ export class KoopfyIntegrationController {
     return this.svc.setDefaultRoutingAccount(req.sellerCtx, accountId);
   }
 
+  // "Para qual conta iria esta venda?": mesmas regras da escolha real, sem gravar nada.
+  // Body: { method?, country?, currency?, amountUsdCents?, link? }
+  @Post('routing/simulate')
+  @UseGuards(CrossServiceJwtGuard)
+  routingSimulate(@Req() req: any, @Body() body: any) {
+    return this.svc.routingSimulate(req.sellerCtx, body ?? {});
+  }
+
+  // Pedidos, aprovadas, faturamento e disputas por conta e por dia (até 90 dias).
+  @Get('routing/series')
+  @UseGuards(CrossServiceJwtGuard)
+  routingSeries(@Req() req: any, @Query('days') days?: string) {
+    return this.svc.routingSeries(req.sellerCtx, days);
+  }
+
   // O que mudou nas contas e no roteamento (conexões, ajustes, pausas, saques).
   @Get('routing/history')
   @UseGuards(CrossServiceJwtGuard)

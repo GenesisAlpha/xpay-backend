@@ -36,6 +36,7 @@ import {
   activePause,
   canonicalMethod,
   capReached,
+  computeSeries,
   computeStats,
   computeToday,
   effectiveDailyLimits,
@@ -103,6 +104,9 @@ import { selectExternalAfterConnect, sellerUsesKoopfyPayments } from '../seller-
 const STATS_TTL_MS = 60 * 1000;
 const STATS_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const STATS_ROW_LIMIT = 20000;
+const SERIES_MAX_DAYS = 90;
+const SERIES_DEFAULT_DAYS = 30;
+const SERIES_TTL_MS = 60_000;
 // Vendas e volume do dia (tetos e aquecimento): cache bem mais curto, e
 // zerado quando uma conta do seller aprova uma venda (onOwnAccountPaid).
 const TODAY_TTL_MS = 10 * 1000;
@@ -243,6 +247,7 @@ export class SellerRoutingService implements OnModuleInit {
   now: () => number = () => Date.now();
 
   private statsCache = new Map<string, { at: number; rows: StatsTxRow[] }>();
+  private seriesCache = new Map<string, { at: number; value: ReturnType<typeof computeSeries> }>();
   private todayCache = new Map<string, { at: number; dayStart: number; rows: TodayTxRow[] }>();
   private pauseNotices = new Map<string, number>();
   // Injetável nos testes: o e-mail de conta pausada.
@@ -1030,6 +1035,112 @@ export class SellerRoutingService implements OnModuleInit {
       } else out.set(entry.id, sellerMethods.filter(m => canonicalMethod(m) !== 'paypal'));
     }));
     return out;
+  }
+
+  /**
+   * POST /integration/koopfy/routing/simulate — "para qual conta iria esta
+   * venda agora?". Mesmas regras da escolha real (elegibilidade, filtros,
+   * limites do dia e estratégia do slot), sem gravar atribuição nem pausa.
+   * Body: { method?, country?, currency?, amountUsdCents?, link? ('allow' | 'deny') }.
+   * Cada conta volta com o motivo de estar fora (null = concorre) e, no score
+   * (sorteio proporcional), a chance de cada uma.
+   */
+  async simulate(sellerId: string, body: Record<string, any>) {
+    const method = canonicalMethod(String(body?.method ?? 'card').trim().toLowerCase()) || 'card';
+    if (!/^[a-z][a-z0-9_]{1,29}$/.test(method)) throw new BadRequestException('Método inválido.');
+    const country = String(body?.country ?? '').trim().toUpperCase();
+    if (country && !/^[A-Z]{2}$/.test(country)) throw new BadRequestException('País inválido: use o código de 2 letras.');
+    const currency = String(body?.currency ?? '').trim().toUpperCase();
+    if (currency && !/^[A-Z]{3}$/.test(currency)) throw new BadRequestException('Moeda inválida: use o código de 3 letras.');
+    const rawAmount = body?.amountUsdCents;
+    const amount = rawAmount === undefined || rawAmount === null || rawAmount === '' ? null : Number(rawAmount);
+    if (amount !== null && (!Number.isInteger(amount) || amount < 0 || amount > 1e10)) throw new BadRequestException('Valor inválido.');
+
+    const settings = await this.settings(sellerId);
+    const slot = slotOfMethod(method) || 'card';
+    const ctx: RoutingContext = {
+      country: country || null,
+      currency: currency || null,
+      amountUsdCents: amount,
+      link: body?.link === 'deny' ? 'deny' : 'allow',
+      linkProviders: ['shopify', 'digistore24'],
+      method,
+    };
+    const sctx = slotCtx(slot, ctx);
+    const pool = await this.loadPool(sellerId, settings);
+    const strategy = strategyOfSlot(settings, slot);
+    const now = this.now();
+
+    const reasons = new Map<string, string | null>();
+    for (const entry of pool) {
+      if (!entry.slots.includes(slot)) { reasons.set(entry.id, 'not_in_slot'); continue; }
+      if (!servesSlot(entry, slot, sctx)) { reasons.set(entry.id, 'link_mode'); continue; }
+      let reason: string | null = ineligibility(entry, sctx, settings.disputePausePctEffective, { now });
+      // Divisão por peso: peso 0 deixa a conta só de reserva.
+      if (!reason && (strategy === 'orders_split' || strategy === 'revenue_split') && entry.config.weight <= 0) reason = 'weight_zero';
+      reasons.set(entry.id, reason);
+    }
+    const eligible = pool.filter(entry => reasons.get(entry.id) === null);
+    // Score sorteia: a "escolhida" é a de maior chance e cada uma volta com a dela.
+    const chances = new Map<string, number>();
+    if (strategy === 'score' && eligible.length) {
+      const total = eligible.reduce((sum, entry) => sum + Math.max(1, entry.stats.score), 0);
+      for (const entry of eligible) chances.set(entry.id, Math.max(1, entry.stats.score) / total);
+    }
+    const chosen = !settings.enabled || !eligible.length
+      ? null
+      : strategy === 'score'
+        ? [...eligible].sort((a, b) => (chances.get(b.id) ?? 0) - (chances.get(a.id) ?? 0) || a.config.priority - b.config.priority)[0]
+        : selectAccount(strategy, eligible, sctx, () => 0.5);
+
+    return {
+      enabled: settings.enabled,
+      slot,
+      strategy,
+      chosenId: chosen?.id ?? null,
+      accounts: pool.map(entry => ({
+        id: entry.id,
+        reason: reasons.get(entry.id) ?? null,
+        ...(chances.has(entry.id) ? { chance: Math.round((chances.get(entry.id) ?? 0) * 1000) / 1000 } : {}),
+      })),
+    };
+  }
+
+  /**
+   * GET /integration/koopfy/routing/series?days= — pedidos, aprovadas,
+   * faturamento e disputas por conta e por dia de Brasília (até 90 dias),
+   * para o período e o gráfico do painel.
+   */
+  async series(sellerId: string, rawDays?: unknown) {
+    const days = Math.min(SERIES_MAX_DAYS, Math.max(1, Math.floor(Number(rawDays)) || SERIES_DEFAULT_DAYS));
+    const entries = await this.loadEntries(sellerId);
+    const ids = entries.map(entry => entry.id);
+    const firstDayStart = routingDayStartMs(this.now()) - (days - 1) * 24 * 60 * 60 * 1000;
+    const cacheKey = `${sellerId}:${days}:${[...ids].sort().join(',')}`;
+    const cached = this.seriesCache.get(cacheKey);
+    if (cached && this.now() - cached.at < SERIES_TTL_MS) return cached.value;
+
+    let rows: any[] = [];
+    if (ids.length) {
+      const since = new Date(firstDayStart).toISOString();
+      const { data, error } = await supabase
+        .from('transactions')
+        .select(
+          'provider_account_id, status, amount_usd_gross_cents, created_at, '
+          + 'whop_dispute:metadata->whop_dispute, stripe_dispute:metadata->stripe_dispute, paypal_dispute:metadata->paypal_dispute',
+        )
+        .eq('seller_id', sellerId)
+        .in('provider_account_id', ids)
+        .gte('created_at', since)
+        .limit(STATS_ROW_LIMIT);
+      if (error) console.error('[SellerRouting] série das contas:', error.message);
+      rows = Array.isArray(data) ? data : [];
+      const linkIds = ids.filter(isLinkAccountId);
+      if (linkIds.length) rows = rows.concat(await loadLinkSales(sellerId, linkIds, since, STATS_ROW_LIMIT));
+    }
+    const value = computeSeries(rows, ids, firstDayStart, days);
+    this.seriesCache.set(cacheKey, { at: this.now(), value });
+    return value;
   }
 
   /**
