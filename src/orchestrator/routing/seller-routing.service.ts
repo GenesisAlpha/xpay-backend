@@ -281,6 +281,30 @@ export class SellerRoutingService implements OnModuleInit {
    */
   async loadPool(sellerId: string, settings?: ResolvedRoutingSettings, opts: RoutingLoadOptions = {}): Promise<PoolEntry[]> {
     const resolved = settings ?? (await this.settings(sellerId));
+    const entries = await this.loadEntries(sellerId);
+    const [stats, available] = await Promise.all([
+      this.loadStats(sellerId, entries.map(entry => entry.id), resolved.disputePausePctEffective),
+      this.readAccountMethods(sellerId, entries, opts.sellerMethods),
+    ]);
+    return entries.map(entry => {
+      const read = available.get(entry.id) ?? [];
+      const methods = effectiveMethods(entry.provider, read, entry.config);
+      return {
+        ...entry,
+        available: read,
+        methods,
+        slots: slotsOfAccount(entry.provider, methods),
+        stats: stats.get(entry.id)!,
+        breakerOpen: this.router.accountBreakerOpen(entry.id),
+      };
+    });
+  }
+
+  /**
+   * As contas do pool com a configuração de cada uma, sem estatística nem
+   * métodos (leituras pesadas): basta para achar e gravar uma conta.
+   */
+  private async loadEntries(sellerId: string): Promise<Array<Omit<PoolEntry, 'stats' | 'breakerOpen' | 'available' | 'methods' | 'slots'>>> {
     const [principal, rows, configs, links] = await Promise.all([
       this.whopLinked.getRow(sellerId).catch(() => null),
       this.sellerProviders.listRows(sellerId).catch(() => []),
@@ -350,22 +374,7 @@ export class SellerRoutingService implements OnModuleInit {
       });
     }
 
-    const [stats, available] = await Promise.all([
-      this.loadStats(sellerId, entries.map(entry => entry.id), resolved.disputePausePctEffective),
-      this.readAccountMethods(sellerId, entries, opts.sellerMethods),
-    ]);
-    return entries.map(entry => {
-      const read = available.get(entry.id) ?? [];
-      const methods = effectiveMethods(entry.provider, read, entry.config);
-      return {
-        ...entry,
-        available: read,
-        methods,
-        slots: slotsOfAccount(entry.provider, methods),
-        stats: stats.get(entry.id)!,
-        breakerOpen: this.router.accountBreakerOpen(entry.id),
-      };
-    });
+    return entries;
   }
 
   private async loadConfigs(sellerId: string): Promise<Map<string, any>> {
@@ -1211,8 +1220,9 @@ export class SellerRoutingService implements OnModuleInit {
 
   /** PUT /integration/koopfy/routing/accounts/:accountId */
   async updateAccount(sellerId: string, accountId: string, body: Record<string, any>, actor: string | null) {
-    const pool = await this.loadPool(sellerId);
-    const entry = pool.find(item => item.id === accountId);
+    // Só a configuração da conta: o pool completo (estatística, métodos) sai uma vez, na resposta.
+    const entries = await this.loadEntries(sellerId);
+    const entry = entries.find(item => item.id === accountId);
     if (!entry) throw new NotFoundException('Conta não encontrada.');
 
     const patch = parseAccountPatch(body ?? {}, entry.config, new Date(this.now()).toISOString());
