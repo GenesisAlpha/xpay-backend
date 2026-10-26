@@ -611,6 +611,8 @@ export interface SeriesTxRow extends StatsTxRow {
 export interface AccountSeries {
   orders: number[];
   approved: number[];
+  /** Recusadas: aprovação = aprovadas ÷ (aprovadas + recusadas), como no resumo de 7 dias. */
+  failed: number[];
   revenueUsdCents: number[];
   disputes: number[];
 }
@@ -631,7 +633,7 @@ export function computeSeries(
   const labels = Array.from({ length: days }, (_, i) => new Date((firstDay + i) * DAY_MS).toISOString().slice(0, 10));
   const accounts: Record<string, AccountSeries> = {};
   for (const id of accountIds) {
-    accounts[id] = { orders: Array(days).fill(0), approved: Array(days).fill(0), revenueUsdCents: Array(days).fill(0), disputes: Array(days).fill(0) };
+    accounts[id] = { orders: Array(days).fill(0), approved: Array(days).fill(0), failed: Array(days).fill(0), revenueUsdCents: Array(days).fill(0), disputes: Array(days).fill(0) };
   }
   for (const row of rows) {
     const series = row.provider_account_id ? accounts[row.provider_account_id] : undefined;
@@ -644,6 +646,8 @@ export function computeSeries(
     if (APPROVED_STATES.has(status)) {
       series.approved[index] += 1;
       series.revenueUsdCents[index] += Math.max(0, Math.round(Number(row.amount_usd_gross_cents ?? 0) || 0));
+    } else if (status === 'failed') {
+      series.failed[index] += 1;
     }
     if (status === 'chargeback' || row.whop_dispute || row.stripe_dispute || row.paypal_dispute || row.link_dispute) series.disputes[index] += 1;
   }

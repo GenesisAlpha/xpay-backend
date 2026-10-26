@@ -802,7 +802,7 @@ describe('simulador e série do painel', () => {
     const series = await build().series(SELLER, 3)
     expect(series.days).toEqual(['2026-09-26', '2026-09-27', '2026-09-28'])
     // 02:00 UTC do dia 28 ainda é dia 27 em Brasília.
-    expect(series.accounts.stripel_aaa).toEqual({ orders: [0, 1, 1], approved: [0, 0, 1], revenueUsdCents: [0, 0, 1000], disputes: [0, 0, 0] })
-    expect(series.accounts.whopa_bbbb).toEqual({ orders: [0, 1, 0], approved: [0, 1, 0], revenueUsdCents: [0, 700, 0], disputes: [0, 1, 0] })
+    expect(series.accounts.stripel_aaa).toEqual({ orders: [0, 1, 1], approved: [0, 0, 1], failed: [0, 1, 0], revenueUsdCents: [0, 0, 1000], disputes: [0, 0, 0] })
+    expect(series.accounts.whopa_bbbb).toEqual({ orders: [0, 1, 0], approved: [0, 1, 0], failed: [0, 0, 0], revenueUsdCents: [0, 700, 0], disputes: [0, 1, 0] })
   })
 })
