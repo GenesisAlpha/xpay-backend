@@ -233,11 +233,14 @@ export class ClipProvider {
       return { success: false, status: 'unknown', raw: body };
     }
 
+    // ⚠️ A Clip escreve `cancelled` (dois L, code CA-AUT01): é o 3DS que o
+    // comprador abandonou, cancelado por ela ~14 min depois. Com só `canceled`
+    // a transação ficava pending para sempre.
     const s = String(body?.status ?? '').toLowerCase();
     const status: RetrieveResponse['status'] =
       s === 'approved' || s === 'paid' || s === 'completed' ? 'paid'
         : s === 'pending' ? 'pending'
-          : s === 'rejected' || s === 'declined' || s === 'canceled' ? 'failed'
+          : ['rejected', 'declined', 'canceled', 'cancelled', 'expired'].includes(s) ? 'failed'
             : 'unknown';
 
     return {
