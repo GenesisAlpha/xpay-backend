@@ -5,6 +5,7 @@ import { LinkAccountsInternalController } from './link-accounts-internal.control
 import { WhopCardBackfillController } from './whop-card-backfill.controller';
 import { WhopCardBackfillService } from './whop-card-backfill.service';
 import { ClipReconcilerService } from './clip-reconciler.service';
+import { ClipWebhookController } from './clip-webhook.controller';
 
 import { WalletModule } from '../wallets/wallet.module';
 import { CurrencyModule } from '../currency/currency.module';
@@ -37,6 +38,6 @@ import { AffiliatesModule } from '../affiliates/affiliates.module';
     ClipReconcilerService,
   ],
   exports: [PaymentService],
-  controllers: [PaymentController, WhopCardBackfillController, LinkAccountsInternalController],
+  controllers: [PaymentController, WhopCardBackfillController, LinkAccountsInternalController, ClipWebhookController],
 })
 export class PaymentModule {}

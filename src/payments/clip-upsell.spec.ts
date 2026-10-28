@@ -106,7 +106,7 @@ describe('Clip — confirmação do 3DS na fonte', () => {
 // Query encadeável que devolve `rows` em qualquer ponto em que for aguardada.
 function listQuery(rows: any[], calls: Array<[string, unknown[]]> = []) {
   const q: any = {};
-  for (const m of ['select', 'eq', 'not', 'gte', 'lte', 'order', 'limit']) {
+  for (const m of ['select', 'eq', 'in', 'not', 'gte', 'lte', 'order', 'limit']) {
     q[m] = (...args: unknown[]) => { calls.push([m, args]); return q; };
   }
   q.then = (ok: any, fail: any) => Promise.resolve({ data: rows, error: null }).then(ok, fail);
@@ -159,6 +159,21 @@ describe('Clip — 3DS que ninguém voltou para conferir', () => {
       ['gte', ['processed_at', '2026-10-11T01:00:00.000Z']],
       ['lte', ['processed_at', '2026-10-12T00:59:00.000Z']],
     ]));
+  });
+
+  it('webhook da Clip: só usa o id para perguntar à Clip; id desconhecido não faz nada', async () => {
+    const calls: Array<[string, unknown[]]> = [];
+    (supabase.from as jest.Mock).mockReturnValue(listQuery([pending('wh-a')], calls));
+    retrieve.mockResolvedValue({ success: true, status: 'failed' });
+
+    await expect(service.handleClipWebhook({ id: 'pay-wh-a', status: 'paid' })).resolves.toEqual({ received: true });
+    expect(calls).toEqual(expect.arrayContaining([['in', ['provider_transaction_id', ['pay-wh-a']]]]));
+    // O corpo dizia "paid", a Clip disse "failed": vale a Clip.
+    expect(handleWebhookProvider).toHaveBeenCalledWith(expect.objectContaining({ reference: 'wh-a', status: 'FAILED' }));
+
+    handleWebhookProvider.mockClear();
+    await expect(service.handleClipWebhook({ foo: 'bar' })).resolves.toEqual({ received: true });
+    expect(handleWebhookProvider).not.toHaveBeenCalled();
   });
 
   it('sair para o banco não devolve a reserva de uma cobrança em andamento', async () => {

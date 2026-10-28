@@ -2535,6 +2535,28 @@ export class PaymentService {
         return { checked: data?.length ?? 0, resolved }
     }
 
+    /**
+     * Webhook da Clip (POST /webhook/clip). Ela manda, sim — e o 404 fazia ela
+     * repetir de hora em hora. O corpo NÃO é confiável (sem assinatura que a
+     * gente conheça): só tiramos dele o id do pagamento e perguntamos à Clip,
+     * pelo mesmo caminho da varredura. Um id que não casa é ignorado.
+     */
+    async handleClipWebhook(body: any) {
+        const ids = [body?.id, body?.payment_id, body?.paymentId, body?.data?.id, body?.data?.payment_id,
+            body?.payment?.id, body?.resource?.id]
+            .filter((v): v is string => typeof v === 'string' && /^[\w-]{6,80}$/.test(v))
+        console.log(`[ClipWebhook] evento=${body?.event ?? body?.type ?? body?.event_type ?? '-'} `
+            + `status=${body?.status ?? body?.data?.status ?? '-'} ids=${ids.length} chaves=${Object.keys(body ?? {}).join(',')}`)
+        if (!ids.length) return { received: true }
+
+        const { data } = await supabase.from('transactions')
+            .select('id, status, provider, provider_transaction_id, provider_account_id, metadata, amount')
+            .eq('provider', 'clip').in('provider_transaction_id', [...new Set(ids)])
+            .limit(5)
+        for (const tx of data ?? []) await this.confirmClipAtProvider(tx)
+        return { received: true }
+    }
+
     private async confirmAtProvider(tx: any): Promise<boolean> {
         if (!tx || ['approved', 'refunded', 'chargeback'].includes(String(tx.status))) return false
         if (this.normalizeProviderName(tx.provider) === 'clip') return this.confirmClipAtProvider(tx)
