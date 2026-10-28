@@ -66,6 +66,17 @@ describe('ClipProvider.charge — dados do comprador', () => {
     }));
   });
 
+  it('prevention_data como na documentação: sessão do SDK nos dois campos e o user agent do checkout', async () => {
+    mockClip({ status: 200, body: { id: 'p1', status: 'completed' } });
+    await new ClipProvider().charge(ctx({
+      payment_data: { clipToken: 'tok', clipSessionId: 'sdk-sess-1' },
+      context: { orderId: 'o1', userAgent: 'Mozilla/5.0 (iPhone)' },
+    }) as never);
+    expect(sent[0].prevention_data).toEqual({
+      session_id: 'sdk-sess-1', device_finger_print_token: 'sdk-sess-1', user_agent: 'Mozilla/5.0 (iPhone)',
+    });
+  });
+
   it('sem telefone não inventa número; sem número no formulário tira da rua', async () => {
     mockClip({ status: 200, body: { id: 'p1', status: 'completed' } });
     await new ClipProvider().charge(ctx({

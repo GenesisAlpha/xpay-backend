@@ -380,10 +380,17 @@ export class ClipProvider {
     // ⚠️ location.ip NÃO está no schema atual de /payments e disparava CL2200.
     // O sinal de device vai por prevention_data.session_id — não reintroduza
     // location sem confirmar no schema da Clip.
+    // Como na documentação de 3DS: session_id e device_finger_print_token são a
+    // sessão do SDK (card.preventionData()), e user_agent o do comprador. O
+    // checkout manda o user agent em context.userAgent — só ler user_agent
+    // deixava o campo sempre vazio.
     const pd: any = {};
     const sessionId = ctx.payment_data?.clipSessionId ?? ctx.session_id;
-    if (sessionId) pd.session_id = s(sessionId, 100);
-    const ua = s(ctx.user_agent ?? ctx.payment_data?.userAgent, 400);
+    if (sessionId) {
+      pd.session_id = s(sessionId, 100);
+      pd.device_finger_print_token = pd.session_id;
+    }
+    const ua = s(ctx.user_agent ?? ctx.context?.userAgent ?? ctx.payment_data?.userAgent, 400);
     if (ua) pd.user_agent = ua;
     if (Object.keys(pd).length) payload.prevention_data = pd;
 
