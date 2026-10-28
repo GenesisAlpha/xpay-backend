@@ -130,12 +130,18 @@ export class ClipProvider {
     // simplificar sem reproduzir os dois casos.
     if (res.status >= 400 && /CL2200/.test(res.body)) {
       const emailBad = /email/i.test(res.body);
+      // Se a Clip exigir telefone e o comprador não deu, aí sim vai o de respaldo.
+      const phoneBad = /phone/i.test(res.body);
       console.log(
         `[ClipProvider] ${accountId} CL2200${emailBad ? ' (email inválido → fallback)' : ''} `
         + '→ reenviando sem endereços espelhados',
       );
       delete payload.location;
       if (emailBad && payload.customer) payload.customer.email = `cliente@${brand}`;
+      if (phoneBad && payload.customer) payload.customer.phone = '5555555555';
+      // Endereço que a Clip não aceitou (estado por extenso, CP fora do
+      // padrão…) não pode derrubar a venda: sai inteiro no reenvio.
+      if (/customer\.address|address\./i.test(res.body) && payload.customer) delete payload.customer.address;
       if (payload.metadata) {
         delete payload.metadata.billing_address;
         delete payload.metadata.shipping_address;
@@ -301,7 +307,13 @@ export class ClipProvider {
 
   private buildPayload(ctx: ClipCtx, amountDecimal: number, brand: string) {
     const c = ctx.customer ?? {};
+    // O checkout manda o endereço em `billing_address` ({ address, number,
+    // zipcode, city, state, country }) e o nome inteiro em `customer.name`.
+    // Antes este payload só lia customer.street/first_name, e a Clip recebia o
+    // pedido sem nome, sem endereço e com telefone inventado.
+    const b = ctx.billing_address ?? ctx.shippingDetails?.shippingAddress ?? {};
     const s = (v: any, max = 255) => String(v ?? '').trim().slice(0, max);
+    const phone = s(c.phone, 20).replace(/\D/g, '').slice(-10);
 
     const payload: any = {
       amount: amountDecimal,
@@ -310,12 +322,15 @@ export class ClipProvider {
       payment_method: { token: ctx.payment_data?.clipToken ?? ctx.payment_data?.token ?? ctx.token },
       customer: {
         email: s(c.email, 120) || `cliente@${brand}`,
-        phone: s(c.phone, 20).replace(/\D/g, '').slice(-10) || '5555555555',
       },
     };
+    // Telefone falso é sinal de fraude para o antifraude: sem telefone de
+    // verdade, o campo fica de fora (ver o retry do CL2200 em charge).
+    if (phone.length === 10) payload.customer.phone = phone;
 
-    if (c.first_name) payload.customer.first_name = s(c.first_name, 60);
-    if (c.last_name) payload.customer.last_name = s(c.last_name, 60);
+    const [firstName, lastName] = this.splitName(c.first_name, c.last_name, c.name);
+    if (firstName) payload.customer.first_name = s(firstName, 60);
+    if (lastName) payload.customer.last_name = s(lastName, 60);
 
     // Referência de conciliação da Clip: só - e _, máximo 36.
     if (ctx.external_reference) {
@@ -340,9 +355,13 @@ export class ClipProvider {
     // ⚠️ O REQUEST usa exterior_number/interior_number; a RESPONSE devolve
     // external_number/internal_number. Mandar a grafia da resposta faz a Clip
     // descartar o campo.
-    const street = s(c.street ?? c.address, 120);
-    const postalCode = s(c.postal_code ?? c.zip, 20).replace(/\D/g, '').slice(0, 5);
-    const extNum = this.exteriorNumber(street);
+    const street = s(c.street ?? c.address ?? b.address ?? b.line1, 120);
+    const postalCode = s(c.postal_code ?? c.zip ?? b.zipcode ?? b.postal_code, 20).replace(/\D/g, '').slice(0, 5);
+    // O número do formulário vale mais que o adivinhado do texto da rua.
+    const extNum = s(c.exterior_number ?? b.number, 10).replace(/\s+/g, '') || this.exteriorNumber(street);
+    const city = s(c.city ?? b.city, 80);
+    const state = s(c.state ?? b.state, 80);
+    const country = /^[A-Z]{2}$/i.test(String(b.country ?? '')) ? String(b.country).toUpperCase() : 'MX';
 
     const address: any = {};
     if (postalCode) address.postal_code = postalCode;
@@ -350,10 +369,10 @@ export class ClipProvider {
       address.street = street;
       if (extNum) address.exterior_number = extNum;
     }
-    if (c.city) address.city = s(c.city, 80);
-    if (c.state) address.state = s(c.state, 80);
+    if (city) address.city = city;
+    if (state) address.state = state;
     if (Object.keys(address).length) {
-      address.country = 'MX';
+      address.country = country;
       payload.customer.address = address;
     }
 
@@ -383,6 +402,15 @@ export class ClipProvider {
     if (inst === 3 || inst === 6) payload.installments = inst;
 
     return payload;
+  }
+
+  // Nome e sobrenome: a Clip quer separados; o checkout manda o nome inteiro.
+  // Primeira palavra é o nome, o resto o sobrenome — no México os dois
+  // apellidos ficam juntos: "Ana López Pérez" → ["Ana", "López Pérez"].
+  private splitName(first?: string, last?: string, full?: string): [string, string] {
+    if (first || last) return [String(first ?? '').trim(), String(last ?? '').trim()];
+    const parts = String(full ?? '').trim().split(/\s+/).filter(Boolean);
+    return [parts[0] ?? '', parts.slice(1).join(' ')];
   }
 
   // Número exterior: corta o que vier depois de um marcador de interior e pega
