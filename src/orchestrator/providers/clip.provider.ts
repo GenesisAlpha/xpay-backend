@@ -132,19 +132,40 @@ export class ClipProvider {
       const emailBad = /email/i.test(res.body);
       // Se a Clip exigir telefone e o comprador não deu, aí sim vai o de respaldo.
       const phoneBad = /phone/i.test(res.body);
+      // O texto inteiro do CL2200: sem ele não dá para saber qual campo a
+      // Clip recusou (em 30/10 o endereço sumia e o log não dizia por quê).
       console.log(
-        `[ClipProvider] ${accountId} CL2200${emailBad ? ' (email inválido → fallback)' : ''} `
-        + '→ reenviando sem endereços espelhados',
+        `[ClipProvider] ${accountId} tx=${transactionId} CL2200${emailBad ? ' (email inválido → fallback)' : ''} `
+        + `→ reenviando. Resposta: ${String(res.body).slice(0, 800)}`,
       );
       delete payload.location;
       if (emailBad && payload.customer) payload.customer.email = `cliente@${brand}`;
       if (phoneBad && payload.customer) payload.customer.phone = '5555555555';
-      // Endereço que a Clip não aceitou (estado por extenso, CP fora do
-      // padrão…) não pode derrubar a venda: sai inteiro no reenvio.
-      if (/customer\.address|address\./i.test(res.body) && payload.customer) delete payload.customer.address;
+      // Campos que copiamos do plugin oficial em 30/10: se a Clip recusar um
+      // deles nesta conta, ele sai no reenvio em vez de derrubar a venda.
+      for (const k of ['type', 'entry_mode', 'webhook_url', 'tip_amount', 'country']) {
+        if (new RegExp(`(^|[^.\\w])${k}\\b`, 'i').test(res.body)) delete payload[k];
+      }
+      if (/metadata\.website/i.test(res.body) && payload.metadata) delete payload.metadata.website;
+      // Endereço que a Clip não aceitou não pode derrubar a venda. Só o campo que a Clip citou sai (ex.: customer.address.state); CP, rua
+      // e número ficam — são os que pesam no AVS. Sem campo citado, sai inteiro.
+      const badFields = this.addressFieldsCited(res.body);
+      const addressCited = /address/i.test(res.body);
+      const trim = (a: any) => {
+        if (!a) return a;
+        for (const f of badFields) delete a[f];
+        return Object.keys(a).some((k) => k !== 'country') ? a : undefined;
+      };
+      if (addressCited && payload.customer?.address) {
+        payload.customer.address = badFields.length ? trim(payload.customer.address) : undefined;
+        if (!payload.customer.address) delete payload.customer.address;
+      }
       if (payload.metadata) {
-        delete payload.metadata.billing_address;
-        delete payload.metadata.shipping_address;
+        for (const k of ['billing_address', 'shipping_address']) {
+          // Sem campo citado, os espelhos saem inteiros (comportamento antigo).
+          const kept = badFields.length ? trim(payload.metadata[k]) : undefined;
+          if (kept) payload.metadata[k] = kept; else delete payload.metadata[k];
+        }
       }
       res = await this.request('/payments', 'POST', payload, publicKey, secretKey);
       console.log(`[ClipProvider] ${accountId} retry ${this.diag(res)}`);
@@ -315,14 +336,23 @@ export class ClipProvider {
     const s = (v: any, max = 255) => String(v ?? '').trim().slice(0, max);
     const phone = s(c.phone, 20).replace(/\D/g, '').slice(-10);
 
+    // Campos de topo como no plugin oficial da Clip para WooCommerce
+    // (clip-mexico-payments-for-ecommerce-transparent-checkout, charge_payment):
+    // type/entry_mode dizem à Clip que é e-commerce com cartão digitado, e
+    // webhook_url é para onde ela avisa o desfecho do 3DS.
     const payload: any = {
       amount: amountDecimal,
+      tip_amount: 0,
       currency: 'MXN',
+      country: 'MX',
+      type: 'openplatform',
+      entry_mode: 'manual',
       description: s(ctx.description, 120) || 'Pedido',
       payment_method: { token: ctx.payment_data?.clipToken ?? ctx.payment_data?.token ?? ctx.token },
       customer: {
         email: s(c.email, 120) || `cliente@${brand}`,
       },
+      webhook_url: process.env.CLIP_WEBHOOK_URL || 'https://api.koopfy.com/pay/webhook/clip',
     };
     // Telefone falso é sinal de fraude para o antifraude: sem telefone de
     // verdade, o campo fica de fora (ver o retry do CL2200 em charge).
@@ -360,8 +390,12 @@ export class ClipProvider {
     // O número do formulário vale mais que o adivinhado do texto da rua.
     const extNum = s(c.exterior_number ?? b.number, 10).replace(/\s+/g, '') || this.exteriorNumber(street);
     const city = s(c.city ?? b.city, 80);
-    const state = s(c.state ?? b.state, 80);
-    const country = /^[A-Z]{2}$/i.test(String(b.country ?? '')) ? String(b.country).toUpperCase() : 'MX';
+    // O plugin oficial manda o NOME do estado e do país (os do WooCommerce:
+    // "Chihuahua", "Mexico"). A folha da Shopify devolve código ("CHIH"):
+    // traduzimos para o nome.
+    const state = mxStateName(s(c.state ?? b.state, 80));
+    const iso = /^[A-Z]{2}$/i.test(String(b.country ?? '')) ? String(b.country).toUpperCase() : 'MX';
+    const country = iso === 'MX' ? 'Mexico' : iso;
 
     const address: any = {};
     if (postalCode) address.postal_code = postalCode;
@@ -396,11 +430,10 @@ export class ClipProvider {
 
     // metadata espelhado (billing/shipping). `colony` NÃO é campo válido aqui —
     // a Clip rejeitava com CL2200 (metadata.*_address.colony is invalid).
+    payload.metadata = { website: this.website(ctx, brand) };
     if (Object.keys(address).length) {
-      payload.metadata = {
-        billing_address: { ...address },
-        shipping_address: { ...address },
-      };
+      payload.metadata.billing_address = { ...address };
+      payload.metadata.shipping_address = { ...address };
     }
 
     // MSI (meses sem juros). A conta aceita 3 e 6 — outros valores fazem a Clip
@@ -409,6 +442,22 @@ export class ClipProvider {
     if (inst === 3 || inst === 6) payload.installments = inst;
 
     return payload;
+  }
+
+  // Campos do endereço que a Clip citou no CL2200 ("customer.address.state is
+  // invalid" → ['state']).
+  private addressFieldsCited(body: string): string[] {
+    const out = new Set<string>();
+    for (const m of String(body ?? '').matchAll(/address\.([a-z_]+)/gi)) out.add(m[1].toLowerCase());
+    return [...out];
+  }
+
+  // Site da loja (sinal antifraude do plugin oficial): a origem da página de
+  // resultado que o checkout mandou; sem ela, o domínio da conta.
+  private website(ctx: ClipCtx, brand: string): string {
+    const raw = ctx.metadata?.redirect_url ?? ctx.returnUrl;
+    try { if (raw) return new URL(String(raw)).origin; } catch { /* segue */ }
+    return `https://${brand}`;
   }
 
   // Nome e sobrenome: a Clip quer separados; o checkout manda o nome inteiro.
@@ -499,4 +548,48 @@ export class ClipProvider {
       data: { accountLevel, raw },
     };
   }
+}
+
+// Estados do México: código (ISO 3166-2:MX e o da Shopify) → nome, como o
+// WooCommerce entrega ao plugin oficial da Clip. Nome já escrito passa direto.
+const MX_STATES: Record<string, string> = {
+  AGU: 'Aguascalientes', AGS: 'Aguascalientes',
+  BCN: 'Baja California', BC: 'Baja California',
+  BCS: 'Baja California Sur',
+  CAM: 'Campeche', CAMP: 'Campeche',
+  CHP: 'Chiapas', CHIS: 'Chiapas',
+  CHH: 'Chihuahua', CHIH: 'Chihuahua',
+  CMX: 'Ciudad de México', CDMX: 'Ciudad de México', DF: 'Ciudad de México',
+  COA: 'Coahuila', COAH: 'Coahuila',
+  COL: 'Colima',
+  DUR: 'Durango', DGO: 'Durango',
+  GUA: 'Guanajuato', GTO: 'Guanajuato',
+  GRO: 'Guerrero',
+  HID: 'Hidalgo', HGO: 'Hidalgo',
+  JAL: 'Jalisco',
+  MEX: 'Estado de México', EM: 'Estado de México',
+  MIC: 'Michoacán', MICH: 'Michoacán',
+  MOR: 'Morelos',
+  NAY: 'Nayarit',
+  NLE: 'Nuevo León', NL: 'Nuevo León',
+  OAX: 'Oaxaca',
+  PUE: 'Puebla',
+  QUE: 'Querétaro', QRO: 'Querétaro',
+  ROO: 'Quintana Roo', 'Q ROO': 'Quintana Roo', QROO: 'Quintana Roo',
+  SLP: 'San Luis Potosí',
+  SIN: 'Sinaloa',
+  SON: 'Sonora',
+  TAB: 'Tabasco',
+  TAM: 'Tamaulipas', TAMPS: 'Tamaulipas',
+  TLA: 'Tlaxcala', TLAX: 'Tlaxcala',
+  VER: 'Veracruz',
+  YUC: 'Yucatán',
+  ZAC: 'Zacatecas',
+};
+
+export function mxStateName(raw: string): string {
+  const v = String(raw ?? '').trim();
+  if (!v) return '';
+  const code = v.toUpperCase().replace(/^MX-/, '').replace(/[.]/g, '');
+  return MX_STATES[code] ?? v;
 }

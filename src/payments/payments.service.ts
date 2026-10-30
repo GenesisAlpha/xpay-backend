@@ -1,6 +1,7 @@
 // nexor/src/payments/payment.service.ts
 
 import { Injectable, BadRequestException, ConflictException, ForbiddenException, NotFoundException, Optional, ServiceUnavailableException } from '@nestjs/common'
+import { clipFailureReason } from './clip-failure-reason'
 import { supabase } from '../lib/supabase.client'
 import { CurrencyService } from '../currency/currency.service'
 import { WalletService } from '../wallets/wallet.service'
@@ -2489,10 +2490,16 @@ export class PaymentService {
                 void this.clipAccounts.release(reservationId, 'declined')
             }
 
+            // Motivo da recusa vindo da Clip (ex.: CA-AUT01 = 3DS não concluído).
+            // Antes ia vazio e a única forma de saber era perguntar à Clip.
+            const detail = r.raw?.status_detail ?? {}
+            const failure = mapped === 'FAILED' ? clipFailureReason(detail.code, detail.message) : null
+
             await this.webhookService.handleWebhookProvider({
                 reference: tx.id,
                 status: mapped,
                 type: 'TRANSACTION',
+                ...(failure ?? {}),
             })
             return true
         } catch (err: any) {

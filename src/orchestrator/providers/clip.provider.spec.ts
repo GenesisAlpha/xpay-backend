@@ -61,9 +61,27 @@ describe('ClipProvider.charge — dados do comprador', () => {
       first_name: 'Ana', last_name: 'López Pérez', phone: '5512345678',
       address: expect.objectContaining({
         street: 'Av. Juárez', exterior_number: '45-A', postal_code: '06600',
-        city: 'Cuauhtémoc', state: 'Ciudad de México', country: 'MX',
+        city: 'Cuauhtémoc', state: 'Ciudad de México', country: 'Mexico',
       }),
     }));
+  });
+
+  it('campos de topo como o plugin oficial da Clip', async () => {
+    mockClip({ status: 200, body: { id: 'p1', status: 'completed' } });
+    await new ClipProvider().charge(ctx({ metadata: { redirect_url: 'https://checkout.koopfy.com/payment-result?orderId=1' } }) as never);
+    expect(sent[0]).toEqual(expect.objectContaining({
+      type: 'openplatform', entry_mode: 'manual', country: 'MX', tip_amount: 0,
+      webhook_url: 'https://api.koopfy.com/pay/webhook/clip',
+    }));
+    expect(sent[0].metadata.website).toBe('https://checkout.koopfy.com');
+  });
+
+  it('estado em código (folha da Shopify) vira o nome', async () => {
+    mockClip({ status: 200, body: { id: 'p1', status: 'completed' } });
+    await new ClipProvider().charge(ctx({
+      billing_address: { address: 'Tercera 1409', number: '1409', zipcode: '31940', city: 'Madera', state: 'CHIH', country: 'MX' },
+    }) as never);
+    expect(sent[0].customer.address.state).toBe('Chihuahua');
   });
 
   it('prevention_data como na documentação: sessão do SDK nos dois campos e o user agent do checkout', async () => {
@@ -94,7 +112,39 @@ describe('ClipProvider.charge — dados do comprador', () => {
     );
     const r = await new ClipProvider().charge(ctx({ customer: { name: 'Ana', email: 'ana@example.com' } }) as never);
     expect(r.success).toBe(true);
-    expect(sent[1].customer.address).toBeUndefined();
+    // Só o estado sai: CP, rua e número continuam (AVS).
+    expect(sent[1].customer.address.state).toBeUndefined();
+    expect(sent[1].customer.address).toEqual(expect.objectContaining({ postal_code: '06600', exterior_number: '45-A' }));
+    expect(sent[1].metadata.billing_address.state).toBeUndefined();
     expect(sent[1].customer.phone).toBe('5555555555');
   });
+
+  it('CL2200 sem campo citado do endereço: o endereço sai inteiro', async () => {
+    mockClip(
+      { status: 400, body: { error_code: 'CL2200', detail: 'invalid customer address' } },
+      { status: 200, body: { id: 'p1', status: 'completed' } },
+    );
+    await new ClipProvider().charge(ctx() as never);
+    expect(sent[1].customer.address).toBeUndefined();
+    expect(sent[1].metadata.billing_address).toBeUndefined();
+  });
+
+  it('CL2200 num campo do plugin: ele sai e a venda segue', async () => {
+    mockClip(
+      { status: 400, body: { error_code: 'CL2200', detail: 'entry_mode is invalid' } },
+      { status: 200, body: { id: 'p1', status: 'completed' } },
+    );
+    const r = await new ClipProvider().charge(ctx() as never);
+    expect(r.success).toBe(true);
+    expect(sent[1].entry_mode).toBeUndefined();
+    expect(sent[1].type).toBe('openplatform');
+    expect(sent[1].customer.address.postal_code).toBe('06600');
+  });
+});
+
+describe('mxStateName', () => {
+  const { mxStateName } = require('./clip.provider');
+  it.each([['CHIH', 'Chihuahua'], ['CHH', 'Chihuahua'], ['MX-NLE', 'Nuevo León'], ['CDMX', 'Ciudad de México'], ['Jalisco', 'Jalisco'], ['', '']])(
+    '%s → %s', (a, b) => expect(mxStateName(a)).toBe(b),
+  );
 });
