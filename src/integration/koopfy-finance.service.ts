@@ -72,6 +72,9 @@ const PAYOUT_FIELDS = [
 
 const OWN_PROCESSOR: Record<string, string> = { whop: 'Whop', stripe: 'Stripe', paypal: 'PayPal' };
 
+/** Provedores do mesmo grupo: aparecem por nome na transação (transparência). */
+const RELATED_PARTY_PROCESSORS: Record<string, string> = { kontino: 'Kontino' };
+
 function publicTransaction(transaction: any) {
   // Venda em conta PRÓPRIA do seller: o painel mostra o provedor e a conta, que
   // são dele. Conta do pool da Koopfy nunca sai — segue "Koopfy Payments".
@@ -83,6 +86,10 @@ function publicTransaction(transaction: any) {
     country: transaction.country ?? null,
     paymentMethod: transaction.paymentMethod ?? null,
     processor: ownProvider ? OWN_PROCESSOR[ownProvider] : 'Koopfy Payments',
+    // Parte relacionada (Kontino, empresa do Koopfy Group): o seller vê quem
+    // processou. Os demais provedores do pool seguem como "Koopfy Payments".
+    // Ver specs/koopfy-painel-v2.md §3.
+    relatedPartyProcessor: RELATED_PARTY_PROCESSORS[String(transaction.provider ?? '').toLowerCase()] ?? null,
     ownAccountId: ownProvider ? String(transaction.providerAccountId) : null,
     orderId: transaction.orderId ?? null,
     amount: Number(transaction.amount ?? 0),

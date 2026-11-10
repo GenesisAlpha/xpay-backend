@@ -192,6 +192,21 @@ describe('KoopfyFinanceService', () => {
     expect(method).not.toHaveProperty('provider');
   });
 
+  it('names Kontino (related party) as processor, keeps other pool providers as Koopfy Payments', async () => {
+    const { service, transactions } = createService();
+    const base = { customer: 'Ana', amount: 120, currency: 'BRL', status: 'approved', createdAt: '2026-11-10T00:00:00.000Z' };
+    transactions.list.mockResolvedValue({
+      data: [{ ...base, id: 'tx-k', provider: 'kontino' }, { ...base, id: 'tx-s', provider: 'stripe' }],
+      total: 2, page: 1, pageSize: 20, totalPages: 1,
+    });
+
+    const result: any = await service.listTransactions(activeContext, {});
+
+    expect(result.data[0]).toEqual(expect.objectContaining({ id: 'tx-k', processor: 'Koopfy Payments', relatedPartyProcessor: 'Kontino' }));
+    expect(result.data[1]).toEqual(expect.objectContaining({ id: 'tx-s', processor: 'Koopfy Payments', relatedPartyProcessor: null }));
+    expect(result.data[1]).not.toHaveProperty('provider');
+  });
+
   it('redacts stored secrets from settings and listed API keys', async () => {
     const { service, settings, apiKeys } = createService();
     settings.get.mockResolvedValue({
