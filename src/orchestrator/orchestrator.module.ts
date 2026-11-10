@@ -20,6 +20,8 @@ import { OwnAccountFinanceService } from './own-finance/own-account-finance.serv
 import { OwnPaymentDomainsService } from './own-finance/own-payment-domains.service';
 import { OwnAccountPermissionsService } from './own-finance/own-account-permissions.service';
 
+import { MethodRoutingService } from './method-routing/method-routing.service';
+
 @Module({
   imports: [CryptoModule], // 🔥 precisa pra decrypt
   providers: [
@@ -52,6 +54,8 @@ import { OwnAccountPermissionsService } from './own-finance/own-account-permissi
     StripeRiskService,
     StripeEfwService,
     AffiliateRiskService,
+    // Provedor por método (payment_method_routes): pagamentos e CRM.
+    MethodRoutingService,
   ],
   // WhopAccountsService e StripeAccountsService são exportados porque o
   // WebhookService precisa resolver a conta (e o segredo dela) pelo accountId
@@ -61,6 +65,7 @@ import { OwnAccountPermissionsService } from './own-finance/own-account-permissi
   // taxas (recordRiskEvent) — sem isso, disputa que chega por webhook não conta
   // em lugar nenhum e a quarentena automática nunca dispara.
   exports: [
+    MethodRoutingService,
     // ClipAccountsService é exportado porque o fluxo de reserva (hold/capture/
     // release) vive fora do router: quem segura o teto é o checkout, ANTES de o
     // formulário de cartão existir, e quem captura é o webhook.

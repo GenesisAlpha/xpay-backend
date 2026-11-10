@@ -32,6 +32,8 @@ import { StorageService } from '../lib/storage.service'
 import { WhopProvider, type WhopMembershipState } from '../orchestrator/providers/whop.provider'
 import { customerSubscriptionView, isSubscriptionTransaction } from './customer-subscription'
 import { SLASH_CURRENCIES } from '../orchestrator/providers/slash.provider'
+import { MethodRoutingService } from '../orchestrator/method-routing/method-routing.service'
+import { DIRECT_PROVIDERS } from '../orchestrator/method-routing/method-routing'
 import { ErroKontino, KONTINO_METODOS, criarCobranca, ehMetodoKontino, kontinoConfigurado, respostaAoCheckout, type MetodoKontino } from '../orchestrator/kontino/kontino'
 
 export interface ExternalFeeInput {
@@ -126,6 +128,9 @@ export class PaymentService {
         // Opcional só para os testes que montam o serviço à mão; sem ele (ou
         // com o roteamento desligado) a venda segue exatamente como antes.
         @Optional() private readonly sellerRouting?: SellerRoutingService,
+        // Provedor por método (CRM › Roteamento por método). Opcional pelo mesmo
+        // motivo: sem ele, vale o provider_default do seller.
+        @Optional() private readonly methodRouting?: MethodRoutingService,
     ) { }
 
     private static readonly REDIRECT_PROVIDERS = new Set(['viva'])
@@ -225,10 +230,41 @@ export class PaymentService {
         const currency = dto.currency
         if (!currency) throw new BadRequestException('currency is required')
 
+        // ─── Provedor por método (payment_method_routes) ─────────────────────────
+        // A plataforma decide quem cobra cada método (ex.: Pix/SPEI → Kontino,
+        // cartão → Kaja). Com regra, a cabeça da cadeia substitui o antigo
+        // seller.provider_default em TODA decisão abaixo; sem regra, nada muda.
+        // Upsell segue a compra-mãe (conta já decidida).
+        const methodRoute = !upsellParent && this.methodRouting
+            ? await this.methodRouting.resolve({
+                method: dto.method,
+                country: dto.billing_address?.country ?? dto.customer?.country ?? (dto.method === 'mbway' ? 'PT' : null),
+                currency: String(currency),
+                sellerId: effectiveSellerId,
+            }).catch((err: any) => {
+                console.error('[PaymentService] roteamento por método indisponível, seguindo sem regra:', err?.message)
+                return null
+            })
+            : null
+        const routedByMethod = Boolean(methodRoute?.ruleId)
+        if (routedByMethod && methodRoute!.chain.length === 0) {
+            console.error(
+                `[PaymentService] 🚨 ${dto.method}: nenhum provedor disponível na regra ${methodRoute!.ruleId} — `
+                + methodRoute!.skipped.map(sk => `${sk.provider} (${sk.reason})`).join(', '),
+            )
+            throw new BadRequestException({
+                code: 'METHOD_UNAVAILABLE',
+                message: 'Este método de pagamento está indisponível no momento. Selecione outro.',
+            })
+        }
+        let effectiveProvider = routedByMethod
+            ? methodRoute!.chain[0] as string
+            : this.normalizeProviderName(seller?.provider_default)
+
         // Coinflow opera em USD/cripto — não processa BRL. Barra AQUI (antes do FX,
         // do insert da transação e da chamada ao provider) p/ não gerar pagamento
         // em BRL no provider e devolver uma mensagem clara ao cliente.
-        if (this.normalizeProviderName(seller?.provider_default) === 'coinflow'
+        if (effectiveProvider === 'coinflow'
             && String(currency).toUpperCase() === 'BRL') {
             throw new BadRequestException({
                 code: 'CURRENCY_NOT_SUPPORTED',
@@ -238,7 +274,7 @@ export class PaymentService {
 
         // Rox Pay: trava de moeda ANTES do FX/transação/chamada ao provider —
         // fora da allowlist nem gera requisição.
-        if (this.normalizeProviderName(seller?.provider_default) === 'rox_pay'
+        if (effectiveProvider === 'rox_pay'
             && !ROX_PAY_ALLOWED_CURRENCIES.has(String(currency).toUpperCase())) {
             throw new BadRequestException({
                 code: 'CURRENCY_NOT_SUPPORTED',
@@ -247,7 +283,7 @@ export class PaymentService {
         }
 
         // Slash: a API só aceita USD e EUR.
-        if (this.normalizeProviderName(seller?.provider_default) === 'slash'
+        if (effectiveProvider === 'slash'
             && !SLASH_CURRENCIES.has(String(currency).toUpperCase())) {
             throw new BadRequestException({
                 code: 'CURRENCY_NOT_SUPPORTED',
@@ -258,11 +294,11 @@ export class PaymentService {
         // dentro do formulário deles. O método que vem do checkout é o que
         // estava selecionado na tela (pode ser Pix, se o seller tiver marcado) —
         // e um método que a conta Slash não atende tiraria a conta do roteamento.
-        if (this.normalizeProviderName(seller?.provider_default) === 'slash') dto.method = 'card'
+        if (effectiveProvider === 'slash') dto.method = 'card'
 
         // Slash só faz cobrança avulsa: sem cartão salvo, a assinatura morreria
         // no primeiro ciclo depois de o comprador pagar a entrada.
-        if (this.normalizeProviderName(seller?.provider_default) === 'slash'
+        if (effectiveProvider === 'slash'
             && isSubscriptionTransaction(dto.metadata)) {
             throw new BadRequestException({
                 code: 'SUBSCRIPTION_NOT_SUPPORTED',
@@ -319,7 +355,7 @@ export class PaymentService {
                 ? { provider: routedOwn.provider, commissionPct: await ownAccountCommissionPct(effectiveSellerId) }
                 : await resolveOwnSale({
                     sellerId: effectiveSellerId,
-                    providerDefault: this.normalizeProviderName(seller?.provider_default),
+                    providerDefault: effectiveProvider,
                     method: dto.method,
                 })
         const ownAccountPct = ownSale?.commissionPct ?? null
@@ -401,7 +437,7 @@ export class PaymentService {
                 // Hoje a condição do meio nem dispara (provider_gateway_id nunca é
                 // gravado no pay), mas o dia em que passar a ser, o sintoma seria
                 // exatamente esse — silencioso e difícil de rastrear.
-                const isEmbedProvider = this.normalizeProviderName(seller?.provider_default) === 'whop'
+                const isEmbedProvider = effectiveProvider === 'whop'
 
                 if (!isEmbedProvider) {
                     if (existing.status === 'approved') return this.formatResponse(existing)
@@ -422,7 +458,7 @@ export class PaymentService {
                 // valor que o intent novo vai cobrar. Sem isto a transação ficava
                 // com o valor da primeira chamada e o crédito do seller sairia
                 // errado.
-                if (this.normalizeProviderName(seller?.provider_default) === 'slash'
+                if (effectiveProvider === 'slash'
                     && ['pending', 'requires_action'].includes(existing.status)) {
                     const { data: refreshed, error: refreshError } = await supabase
                         .from('transactions')
@@ -508,15 +544,21 @@ export class PaymentService {
         // ── Kontino Connect: SPEI e Pix com confirmação automática ─────────────
         // Cada cobrança tem a própria CLABE (ou código Pix) e o Kontino avisa o
         // pagamento por webhook assinado (/webhook/kontino): sem comprovante.
-        if (this.normalizeProviderName(seller.provider_default) === 'kontino' && ehMetodoKontino(dto.method)) {
-            return this.cobrarPeloKontino(seller, dto, transaction, amount, String(currency))
+        if (effectiveProvider === 'kontino' && ehMetodoKontino(dto.method)) {
+            // Reserva da regra (ex.: SPEI → Clip, Pix → Approvebly): falha técnica
+            // do Kontino passa para ela em vez de recusar o comprador.
+            const nextProvider = routedByMethod ? (methodRoute!.chain[1] ?? null) : null
+            const kontino = await this.cobrarPeloKontino(seller, dto, transaction, amount, String(currency), { fallbackTo: nextProvider })
+            if (kontino) return kontino
+            console.error(`[PaymentService] ⚠️ FAILOVER por método: kontino → ${nextProvider} (tx=${transaction.id})`)
+            effectiveProvider = nextProvider as string
         }
 
         // ── Clip SPEI: cria a transação e reserva a CLABE no mesmo clique ──
         // Não passa por ClipProvider: SPEI é transferência manual. A resposta
         // abre o modal de instruções e a transação permanece pending até o
         // comprovante ser analisado.
-        if (this.normalizeProviderName(seller.provider_default) === 'clip' && dto.method === 'spei') {
+        if (effectiveProvider === 'clip' && dto.method === 'spei') {
             if (String(currency).toUpperCase() !== 'MXN') {
                 throw new BadRequestException('SPEI está disponível apenas em MXN.')
             }
@@ -638,7 +680,7 @@ export class PaymentService {
         // provider REALMENTE usado, não o preferido. Calcular a taxa da Coinflow
         // num pagamento que saiu pela Stripe é o tipo de erro que só aparece na
         // conciliação do fim do mês.
-        let providerName = this.normalizeProviderName(seller?.provider_default)
+        let providerName = effectiveProvider
         const preferredProvider = providerName
         const customerCountry = buyerCountry
 
@@ -661,6 +703,14 @@ export class PaymentService {
         ) : await this.accountRouter.resolveWithFailover({
             sellerId: effectiveSellerId,
             preferredProvider: providerName,
+            // Com regra por método, a cadeia é a da regra (a partir do provedor
+            // efetivo, sem os que cobram direto, como o Kontino); sem regra, a
+            // cadeia fixa de failover.config.ts.
+            chain: routedByMethod
+                ? methodRoute!.chain
+                    .slice(Math.max(0, methodRoute!.chain.indexOf(effectiveProvider as any)))
+                    .filter(p => !DIRECT_PROVIDERS.has(p))
+                : undefined,
             method: dto.method,
             customerCountry: customerCountry ?? undefined,
             // Isolamento entre titulares: a oferta define a vertical, o seller
@@ -1706,7 +1756,35 @@ export class PaymentService {
     }
 
     /** Cobrança local pelo Kontino Connect (SPEI em MXN, Pix em BRL). */
-    private async cobrarPeloKontino(seller: any, dto: any, transaction: any, amountMinor: number, currency: string) {
+    /**
+     * Provedor do formulário de cartão pela regra de método. `routed: false` =
+     * sem regra (vale o provider_default). Com regra e nenhuma conta, provider
+     * null: o checkout não oferece cartão em vez de montar um formulário que
+     * não cobra.
+     */
+    private async cardProviderByMethod(
+        sellerId: string,
+        opts: { country?: string | null; currency?: string | null },
+    ): Promise<{ routed: boolean; provider: string | null }> {
+        if (!this.methodRouting) return { routed: false, provider: null }
+        const route = await this.methodRouting.resolve({
+            method: 'card', country: opts.country ?? null, currency: opts.currency ?? null, sellerId,
+        }).catch(() => null)
+        if (!route?.ruleId) return { routed: false, provider: null }
+        for (const candidate of route.chain.filter(p => !DIRECT_PROVIDERS.has(p))) {
+            const account = await this.accountRouter.getAccountByProvider({ sellerId, provider: candidate }).catch(() => null)
+            if (account) return { routed: true, provider: candidate }
+        }
+        console.error(`[PaymentService] cartão sem provedor com conta para o seller ${sellerId} na regra ${route.ruleId}`)
+        return { routed: true, provider: null }
+    }
+
+    /**
+     * Cobra pelo Kontino. Com `fallbackTo`, uma falha TÉCNICA (não de regra do
+     * trilho, como valor fora da faixa) devolve null e a transação volta a ficar
+     * livre para o próximo provedor da regra.
+     */
+    private async cobrarPeloKontino(seller: any, dto: any, transaction: any, amountMinor: number, currency: string, opts: { fallbackTo?: string | null } = {}) {
         const metodo = dto.method as MetodoKontino
         if (currency.toUpperCase() !== KONTINO_METODOS[metodo].moeda) {
             throw new BadRequestException(`${metodo === 'spei' ? 'SPEI' : 'Pix'} está disponível apenas em ${KONTINO_METODOS[metodo].moeda}.`)
@@ -1735,6 +1813,14 @@ export class PaymentService {
             }).eq('id', transaction.id)
             return respostaAoCheckout(transaction.id, cobranca, amountMinor)
         } catch (e: any) {
+            if (opts.fallbackTo && !(e instanceof ErroKontino && e.code === 'amount_out_of_range')) {
+                console.error(`[PaymentService] Kontino falhou tx=${transaction.id}, seguindo para ${opts.fallbackTo}:`, e?.message ?? e)
+                await supabase.from('transactions').update({
+                    metadata: { ...(transaction.metadata ?? {}), kontino_fallback: { to: opts.fallbackTo, reason: String(e?.message ?? e).slice(0, 300) } },
+                    updated_at: new Date().toISOString(),
+                }).eq('id', transaction.id)
+                return null
+            }
             const motivo = e instanceof ErroKontino ? `${e.code}: ${e.message}` : String(e?.message ?? e)
             console.error(`[PaymentService] Kontino recusou a cobrança tx=${transaction.id}:`, motivo)
             await supabase.from('transactions').update({
@@ -1792,11 +1878,17 @@ export class PaymentService {
             return null
         })
 
+        // Provedor por método: com regra para cartão, o formulário é o do
+        // primeiro provedor da cadeia que tem conta para este seller — a mesma
+        // ordem que createPayment percorre. Sem regra, o provider_default.
+        const cardByMethod = ownStripe ? null : await this.cardProviderByMethod(sellerId, routingOpts)
         const provider = ownStripe
             ? 'stripe'
-            : seller.provider_default
-                ? this.normalizeProviderName(seller.provider_default)
-                : null
+            : cardByMethod?.routed
+                ? cardByMethod.provider
+                : seller.provider_default
+                    ? this.normalizeProviderName(seller.provider_default)
+                    : null
 
         // MID por seller: Sentinel usa provider_mid; Coinflow usa o merchantId
         // guardado em config.coinflow_merchant_id (provider_mid tem FK p/ Sentinel).

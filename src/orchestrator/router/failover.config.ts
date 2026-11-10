@@ -70,7 +70,17 @@ export const NO_FAILOVER_PROVIDERS = new Set<ProviderName>(['slash']);
 export function buildFailoverOrder(args: {
   preferred?: string | null;
   method?: string;
+  /**
+   * Cadeia da regra de provedor por método (CRM). Quando vem, substitui a
+   * cadeia fixa: a ordem é a da regra e o primeiro é o preferido.
+   */
+  chain?: string[];
 }): ProviderName[] {
+  if (args.chain && args.chain.length) {
+    const explicit = args.chain.map(p => p.toLowerCase()) as ProviderName[];
+    if (NO_FAILOVER_PROVIDERS.has(explicit[0])) return [explicit[0]];
+    return explicit.slice(0, FAILOVER_MAX_HOPS + 1);
+  }
   const chain = failoverChainFor(args.method);
   const preferred = args.preferred?.toLowerCase() as ProviderName | undefined;
 

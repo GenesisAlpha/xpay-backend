@@ -46,6 +46,7 @@ import { CrmController } from './crm.controller'
 import { CrmService }    from './crm.service'
 import { CrmAdminController } from './crm-admin.controller'
 import { CrmAdminService } from './crm-admin.service'
+import { CrmMethodRoutingController } from './crm-method-routing.controller'
 import { CrmCheckoutController } from './crm-checkout.controller'
 import { CrmCheckoutService } from './crm-checkout.service'
 import { CrmTicketsController } from './crm-tickets.controller'
@@ -103,13 +104,13 @@ import { KoopfyIntegrationModule } from '../integration/koopfy-integration.modul
   // CrmCheckoutController: sellers e lojas do checkout (só leitura, via canal
   // interno).
   // CrmClipController: contas Clip (modo cartão/SPEI, status, tetos).
-  controllers: [CrmController, CrmAdminController, CrmCheckoutController, CrmTicketsController, WhopConnectController, WhopRfiReviewsController, WhopLinkedController, SellerRoutingCrmController, ActivationRequestsController, AffiliateCrmController, CrmClipController],
+  controllers: [CrmController, CrmAdminController, CrmCheckoutController, CrmTicketsController, WhopConnectController, WhopRfiReviewsController, WhopLinkedController, SellerRoutingCrmController, ActivationRequestsController, AffiliateCrmController, CrmClipController, CrmMethodRoutingController],
   providers:   [CrmService, CrmAdminService, CrmCheckoutService, CrmClipService, CrmAuthGuard, StorageService],
   exports:     [CrmService, CrmAdminService, CrmCheckoutService],
 })
 export class CrmModule implements NestModule {
   // IP e navegador de cada requisição do CRM, para o log de ações.
   configure(consumer: MiddlewareConsumer) {
-    consumer.apply(crmRequestContext).forRoutes(CrmController, CrmAdminController, CrmCheckoutController, CrmClipController)
+    consumer.apply(crmRequestContext).forRoutes(CrmController, CrmAdminController, CrmCheckoutController, CrmClipController, CrmMethodRoutingController)
   }
 }

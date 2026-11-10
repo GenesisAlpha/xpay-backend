@@ -1080,6 +1080,8 @@ export class AccountRouterService implements OnModuleInit {
   async resolveWithFailover(args: {
     sellerId: string;
     preferredProvider?: string | null;
+    /** Cadeia explícita (provedor por método). Ausente = cadeia fixa por método. */
+    chain?: string[];
     method?: string;
     customerCountry?: string;
     segment?: string | null;
@@ -1150,6 +1152,7 @@ export class AccountRouterService implements OnModuleInit {
     const chain = buildFailoverOrder({
       preferred: args.preferredProvider,
       method: args.method,
+      chain: args.chain,
     });
 
     const attempted: string[] = [];
