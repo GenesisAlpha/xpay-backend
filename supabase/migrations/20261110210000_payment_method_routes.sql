@@ -50,18 +50,22 @@ create index if not exists payment_method_route_history_route_idx
 alter table public.payment_method_route_history enable row level security;
 
 -- Política inicial (decisão de 10/11): Pix e SPEI no Kontino, cartão na Kaja
--- Payments. As reservas mantêm a cobrança viva enquanto o primário não está
--- disponível (Kaja aguardando API/credenciais; Kontino sem chave de produção).
-insert into public.payment_method_routes (method, providers, notes, updated_by) values
-  ('pix',        array['kontino', 'approvebly', 'whop'], 'Pix no Kontino', 'migration'),
-  ('spei',       array['kontino', 'clip'],               'SPEI no Kontino; Clip de reserva', 'migration'),
-  ('card',       array['kaja', 'stripe', 'whop'],        'Cartão na Kaja Payments', 'migration'),
-  ('apple_pay',  array['kaja', 'stripe', 'whop'],        'Carteira no mesmo provedor do cartão', 'migration'),
-  ('google_pay', array['kaja', 'stripe', 'whop'],        'Carteira no mesmo provedor do cartão', 'migration'),
-  -- Demais métodos: a mesma cadeia que estava fixa no código (failover.config.ts).
-  ('boleto',     array['approvebly'],                    'Cadeia de antes', 'migration'),
-  ('mbway',      array['setinel_gate'],                  'Cadeia de antes', 'migration'),
-  ('crypto',     array['coinflow', 'whop'],              'Cadeia de antes', 'migration'),
-  ('paypal',     array['paypal'],                        'Só a conta PayPal do próprio seller', 'migration'),
-  ('link',       array['stripe'],                        'Cadeia de antes', 'migration')
+-- Payments.
+--
+-- Ligadas já: Pix e SPEI (Kontino; sem chave de produção, caem nas reservas).
+-- Desligadas (prontas, um clique no CRM): cartão e carteiras na Kaja — a Kaja
+-- ainda não tem integração, e ligar agora mudaria o cartão de TODO seller para a
+-- reserva da cadeia — e os demais métodos, que seguem no provider_default até
+-- alguém ligar. Regra desligada = comportamento antigo.
+insert into public.payment_method_routes (method, providers, enabled, notes, updated_by) values
+  ('pix',        array['kontino', 'approvebly', 'whop'], true,  'Pix no Kontino', 'migration'),
+  ('spei',       array['kontino', 'clip'],               true,  'SPEI no Kontino; Clip de reserva', 'migration'),
+  ('card',       array['kaja', 'stripe', 'whop'],        false, 'Cartão na Kaja Payments — ligar quando a integração da Kaja estiver no ar', 'migration'),
+  ('apple_pay',  array['kaja', 'stripe', 'whop'],        false, 'Carteira no mesmo provedor do cartão', 'migration'),
+  ('google_pay', array['kaja', 'stripe', 'whop'],        false, 'Carteira no mesmo provedor do cartão', 'migration'),
+  ('boleto',     array['approvebly'],                    false, 'Cadeia de antes', 'migration'),
+  ('mbway',      array['setinel_gate'],                  false, 'Cadeia de antes', 'migration'),
+  ('crypto',     array['coinflow', 'whop'],              false, 'Cadeia de antes', 'migration'),
+  ('paypal',     array['paypal'],                        false, 'Só a conta PayPal do próprio seller', 'migration'),
+  ('link',       array['stripe'],                        false, 'Cadeia de antes', 'migration')
 on conflict do nothing;
