@@ -42,6 +42,14 @@ export class WebhookController {
         return this.webhookService.handleCoinflowWebhook(parsed, raw, headers);
     }
 
+    // KONTINO CONNECT (SPEI e Pix com confirmação automática)
+    @Post('kontino')
+    @HttpCode(200)
+    async handleKontinoWebhook(@Req() req: any, @Headers() headers: Record<string, string>) {
+        const raw = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : JSON.stringify(req.body ?? {});
+        return this.webhookService.handleKontinoWebhook(raw, headers);
+    }
+
     // ROX PAY
     @Post('roxpay')
     async handleRoxPayWebhook(@Req() req: any, @Headers() headers: Record<string, string>) {

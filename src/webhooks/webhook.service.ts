@@ -40,6 +40,7 @@ import {
 } from './whop-renewal'
 import * as crypto from 'crypto'
 import { WhopPayoutWebhookService } from '../payouts/whop-payout-webhook.service'
+import { assinaturaKontinoValida, buscarCobranca } from '../orchestrator/kontino/kontino'
 
 // Status do Sentinel Gate → status canônico do handleWebhookProvider.
 const SENTINEL_WEBHOOK_STATUS: Record<string, 'PAID' | 'PENDING' | 'FAILED' | 'PROCESSING'> = {
@@ -490,6 +491,70 @@ export class WebhookService {
   // buscamos o status AUTORITATIVO via GET /transactions/{TransactionId} em vez
   // de confiar no texto do evento. `TransactionId` == nosso transactions.id
   // (mandamos o próprio id interno como TransactionId ao criar o payment link).
+  // ══════════════════════════════════════════════════════════════════════════
+  // KONTINO CONNECT — collection.paid / collection.expired
+  //
+  // Assinatura obrigatória (Kontino-Signature, HMAC do corpo cru). Antes de
+  // aprovar, consulta a cobrança na API do Kontino (fonte autoritativa): um
+  // webhook forjado ou reenviado fora de ordem nunca aprova sozinho.
+  // ══════════════════════════════════════════════════════════════════════════
+  async handleKontinoWebhook(raw: string, headers: Record<string, string> = {}) {
+    const segredo = process.env.KONTINO_WEBHOOK_SECRET?.trim()
+    if (!segredo) {
+      console.error('[WebhookService] KONTINO_WEBHOOK_SECRET ausente — webhook do Kontino recusado')
+      return { ignored: true, reason: 'not configured' }
+    }
+    const cabecalho = headers['kontino-signature'] ?? headers['Kontino-Signature']
+    if (!assinaturaKontinoValida(segredo, raw, cabecalho)) {
+      console.warn('[WebhookService] Kontino: assinatura inválida')
+      return { ignored: true, reason: 'invalid signature' }
+    }
+    let evento: any
+    try {
+      evento = JSON.parse(raw)
+    } catch {
+      return { ignored: true, reason: 'invalid json' }
+    }
+    const tipo = String(evento?.type ?? '')
+    if (tipo !== 'collection.paid' && tipo !== 'collection.expired' && tipo !== 'collection.canceled') return { ignored: true, reason: `event ${tipo}` }
+    const id: string | null = evento?.data?.object?.id ?? null
+    if (!id) return { ignored: true, reason: 'collection id missing' }
+
+    const { data: tx } = await supabase
+      .from('transactions').select('id, status, metadata')
+      .eq('provider', 'kontino').eq('provider_transaction_id', id)
+      .maybeSingle()
+    if (!tx) {
+      console.warn('[WebhookService] Kontino: transação não encontrada para', id)
+      return { ignored: true, reason: 'transaction not found' }
+    }
+
+    let cobranca: any
+    try {
+      cobranca = await buscarCobranca(id)
+    } catch (err: any) {
+      console.error('[WebhookService] Kontino: erro ao confirmar a cobrança', id, err?.message)
+      // 5xx faz o Kontino tentar de novo (backoff), o que é o que queremos aqui.
+      throw new ServiceUnavailableException('Kontino indisponível; tente de novo.')
+    }
+
+    if (cobranca.status === 'paid') {
+      await supabase.from('transactions').update({
+        metadata: { ...(tx.metadata ?? {}), kontino_settlement: cobranca.settlement ?? null },
+      }).eq('id', tx.id)
+      return this.handleWebhookProvider({ reference: tx.id, status: 'PAID', type: 'TRANSACTION' })
+    }
+    if (cobranca.status === 'expired' || cobranca.status === 'canceled') {
+      return this.handleWebhookProvider({
+        reference: tx.id,
+        status: 'FAILED',
+        type: 'TRANSACTION',
+        failure_message: cobranca.status === 'expired' ? 'Cobrança vencida sem pagamento.' : 'Cobrança cancelada.',
+      })
+    }
+    return { pending: true }
+  }
+
   async handleRoxPayWebhook(body: any, headers: Record<string, string> = {}) {
     console.log('[Rox Pay webhook]', body)
 

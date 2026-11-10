@@ -32,6 +32,7 @@ import { StorageService } from '../lib/storage.service'
 import { WhopProvider, type WhopMembershipState } from '../orchestrator/providers/whop.provider'
 import { customerSubscriptionView, isSubscriptionTransaction } from './customer-subscription'
 import { SLASH_CURRENCIES } from '../orchestrator/providers/slash.provider'
+import { ErroKontino, KONTINO_METODOS, criarCobranca, ehMetodoKontino, kontinoConfigurado, respostaAoCheckout, type MetodoKontino } from '../orchestrator/kontino/kontino'
 
 export interface ExternalFeeInput {
     recipient_id: string
@@ -503,6 +504,13 @@ export class PaymentService {
             transaction = created
         }
         __mark('transaction insert')
+
+        // ── Kontino Connect: SPEI e Pix com confirmação automática ─────────────
+        // Cada cobrança tem a própria CLABE (ou código Pix) e o Kontino avisa o
+        // pagamento por webhook assinado (/webhook/kontino): sem comprovante.
+        if (this.normalizeProviderName(seller.provider_default) === 'kontino' && ehMetodoKontino(dto.method)) {
+            return this.cobrarPeloKontino(seller, dto, transaction, amount, String(currency))
+        }
 
         // ── Clip SPEI: cria a transação e reserva a CLABE no mesmo clique ──
         // Não passa por ClipProvider: SPEI é transferência manual. A resposta
@@ -1695,6 +1703,49 @@ export class PaymentService {
 
         await this.clipAccounts.release(reservationId, 'checkout-abandonou')
         return { released: true }
+    }
+
+    /** Cobrança local pelo Kontino Connect (SPEI em MXN, Pix em BRL). */
+    private async cobrarPeloKontino(seller: any, dto: any, transaction: any, amountMinor: number, currency: string) {
+        const metodo = dto.method as MetodoKontino
+        if (currency.toUpperCase() !== KONTINO_METODOS[metodo].moeda) {
+            throw new BadRequestException(`${metodo === 'spei' ? 'SPEI' : 'Pix'} está disponível apenas em ${KONTINO_METODOS[metodo].moeda}.`)
+        }
+        const enabled = new Set((seller.enabled_methods ?? []).map((m: any) => String(m).toLowerCase()))
+        if (!enabled.has(metodo)) throw new ForbiddenException(`${metodo === 'spei' ? 'SPEI' : 'Pix'} não está habilitado para este seller.`)
+        if (!kontinoConfigurado()) throw new BadRequestException('Pagamento indisponível no momento. Selecione outro método.')
+
+        try {
+            const cobranca = await criarCobranca({
+                transactionId: transaction.id,
+                metodo,
+                valorMinor: amountMinor,
+                moeda: currency,
+                referencia: dto.metadata?.order_number ?? dto.metadata?.orderId ?? null,
+                comprador: { nome: dto.customer?.name, email: dto.customer?.email, documento: dto.customer?.document },
+                contaConectada: seller.config?.kontino_account_id ?? null,
+            })
+            await supabase.from('transactions').update({
+                provider: 'kontino',
+                provider_transaction_id: cobranca.id,
+                provider_status: cobranca.status,
+                status: 'pending',
+                metadata: { ...(transaction.metadata ?? {}), kontino_collection_id: cobranca.id, kontino_expires_at: cobranca.expires_at },
+                updated_at: new Date().toISOString(),
+            }).eq('id', transaction.id)
+            return respostaAoCheckout(transaction.id, cobranca, amountMinor)
+        } catch (e: any) {
+            const motivo = e instanceof ErroKontino ? `${e.code}: ${e.message}` : String(e?.message ?? e)
+            console.error(`[PaymentService] Kontino recusou a cobrança tx=${transaction.id}:`, motivo)
+            await supabase.from('transactions').update({
+                provider: 'kontino', status: 'failed', provider_status: 'failed',
+                failure_code: e instanceof ErroKontino ? `KONTINO_${e.code}`.toUpperCase().slice(0, 60) : 'KONTINO_ERROR',
+                failure_message: motivo.slice(0, 500), updated_at: new Date().toISOString(),
+            }).eq('id', transaction.id)
+            // Fora da faixa do trilho (ex.: menos de US$ 10) a mensagem do Kontino é útil para o comprador.
+            if (e instanceof ErroKontino && e.code === 'amount_out_of_range') throw new BadRequestException(e.message)
+            throw new BadRequestException('Pagamento indisponível no momento. Selecione outro método.')
+        }
     }
 
     private normalizeProviderName(provider: any): string {

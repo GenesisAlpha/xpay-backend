@@ -83,6 +83,14 @@ async function bootstrap() {
   );
 
   // =========================================
+  // 🔥 WEBHOOK KONTINO CONNECT (RAW BODY p/ verificar a Kontino-Signature)
+  // =========================================
+  app.use(
+    '/webhook/kontino',
+    express.raw({ type: '*/*' })
+  );
+
+  // =========================================
   // 🔥 WEBHOOK SLASH (RAW BODY p/ verificar a assinatura RSA)
   // Prefixo /webhook (singular), o mesmo do WebhookController.
   // =========================================
