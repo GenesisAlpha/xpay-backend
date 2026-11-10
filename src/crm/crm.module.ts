@@ -47,6 +47,7 @@ import { CrmService }    from './crm.service'
 import { CrmAdminController } from './crm-admin.controller'
 import { CrmAdminService } from './crm-admin.service'
 import { ComplianceInternalController } from './compliance-internal.controller'
+import { CrmComplianceController } from './crm-compliance.controller'
 import { CrmCheckoutController } from './crm-checkout.controller'
 import { CrmCheckoutService } from './crm-checkout.service'
 import { CrmTicketsController } from './crm-tickets.controller'
@@ -104,13 +105,13 @@ import { KoopfyIntegrationModule } from '../integration/koopfy-integration.modul
   // CrmCheckoutController: sellers e lojas do checkout (só leitura, via canal
   // interno).
   // CrmClipController: contas Clip (modo cartão/SPEI, status, tetos).
-  controllers: [CrmController, CrmAdminController, CrmCheckoutController, CrmTicketsController, WhopConnectController, WhopRfiReviewsController, WhopLinkedController, SellerRoutingCrmController, ActivationRequestsController, AffiliateCrmController, CrmClipController, ComplianceInternalController],
+  controllers: [CrmController, CrmAdminController, CrmCheckoutController, CrmTicketsController, WhopConnectController, WhopRfiReviewsController, WhopLinkedController, SellerRoutingCrmController, ActivationRequestsController, AffiliateCrmController, CrmClipController, ComplianceInternalController, CrmComplianceController],
   providers:   [CrmService, CrmAdminService, CrmCheckoutService, CrmClipService, CrmAuthGuard, StorageService],
   exports:     [CrmService, CrmAdminService, CrmCheckoutService],
 })
 export class CrmModule implements NestModule {
   // IP e navegador de cada requisição do CRM, para o log de ações.
   configure(consumer: MiddlewareConsumer) {
-    consumer.apply(crmRequestContext).forRoutes(CrmController, CrmAdminController, CrmCheckoutController, CrmClipController)
+    consumer.apply(crmRequestContext).forRoutes(CrmController, CrmAdminController, CrmCheckoutController, CrmClipController, CrmComplianceController)
   }
 }
