@@ -57,5 +57,11 @@ insert into public.payment_method_routes (method, providers, notes, updated_by) 
   ('spei',       array['kontino', 'clip'],               'SPEI no Kontino; Clip de reserva', 'migration'),
   ('card',       array['kaja', 'stripe', 'whop'],        'Cartão na Kaja Payments', 'migration'),
   ('apple_pay',  array['kaja', 'stripe', 'whop'],        'Carteira no mesmo provedor do cartão', 'migration'),
-  ('google_pay', array['kaja', 'stripe', 'whop'],        'Carteira no mesmo provedor do cartão', 'migration')
+  ('google_pay', array['kaja', 'stripe', 'whop'],        'Carteira no mesmo provedor do cartão', 'migration'),
+  -- Demais métodos: a mesma cadeia que estava fixa no código (failover.config.ts).
+  ('boleto',     array['approvebly'],                    'Cadeia de antes', 'migration'),
+  ('mbway',      array['setinel_gate'],                  'Cadeia de antes', 'migration'),
+  ('crypto',     array['coinflow', 'whop'],              'Cadeia de antes', 'migration'),
+  ('paypal',     array['paypal'],                        'Só a conta PayPal do próprio seller', 'migration'),
+  ('link',       array['stripe'],                        'Cadeia de antes', 'migration')
 on conflict do nothing;
