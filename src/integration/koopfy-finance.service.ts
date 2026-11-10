@@ -23,6 +23,7 @@ import { supabase } from '../lib/supabase.client';
 import { SellerPayoutAccountService } from '../payouts/seller-payout-account.service';
 import { PayoutOrchestratorService } from '../payouts/payout-orchestrator.service';
 import { ownProviderOfId } from '../orchestrator/routing/seller-routing';
+import { statementDescriptorFor } from './statement-descriptor';
 
 const TRANSACTION_STATUSES = [
   'pending',
@@ -111,6 +112,8 @@ function publicTransaction(transaction: any) {
     riskScore: transaction.riskScore ?? null,
     cardLast4: transaction.cardLast4 ?? null,
     cardBrand: transaction.cardBrand ?? null,
+    // Nome na fatura do cartão (exigência da Kaja: o seller sabe o que o comprador vê).
+    statementDescriptor: statementDescriptorFor(transaction.provider, transaction.paymentMethod, Boolean(ownProvider)),
     failureCode: transaction.failureCode ?? null,
     failureMessage: transaction.failureMessage ?? null,
     orderShipped: Boolean(transaction.orderShipped),
