@@ -15,6 +15,8 @@ import { WebhookModule } from '../webhooks/webhook.module';
 import { StorageService } from '../lib/storage.service';
 import { AffiliatesModule } from '../affiliates/affiliates.module';
 
+import { ComplianceSubscriptionsController } from './compliance-subscriptions.controller'
+
 @Module({
   imports: [
     WalletModule,
@@ -38,6 +40,6 @@ import { AffiliatesModule } from '../affiliates/affiliates.module';
     ClipReconcilerService,
   ],
   exports: [PaymentService],
-  controllers: [PaymentController, WhopCardBackfillController, LinkAccountsInternalController, ClipWebhookController],
+  controllers: [PaymentController, WhopCardBackfillController, LinkAccountsInternalController, ClipWebhookController, ComplianceSubscriptionsController],
 })
 export class PaymentModule {}
