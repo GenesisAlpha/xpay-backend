@@ -58,7 +58,7 @@ alter table public.payment_method_route_history enable row level security;
 -- reserva da cadeia — e os demais métodos, que seguem no provider_default até
 -- alguém ligar. Regra desligada = comportamento antigo.
 insert into public.payment_method_routes (method, providers, enabled, notes, updated_by) values
-  ('pix',        array['kontino', 'approvebly', 'whop'], true,  'Pix no Kontino', 'migration'),
+  ('pix',        array['kontino', 'whop', 'approvebly'], true,  'Pix no Kontino; Whop de reserva (o padrão de hoje)', 'migration'),
   ('spei',       array['kontino', 'clip'],               true,  'SPEI no Kontino; Clip de reserva', 'migration'),
   ('card',       array['kaja', 'stripe', 'whop'],        false, 'Cartão na Kaja Payments — ligar quando a integração da Kaja estiver no ar', 'migration'),
   ('apple_pay',  array['kaja', 'stripe', 'whop'],        false, 'Carteira no mesmo provedor do cartão', 'migration'),
