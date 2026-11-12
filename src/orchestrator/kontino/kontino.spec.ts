@@ -1,5 +1,6 @@
 import { createHmac } from 'node:crypto'
-import { assinaturaKontinoValida, criarCobranca, ehMetodoKontino, respostaAoCheckout, type CobrancaKontino } from './kontino'
+import { isOwnProviderAccountId } from '../seller-provider/seller-provider-accounts'
+import { assinaturaKontinoValida, criarCobranca, ehMetodoKontino, isKontinoOwnAccountId, respostaAoCheckout, toKontinoOwnAccountId, type CobrancaKontino } from './kontino'
 
 const assinar = (segredo: string, corpo: string, t: number) => `t=${t},v1=${createHmac('sha256', segredo).update(`${t}.${corpo}`).digest('hex')}`
 
@@ -61,6 +62,8 @@ describe('Kontino Connect na Koopfy', () => {
         moeda: 'mxn',
         referencia: '#PED 1001',
         comprador: { nome: 'Ana', email: 'nao-e-email', documento: 'N/A' },
+        contaConectada: 'acct_seller1',
+        comissaoUsdCents: 412.4,
       })
     } finally {
       global.fetch = original
@@ -74,7 +77,28 @@ describe('Kontino Connect na Koopfy', () => {
       method: 'spei',
       reference: 'PED1001',
       payer: { name: 'Ana' },
+      account: 'acct_seller1',
+      application_fee_amount: 412,
       metadata: { koopfy_transaction_id: 'tx_42' },
     })
+  })
+
+  it('sem conta Kontino do seller não cobra (nesting: nunca na conta da Koopfy)', async () => {
+    const original = global.fetch
+    global.fetch = jest.fn() as any
+    try {
+      await expect(
+        criarCobranca({ transactionId: 'tx_43', metodo: 'pix', valorMinor: 6000, moeda: 'BRL', contaConectada: '' }),
+      ).rejects.toMatchObject({ code: 'account_required' })
+      expect(global.fetch).not.toHaveBeenCalled()
+    } finally {
+      global.fetch = original
+    }
+  })
+
+  it('venda na conta Kontino do seller é conta própria (fora da carteira da Koopfy)', () => {
+    expect(isKontinoOwnAccountId(toKontinoOwnAccountId('acct_1'))).toBe(true)
+    expect(isOwnProviderAccountId('kontino:acct_1')).toBe(true)
+    expect(isKontinoOwnAccountId('whopl_x')).toBe(false)
   })
 })

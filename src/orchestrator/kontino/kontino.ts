@@ -3,14 +3,19 @@ import { createHmac, timingSafeEqual } from 'node:crypto'
 /**
  * KONTINO CONNECT como provedor de métodos locais da Koopfy.
  *
- * A Koopfy é parceira do Kontino Connect (modelo agregador): a cobrança sai
- * pela API do Kontino com a chave da plataforma (KONTINO_SECRET_KEY), o
- * comprador paga no trilho local e o Kontino avisa por webhook assinado
- * (POST /webhook/kontino). Diferente do SPEI da Clip, não há comprovante: cada
- * cobrança tem a própria CLABE e a confirmação é automática.
+ * A Koopfy é parceira do Kontino Connect no modelo de CONTAS CONECTADAS: a
+ * cobrança sai pela API do Kontino com a chave da plataforma
+ * (KONTINO_SECRET_KEY), SEMPRE em nome da conta Kontino do próprio seller
+ * (seller.config.kontino_account_id), o comprador paga no trilho local e o
+ * Kontino avisa por webhook assinado (POST /webhook/kontino). Diferente do SPEI
+ * da Clip, não há comprovante: cada cobrança tem a própria CLABE e a
+ * confirmação é automática.
  *
- * Seller com conta conectada no Kontino (metadata kontino_account_id) recebe
- * direto na própria conta; sem ela, o valor entra no saldo da Koopfy.
+ * Sem conta conectada o Kontino NÃO é usado: receber em nome de um seller na
+ * conta da Koopfy é "nesting" e a BlindPay recusa (blindpay.com/docs/kb/nested-payments).
+ * O dinheiro cai na conta do seller; a comissão da Koopfy vai em
+ * `application_fee_amount` (centavos de USD) e a venda não entra na carteira da
+ * Koopfy (ver isKontinoOwnAccountId).
  *
  * Variáveis: KONTINO_API_URL (padrão produção), KONTINO_SECRET_KEY (sk_live_ ou
  * sk_test_), KONTINO_WEBHOOK_SECRET (whsec_ do endpoint cadastrado no painel).
@@ -46,6 +51,11 @@ export class ErroKontino extends Error {
   }
 }
 
+/** provider_account_id de venda na conta Kontino do seller: fora da carteira da Koopfy. */
+const PREFIXO_CONTA = 'kontino:'
+export const toKontinoOwnAccountId = (contaKontino: string) => `${PREFIXO_CONTA}${contaKontino}`
+export const isKontinoOwnAccountId = (id: string | null | undefined): boolean => typeof id === 'string' && id.startsWith(PREFIXO_CONTA)
+
 const base = () => (process.env.KONTINO_API_URL?.trim() || 'https://api.kontino.co/api/kontino/v1').replace(/\/+$/, '')
 
 export const kontinoConfigurado = () => !!process.env.KONTINO_SECRET_KEY?.trim()
@@ -76,15 +86,19 @@ async function chamar<T>(metodo: 'GET' | 'POST', caminho: string, corpo?: unknow
 }
 
 /** Cria a cobrança. A chave de idempotência é o id da transação: reenvio não duplica. */
-export function criarCobranca(i: {
+export async function criarCobranca(i: {
   transactionId: string
   metodo: MetodoKontino
   valorMinor: number
   moeda: string
   referencia?: string | null
   comprador?: { nome?: string | null; email?: string | null; documento?: string | null }
-  contaConectada?: string | null
+  /** Conta Kontino do seller (acct_…). Obrigatória: sem ela não há cobrança. */
+  contaConectada: string
+  /** Comissão da Koopfy em centavos de USD, tirada da conta do seller quando paga. */
+  comissaoUsdCents?: number | null
 }) {
+  if (!i.contaConectada) throw new ErroKontino(400, 'account_required', 'Seller sem conta Kontino conectada.')
   // A API aceita referência de 4 a 30 caracteres (letras, números e hífen).
   const ref = String(i.referencia ?? '').replace(/[^A-Za-z0-9-]/g, '').slice(0, 30)
   const referencia = ref.length >= 4 ? ref : null
@@ -103,7 +117,8 @@ export function criarCobranca(i: {
       method: i.metodo,
       ...(referencia ? { reference: referencia } : {}),
       ...(Object.keys(pagador).length ? { payer: pagador } : {}),
-      ...(i.contaConectada ? { account: i.contaConectada } : {}),
+      account: i.contaConectada,
+      ...(i.comissaoUsdCents && i.comissaoUsdCents >= 1 ? { application_fee_amount: Math.round(i.comissaoUsdCents) } : {}),
       metadata: { koopfy_transaction_id: i.transactionId },
     },
     `koopfy-${i.transactionId}`,

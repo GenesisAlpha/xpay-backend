@@ -18,6 +18,7 @@
 // ============================================================================
 
 import { DEFAULT_LINKED_COMMISSION_PCT, isLinkedProviderAccountId } from '../whop/whop-linked';
+import { isKontinoOwnAccountId } from '../kontino/kontino';
 import { type CheckoutFeeSource, checkoutFeeIsUnified } from '../../shared/checkout-fee-source';
 
 export type OwnProvider = 'whop' | 'stripe' | 'paypal';
@@ -71,11 +72,12 @@ export function rowIdFromOwnAccountId(id: string): string | null {
 }
 
 /**
- * Conta do PRÓPRIO seller (Whop, Stripe ou PayPal)? É o que decide que a venda
- * não entra na carteira da Koopfy: o dinheiro já está na conta dele.
+ * Conta do PRÓPRIO seller (Whop, Stripe, PayPal ou a conta Kontino dele)? É o
+ * que decide que a venda não entra na carteira da Koopfy: o dinheiro já está
+ * na conta dele.
  */
 export function isOwnProviderAccountId(id: string | null | undefined): boolean {
-  return isLinkedProviderAccountId(id) || isWhopExtraAccountId(id) || isStripeOwnAccountId(id) || isPaypalOwnAccountId(id);
+  return isLinkedProviderAccountId(id) || isWhopExtraAccountId(id) || isStripeOwnAccountId(id) || isPaypalOwnAccountId(id) || isKontinoOwnAccountId(id);
 }
 
 export interface SellerProviderAccountRow {

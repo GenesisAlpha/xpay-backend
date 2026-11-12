@@ -34,7 +34,7 @@ import { customerSubscriptionView, isSubscriptionTransaction } from './customer-
 import { SLASH_CURRENCIES } from '../orchestrator/providers/slash.provider'
 import { MethodRoutingService } from '../orchestrator/method-routing/method-routing.service'
 import { DIRECT_PROVIDERS } from '../orchestrator/method-routing/method-routing'
-import { ErroKontino, KONTINO_METODOS, criarCobranca, ehMetodoKontino, kontinoConfigurado, respostaAoCheckout, type MetodoKontino } from '../orchestrator/kontino/kontino'
+import { ErroKontino, KONTINO_METODOS, criarCobranca, ehMetodoKontino, kontinoConfigurado, respostaAoCheckout, toKontinoOwnAccountId, type MetodoKontino } from '../orchestrator/kontino/kontino'
 
 export interface ExternalFeeInput {
     recipient_id: string
@@ -548,9 +548,19 @@ export class PaymentService {
             // Reserva da regra (ex.: SPEI → Clip, Pix → Approvebly): falha técnica
             // do Kontino passa para ela em vez de recusar o comprador.
             const nextProvider = routedByMethod ? (methodRoute!.chain[1] ?? null) : null
-            const kontino = await this.cobrarPeloKontino(seller, dto, transaction, amount, String(currency), { fallbackTo: nextProvider })
+            const contaKontino = String(seller.config?.kontino_account_id ?? '').trim()
+            // Sem conta Kontino do seller o Kontino não entra: cobrar em nome dele
+            // na conta da Koopfy é "nesting" (recusado pela BlindPay).
+            const kontino = contaKontino
+                ? await this.cobrarPeloKontino(seller, dto, transaction, amount, String(currency), {
+                    fallbackTo: nextProvider, contaKontino, comissaoUsdCents: saleFees.platformFeeCents,
+                })
+                : null
             if (kontino) return kontino
-            console.error(`[PaymentService] ⚠️ FAILOVER por método: kontino → ${nextProvider} (tx=${transaction.id})`)
+            if (!contaKontino && !nextProvider) {
+                throw new BadRequestException('Pagamento indisponível no momento. Selecione outro método.')
+            }
+            console.error(`[PaymentService] ⚠️ FAILOVER por método: kontino → ${nextProvider} (tx=${transaction.id}${contaKontino ? '' : ', seller sem conta Kontino'})`)
             effectiveProvider = nextProvider as string
         }
 
@@ -1784,7 +1794,7 @@ export class PaymentService {
      * trilho, como valor fora da faixa) devolve null e a transação volta a ficar
      * livre para o próximo provedor da regra.
      */
-    private async cobrarPeloKontino(seller: any, dto: any, transaction: any, amountMinor: number, currency: string, opts: { fallbackTo?: string | null } = {}) {
+    private async cobrarPeloKontino(seller: any, dto: any, transaction: any, amountMinor: number, currency: string, opts: { fallbackTo?: string | null; contaKontino: string; comissaoUsdCents: number }) {
         const metodo = dto.method as MetodoKontino
         if (currency.toUpperCase() !== KONTINO_METODOS[metodo].moeda) {
             throw new BadRequestException(`${metodo === 'spei' ? 'SPEI' : 'Pix'} está disponível apenas em ${KONTINO_METODOS[metodo].moeda}.`)
@@ -1801,10 +1811,15 @@ export class PaymentService {
                 moeda: currency,
                 referencia: dto.metadata?.order_number ?? dto.metadata?.orderId ?? null,
                 comprador: { nome: dto.customer?.name, email: dto.customer?.email, documento: dto.customer?.document },
-                contaConectada: seller.config?.kontino_account_id ?? null,
+                contaConectada: opts.contaKontino,
+                comissaoUsdCents: opts.comissaoUsdCents,
             })
             await supabase.from('transactions').update({
                 provider: 'kontino',
+                // Conta do próprio seller: a venda não entra na carteira da Koopfy;
+                // a comissão (fee) sai da conta dele como application fee.
+                provider_account_id: toKontinoOwnAccountId(opts.contaKontino),
+                fee: opts.comissaoUsdCents,
                 provider_transaction_id: cobranca.id,
                 provider_status: cobranca.status,
                 status: 'pending',
