@@ -130,6 +130,22 @@ export class KoopfyIntegrationController {
     return this.onboarding.submitRequirements(req.sellerCtx.userId, body);
   }
 
+  // ─── Kontino (Pix, SPEI e banco) ───────────────────────────────────────────
+  // A conta Kontino é do seller: abrir, retomar o cadastro e ler o status.
+  // Guard leve: quem ainda não tem conta no pay também pode começar por aqui.
+
+  @Get('kontino')
+  @UseGuards(CrossServiceTokenGuard)
+  kontinoStatus(@Req() req: any) {
+    return this.svc.kontinoStatus(req.tokenEmail, req.accountSellerId ?? null);
+  }
+
+  @Post('kontino')
+  @UseGuards(CrossServiceTokenGuard)
+  kontinoStart(@Req() req: any, @Body() body: any) {
+    return this.svc.kontinoStart(req.tokenEmail, req.accountSellerId ?? null, body ?? {});
+  }
+
   // ─── Provedor externo (conta Whop do próprio seller) ───────────────────────
   // Liberado para todos; o CRM só corta.
 

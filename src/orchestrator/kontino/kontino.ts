@@ -174,3 +174,79 @@ export function respostaAoCheckout(transactionId: string, c: CobrancaKontino, va
     pix: { copyPaste: c.instructions.copy_paste ?? null, qrcode: null, expiration: c.expires_at },
   }
 }
+
+// ─── Contas conectadas (a conta Kontino de cada seller) ──────────────────────
+//
+// A Koopfy cria a conta conectada do seller na API do Kontino e pede um link:
+// o seller abre a conta Kontino (KYB próprio, que é o que evita o nesting) ou
+// liga uma conta Kontino que já tem. Com a conta aprovada a conexão fica
+// "active" e só então as cobranças saem em nome dela.
+
+export type StatusContaKontino = 'pending' | 'active' | 'rejected' | 'disconnected' | string
+
+export type ContaKontino = {
+  id: string
+  status: StatusContaKontino
+  type: 'individual' | 'business'
+  country: string
+  email: string
+  name: string | null
+  external_id: string | null
+  /** onboarding (conta nova) | connect_existing (já tinha conta Kontino) */
+  connection_type: 'onboarding' | 'connect_existing' | string
+  capabilities?: Record<string, string>
+  requirements?: unknown
+}
+
+export type LinkDaContaKontino = { url: string; expires_at: string; type: string; account: string }
+
+export function criarContaKontino(i: {
+  sellerId: string
+  email: string
+  nome?: string | null
+  tipo: 'individual' | 'business'
+  pais: string
+  retorno?: string | null
+}) {
+  return chamar<ContaKontino>(
+    'POST',
+    '/accounts',
+    {
+      email: i.email,
+      ...(i.nome ? { name: i.nome.slice(0, 140) } : {}),
+      type: i.tipo,
+      country: i.pais.toUpperCase(),
+      external_id: i.sellerId,
+      metadata: { koopfy_seller_id: i.sellerId },
+      ...(i.retorno ? { return_url: i.retorno } : {}),
+      // O seller usa a Kontino também como banco (saldo, saques, cartão).
+      dashboard: 'kontino',
+    },
+    `koopfy-seller-${i.sellerId}-${i.pais.toUpperCase()}-${i.tipo}`,
+  )
+}
+
+export const buscarContaKontino = (id: string) => chamar<ContaKontino>('GET', `/accounts/${encodeURIComponent(id)}`)
+
+/**
+ * A conta que o Kontino já tem para este seller (external_id = id do seller).
+ * O 409 de "já existe" traz o id na mensagem; sem ele, procura nas contas do
+ * parceiro, página a página.
+ */
+export async function contaKontinoPorSeller(sellerId: string, mensagem409?: string | null): Promise<ContaKontino | null> {
+  const doErro = mensagem409?.match(/\bacct_[A-Za-z0-9]+/)?.[0]
+  if (doErro) return buscarContaKontino(doErro)
+  let depois: string | null = null
+  for (let pagina = 0; pagina < 50; pagina++) {
+    const r: { data: ContaKontino[]; has_more?: boolean } = await chamar('GET', `/accounts?limit=100${depois ? `&starting_after=${encodeURIComponent(depois)}` : ''}`)
+    const achada = (r?.data ?? []).find((c) => c.external_id === sellerId)
+    if (achada) return achada
+    if (!r?.has_more || !r.data?.length) return null
+    depois = r.data[r.data.length - 1].id
+  }
+  return null
+}
+
+export function linkDaContaKontino(id: string, retorno?: string | null) {
+  return chamar<LinkDaContaKontino>('POST', `/accounts/${encodeURIComponent(id)}/onboarding_links`, retorno ? { return_url: retorno } : {})
+}

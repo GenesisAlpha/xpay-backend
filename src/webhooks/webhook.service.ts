@@ -41,6 +41,7 @@ import {
 import * as crypto from 'crypto'
 import { WhopPayoutWebhookService } from '../payouts/whop-payout-webhook.service'
 import { assinaturaKontinoValida, buscarCobranca } from '../orchestrator/kontino/kontino'
+import { contaKontinoMudou } from '../orchestrator/kontino/kontino-seller'
 
 // Status do Sentinel Gate → status canônico do handleWebhookProvider.
 const SENTINEL_WEBHOOK_STATUS: Record<string, 'PAID' | 'PENDING' | 'FAILED' | 'PROCESSING'> = {
@@ -516,6 +517,17 @@ export class WebhookService {
       return { ignored: true, reason: 'invalid json' }
     }
     const tipo = String(evento?.type ?? '')
+    // Conta Kontino de um seller mudou (aprovada, recusada, desconectada).
+    if (tipo.startsWith('account.')) {
+      const contaId: string | null = evento?.data?.object?.id ?? null
+      if (!contaId) return { ignored: true, reason: 'account id missing' }
+      try {
+        return await contaKontinoMudou(contaId)
+      } catch (err: any) {
+        console.error('[WebhookService] Kontino: erro ao atualizar a conta', contaId, err?.message)
+        throw new ServiceUnavailableException('Kontino indisponível; tente de novo.')
+      }
+    }
     if (tipo !== 'collection.paid' && tipo !== 'collection.expired' && tipo !== 'collection.canceled') return { ignored: true, reason: `event ${tipo}` }
     const id: string | null = evento?.data?.object?.id ?? null
     if (!id) return { ignored: true, reason: 'collection id missing' }

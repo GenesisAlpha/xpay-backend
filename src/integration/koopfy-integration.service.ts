@@ -11,6 +11,7 @@ import {
   ConflictException,
   Injectable,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import * as bcrypt from 'bcrypt';
 import * as jwt from 'jsonwebtoken';
@@ -19,6 +20,7 @@ import { supabase } from '../lib/supabase.client';
 import { StorageService } from '../lib/storage.service';
 import { generateKey, hashKey } from '../utils/apikeys.utils';
 import { SellerCtx } from './cross-service-jwt.guard';
+import { ErroContaKontino, estadoKontino, iniciarContaKontino } from '../orchestrator/kontino/kontino-seller';
 import {
   AccountState,
   accountAliasEmail,
@@ -395,6 +397,54 @@ export class KoopfyIntegrationService {
       await this.whopLinked.disconnect(sellerId, 'desconectado pelo seller', actor, { bySeller: true });
     } else {
       await this.sellerProviders.disconnectById(sellerId, accountId, actor);
+    }
+  }
+
+  // ─── Kontino: a conta Kontino do seller (Pix, SPEI e banco) ────────────────
+
+  /** Estado da conta Kontino do seller. Não cria conta no pay. */
+  async kontinoStatus(email: string, accountSellerId: string | null) {
+    const normEmail = normalizeEmail(email);
+    const userId = normEmail ? await resolveAccountUserId(normEmail, accountSellerId) : null;
+    let sellerId: string | null = null;
+    if (userId) {
+      const { data } = await supabase.from('seller_profiles').select('id').eq('user_id', userId).maybeSingle();
+      sellerId = data?.id ?? null;
+    }
+    return estadoKontino(sellerId);
+  }
+
+  /**
+   * Abre (ou retoma) a conta Kontino do seller e devolve o link para concluir
+   * no Kontino. Quem ainda não tem conta no pay ganha a principal agora, como
+   * nas outras conexões.
+   */
+  async kontinoStart(
+    email: string,
+    accountSellerId: string | null,
+    body: { country?: string; type?: string; name?: string; email?: string; returnUrl?: string },
+  ) {
+    const { sellerId, userId } = await this.sellerForConnection(email, accountSellerId);
+    let nome = String(body?.name ?? '').trim() || null;
+    if (!nome) {
+      const { data: user } = await supabase.from('users').select('name').eq('id', userId).maybeSingle();
+      nome = user?.name ?? null;
+    }
+    try {
+      return await iniciarContaKontino({
+        sellerId,
+        email: String(body?.email ?? '').trim() || email,
+        nome,
+        tipo: body?.type === 'individual' ? 'individual' : 'business',
+        pais: String(body?.country ?? ''),
+        retorno: body?.returnUrl ?? null,
+      });
+    } catch (err) {
+      if (err instanceof ErroContaKontino) {
+        if (err.code === 'provider') throw new ServiceUnavailableException(err.message);
+        throw new BadRequestException(err.message);
+      }
+      throw err;
     }
   }
 
