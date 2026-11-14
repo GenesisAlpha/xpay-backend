@@ -28,7 +28,7 @@ jest.mock('../../lib/supabase.client', () => ({
   },
 }))
 
-import { configComConta, contaKontinoMudou, estadoKontino, iniciarContaKontino } from './kontino-seller'
+import { configComConta, contaKontinoMudou, estadoKontino, iniciarContaKontino, kontinoPelaContaDoSeller } from './kontino-seller'
 import type { ContaKontino } from './kontino'
 
 const conta = (o: Partial<ContaKontino> = {}): ContaKontino => ({
@@ -165,5 +165,34 @@ describe('conta Kontino do seller', () => {
     linhas['seller-1'].config = { kontino: { connection_id: 'acct_outra' } }
     respostas.push(() => ({ status: 200, body: conta({ status: 'active' }) }))
     expect(await contaKontinoMudou('acct_1')).toMatchObject({ ok: false })
+  })
+})
+
+describe('Pix e SPEI pela conta Kontino do seller', () => {
+  const base = {
+    routedByMethod: false,
+    upsell: false,
+    contaKontino: 'acct_1',
+    configurado: true,
+    metodo: 'pix',
+    moeda: 'BRL',
+    metodosDoSeller: ['card', 'pix', 'spei'],
+    provedorAtual: 'asaas',
+  }
+
+  it('conta ativa liga a Kontino e guarda o provedor de antes como reserva', () => {
+    expect(kontinoPelaContaDoSeller(base)).toEqual({ reserva: 'asaas' })
+    expect(kontinoPelaContaDoSeller({ ...base, metodo: 'spei', moeda: 'mxn', provedorAtual: 'clip' })).toEqual({ reserva: 'clip' })
+    expect(kontinoPelaContaDoSeller({ ...base, provedorAtual: null })).toEqual({ reserva: null })
+  })
+
+  it('não entra quando não deve', () => {
+    expect(kontinoPelaContaDoSeller({ ...base, contaKontino: undefined })).toBeNull()
+    expect(kontinoPelaContaDoSeller({ ...base, routedByMethod: true })).toBeNull()
+    expect(kontinoPelaContaDoSeller({ ...base, upsell: true })).toBeNull()
+    expect(kontinoPelaContaDoSeller({ ...base, configurado: false })).toBeNull()
+    expect(kontinoPelaContaDoSeller({ ...base, metodo: 'card' })).toBeNull()
+    expect(kontinoPelaContaDoSeller({ ...base, moeda: 'USD' })).toBeNull()
+    expect(kontinoPelaContaDoSeller({ ...base, metodosDoSeller: ['card'] })).toBeNull()
   })
 })

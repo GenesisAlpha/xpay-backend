@@ -35,6 +35,7 @@ import { SLASH_CURRENCIES } from '../orchestrator/providers/slash.provider'
 import { MethodRoutingService } from '../orchestrator/method-routing/method-routing.service'
 import { DIRECT_PROVIDERS } from '../orchestrator/method-routing/method-routing'
 import { ErroKontino, KONTINO_METODOS, criarCobranca, ehMetodoKontino, kontinoConfigurado, respostaAoCheckout, toKontinoOwnAccountId, type MetodoKontino } from '../orchestrator/kontino/kontino'
+import { kontinoPelaContaDoSeller } from '../orchestrator/kontino/kontino-seller'
 
 export interface ExternalFeeInput {
     recipient_id: string
@@ -260,6 +261,27 @@ export class PaymentService {
         let effectiveProvider = routedByMethod
             ? methodRoute!.chain[0] as string
             : this.normalizeProviderName(seller?.provider_default)
+
+        // ─── Conta Kontino ativa do próprio seller ────────────────────────────
+        // Sem regra da plataforma para o método, Pix (BRL) e SPEI (MXN) saem pela
+        // conta Kontino do seller assim que ela está aprovada; o provedor de antes
+        // vira a reserva (falha técnica ou valor fora da faixa da Kontino). Regra
+        // explícita em payment_method_routes continua mandando.
+        let kontinoReserva: string | null = null
+        const pelaContaKontino = kontinoPelaContaDoSeller({
+            routedByMethod,
+            upsell: Boolean(upsellParent),
+            contaKontino: seller?.config?.kontino_account_id,
+            configurado: kontinoConfigurado(),
+            metodo: dto.method,
+            moeda: String(currency),
+            metodosDoSeller: seller?.enabled_methods,
+            provedorAtual: effectiveProvider,
+        })
+        if (pelaContaKontino) {
+            kontinoReserva = pelaContaKontino.reserva
+            effectiveProvider = 'kontino'
+        }
 
         // Coinflow opera em USD/cripto — não processa BRL. Barra AQUI (antes do FX,
         // do insert da transação e da chamada ao provider) p/ não gerar pagamento
@@ -547,13 +569,16 @@ export class PaymentService {
         if (effectiveProvider === 'kontino' && ehMetodoKontino(dto.method)) {
             // Reserva da regra (ex.: SPEI → Clip, Pix → Approvebly): falha técnica
             // do Kontino passa para ela em vez de recusar o comprador.
-            const nextProvider = routedByMethod ? (methodRoute!.chain[1] ?? null) : null
+            const nextProvider = routedByMethod ? (methodRoute!.chain[1] ?? null) : kontinoReserva
             const contaKontino = String(seller.config?.kontino_account_id ?? '').trim()
             // Sem conta Kontino do seller o Kontino não entra: cobrar em nome dele
             // na conta da Koopfy é "nesting" (recusado pela BlindPay).
             const kontino = contaKontino
                 ? await this.cobrarPeloKontino(seller, dto, transaction, amount, String(currency), {
                     fallbackTo: nextProvider, contaKontino, comissaoUsdCents: saleFees.platformFeeCents,
+                    // Ligada pela conta do seller (sem regra): valor fora da faixa da
+                    // Kontino volta para o provedor de antes em vez de recusar.
+                    fallbackOnRange: !routedByMethod,
                 })
                 : null
             if (kontino) return kontino
@@ -1794,7 +1819,7 @@ export class PaymentService {
      * trilho, como valor fora da faixa) devolve null e a transação volta a ficar
      * livre para o próximo provedor da regra.
      */
-    private async cobrarPeloKontino(seller: any, dto: any, transaction: any, amountMinor: number, currency: string, opts: { fallbackTo?: string | null; contaKontino: string; comissaoUsdCents: number }) {
+    private async cobrarPeloKontino(seller: any, dto: any, transaction: any, amountMinor: number, currency: string, opts: { fallbackTo?: string | null; contaKontino: string; comissaoUsdCents: number; fallbackOnRange?: boolean }) {
         const metodo = dto.method as MetodoKontino
         if (currency.toUpperCase() !== KONTINO_METODOS[metodo].moeda) {
             throw new BadRequestException(`${metodo === 'spei' ? 'SPEI' : 'Pix'} está disponível apenas em ${KONTINO_METODOS[metodo].moeda}.`)
@@ -1828,7 +1853,7 @@ export class PaymentService {
             }).eq('id', transaction.id)
             return respostaAoCheckout(transaction.id, cobranca, amountMinor)
         } catch (e: any) {
-            if (opts.fallbackTo && !(e instanceof ErroKontino && e.code === 'amount_out_of_range')) {
+            if (opts.fallbackTo && (opts.fallbackOnRange || !(e instanceof ErroKontino && e.code === 'amount_out_of_range'))) {
                 console.error(`[PaymentService] Kontino falhou tx=${transaction.id}, seguindo para ${opts.fallbackTo}:`, e?.message ?? e)
                 await supabase.from('transactions').update({
                     metadata: { ...(transaction.metadata ?? {}), kontino_fallback: { to: opts.fallbackTo, reason: String(e?.message ?? e).slice(0, 300) } },

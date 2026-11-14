@@ -2,6 +2,8 @@ import { supabase } from '../../lib/supabase.client'
 import {
   type ContaKontino,
   ErroKontino,
+  KONTINO_METODOS,
+  ehMetodoKontino,
   buscarContaKontino,
   contaKontinoPorSeller,
   criarContaKontino,
@@ -232,4 +234,29 @@ export async function contaKontinoMudou(contaId: string): Promise<{ ok: boolean;
   if (atual && atual !== conta.id) return { ok: false, reason: 'seller has another connection' }
   await guardarConta(sellerId, conta)
   return { ok: true }
+}
+
+/**
+ * Pix (BRL) e SPEI (MXN) saem pela conta Kontino ATIVA do seller quando não há
+ * regra da plataforma para o método. Devolve a reserva (o provedor de antes) ou
+ * null quando a Kontino não entra nesta cobrança.
+ */
+export function kontinoPelaContaDoSeller(i: {
+  routedByMethod: boolean
+  upsell: boolean
+  contaKontino: unknown
+  configurado: boolean
+  metodo: string
+  moeda: string
+  metodosDoSeller: unknown
+  provedorAtual: string | null | undefined
+}): { reserva: string | null } | null {
+  if (i.routedByMethod || i.upsell || !i.configurado) return null
+  if (!String(i.contaKontino ?? '').trim()) return null
+  if (!ehMetodoKontino(i.metodo)) return null
+  if (String(i.moeda).toUpperCase() !== KONTINO_METODOS[i.metodo].moeda) return null
+  const metodos = Array.isArray(i.metodosDoSeller) ? i.metodosDoSeller.map((m) => String(m).toLowerCase()) : []
+  if (!metodos.includes(i.metodo)) return null
+  const reserva = i.provedorAtual && i.provedorAtual !== 'kontino' ? i.provedorAtual : null
+  return { reserva }
 }
