@@ -23,12 +23,14 @@ import { KoopfyIntegrationService } from './koopfy-integration.service';
 import { DocumentsDto, KycDto, OperationDto, RequirementsDto } from '../onboarding/onboarding.dto';
 import { OnboardingService } from '../onboarding/onboarding.service';
 import { ActivationRequestDto } from '../activation/activation-request.dto';
+import { CadastroService } from './cadastro.service';
 
 @Controller('integration/koopfy')
 export class KoopfyIntegrationController {
   constructor(
     private readonly svc: KoopfyIntegrationService,
     private readonly onboarding: OnboardingService,
+    private readonly cadastro: CadastroService,
   ) {}
 
   // Estado do onboarding/conta do seller (não retorna segredos).
@@ -128,6 +130,38 @@ export class KoopfyIntegrationController {
   @UsePipes(new ValidationPipe({ transform: true, whitelist: true, forbidNonWhitelisted: true }))
   submitRequirements(@Req() req: any, @Body() body: RequirementsDto) {
     return this.onboarding.submitRequirements(req.sellerCtx.userId, body);
+  }
+
+  // ─── Cadastro único (ativação v2): Koopfy + Kontino ─────────────────────────
+  // Guard leve: quem ainda não tem conta no pay começa por aqui (a conta nasce
+  // no primeiro arquivo ou no envio). IP e navegador do seller chegam do
+  // checkout nos cabeçalhos x-koopfy-client-ip/-ua (evidência do aceite).
+
+  @Get('cadastro')
+  @UseGuards(CrossServiceTokenGuard)
+  cadastroEstado(@Req() req: any) {
+    return this.cadastro.estado(req.tokenEmail, req.accountSellerId ?? null);
+  }
+
+  @Post('cadastro/arquivo')
+  @UseGuards(CrossServiceTokenGuard)
+  cadastroArquivo(@Req() req: any, @Body() body: any) {
+    return this.cadastro.arquivo(req.tokenEmail, req.accountSellerId ?? null, body ?? {});
+  }
+
+  @Post('cadastro')
+  @UseGuards(CrossServiceTokenGuard)
+  cadastroEnviar(@Req() req: any, @Body() body: any) {
+    return this.cadastro.enviar(req.tokenEmail, req.accountSellerId ?? null, body ?? {}, {
+      ip: String(req.headers?.['x-koopfy-client-ip'] ?? '').split(',')[0].trim() || null,
+      userAgent: String(req.headers?.['x-koopfy-client-ua'] ?? '') || null,
+    });
+  }
+
+  @Post('cadastro/kontino-link')
+  @UseGuards(CrossServiceTokenGuard)
+  cadastroKontinoLink(@Req() req: any, @Body() body: any) {
+    return this.cadastro.linkKontino(req.tokenEmail, req.accountSellerId ?? null, body ?? {});
   }
 
   // ─── Kontino (Pix, SPEI e banco) ───────────────────────────────────────────

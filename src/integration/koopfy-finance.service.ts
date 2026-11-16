@@ -20,6 +20,7 @@ import { AnticipationService } from '../wallets/anticipation.service';
 import { normalizeFinanceListQuery } from './koopfy-finance-query';
 import { feesFromRows, normalizeFeeIds } from './transaction-fees';
 import { supabase } from '../lib/supabase.client';
+import { repasseRetido } from '../orchestrator/kontino/kontino-aprovacao';
 import { SellerPayoutAccountService } from '../payouts/seller-payout-account.service';
 import { PayoutOrchestratorService } from '../payouts/payout-orchestrator.service';
 import { ownProviderOfId } from '../orchestrator/routing/seller-routing';
@@ -165,6 +166,17 @@ export class KoopfyFinanceService {
     @Optional() private readonly payoutAccounts?: SellerPayoutAccountService,
     @Optional() private readonly payoutOrchestrator?: PayoutOrchestratorService,
   ) {}
+
+  /**
+   * Cadastro único (v2): o dinheiro do seller sai para a conta Kontino dele.
+   * Até ela ser verificada, os repasses ficam retidos na Koopfy.
+   */
+  private async exigirRepasseLiberado(ctx: SellerCtx) {
+    const id = this.seller(ctx).id;
+    if (await repasseRetido(id)) {
+      throw new ConflictException('Os repasses ficam disponíveis quando a sua conta Kontino for verificada.');
+    }
+  }
 
   private seller(ctx: SellerCtx) {
     if (!ctx.seller || ctx.seller.status !== 'active') {
@@ -431,6 +443,7 @@ export class KoopfyFinanceService {
     ctx: SellerCtx,
     body: { methodId?: unknown; speed?: unknown; grossMinor?: unknown },
   ) {
+    await this.exigirRepasseLiberado(ctx);
     this.requireMasterPayoutRollout();
     return this.requirePayoutOrchestrator().preview(this.seller(ctx).id, {
       methodId: typeof body.methodId === 'string' ? body.methodId : '',
@@ -461,6 +474,7 @@ export class KoopfyFinanceService {
     body: Record<string, unknown>,
     idempotencyKey: unknown,
   ) {
+    await this.exigirRepasseLiberado(ctx);
     if (process.env.KOOPFY_WHOP_MASTER_PAYOUTS_ENABLED === 'true') {
       this.requireMasterPayoutRollout();
       const confirmation = {

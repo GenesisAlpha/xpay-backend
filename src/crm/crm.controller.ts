@@ -142,6 +142,14 @@ export class CrmController {
     return this.crm.approveSeller(id, req.manager.sub, body)
   }
 
+  /** Cadastro único: refaz a abertura da conta Kontino (depois de resolver o caso com o seller). */
+  @Post('sellers/:id/kontino/retry')
+  @UseGuards(CrmAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  retryKontino(@Param('id') id: string, @Req() req: any) {
+    return this.crm.retomarKontino(id, req.manager.sub)
+  }
+
   /**
    * Adiciona / edita / remove o grupo logístico depois da aprovação.
    * Body vazio (`url: null`) desvincula o grupo.

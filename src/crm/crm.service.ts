@@ -7,6 +7,8 @@ import { JwtService } from '@nestjs/jwt'
 import * as jwt from 'jsonwebtoken'
 import { supabase } from '../lib/supabase.client'
 import { StorageService } from '../lib/storage.service'
+import { abrirKontinoAposAprovacao, cadastroV2, iniciarAberturaAposAprovacao } from '../orchestrator/kontino/kontino-aprovacao'
+import { arquivosDoEnvio } from '../onboarding/cadastro-v2'
 import { CryptoService } from '../crypto/crypto.service'
 import { WhopAccountsService } from '../orchestrator/whop/whop-accounts.service'
 import { WhopProvider } from '../orchestrator/providers/whop.provider'
@@ -316,7 +318,39 @@ export class CrmService {
       kyc: kycRes.data,
       documents: await this.buildDocumentsPayload(docsRes.data),
       activation_requests: (activationRes as any).data ?? [],
+      cadastro: await this.cadastroParaAnalise(sp?.config ?? null),
     }
+  }
+
+  /**
+   * Cadastro único (v2) para a análise: dados como o seller enviou, arquivos
+   * com URL temporária, evidência do aceite e o andamento da conta Kontino.
+   */
+  private async cadastroParaAnalise(config: Record<string, any> | null) {
+    const cad = cadastroV2(config)
+    if (!cad) return null
+    const arquivos: Record<string, string | null> = {}
+    for (const a of arquivosDoEnvio(cad.envio)) {
+      arquivos[a.campo] = await this.storageService.getSignedDocumentUrl(a.id)
+    }
+    return {
+      version: cad.version,
+      submitted_at: cad.submitted_at,
+      envio: cad.envio,
+      arquivos,
+      aceite: cad.aceite,
+      empresa_chave: config?.cadastro_chave ?? null,
+      kontino: { conexao: config?.kontino ?? null, andamento: config?.cadastro_kontino ?? null },
+    }
+  }
+
+  /** Refaz a abertura da conta Kontino de um seller aprovado (caso com a equipe resolvido). */
+  async retomarKontino(sellerId: string, managerId: string) {
+    await this.assertAssigned(sellerId, managerId)
+    const r = await abrirKontinoAposAprovacao(sellerId)
+    if (!r.andamento) throw new BadRequestException('Seller sem cadastro único aprovado.')
+    await this.log(sellerId, managerId, 'kontino_retry', { etapa: r.andamento.etapa, motivo: r.andamento.motivo })
+    return { andamento: r.andamento, conexao: r.conta ? { id: r.conta.id, status: r.conta.status } : null }
   }
 
   // Monta a resposta de documentos com signed URLs (bucket privado).
@@ -471,7 +505,8 @@ export class CrmService {
       .select('company_type')
       .eq('user_id', seller.user_id)
       .maybeSingle()
-    if (sellerDocs?.company_type === 'BR') {
+    // Cadastro único (v2): a regra de CNPJ × LLC era da Whop e não vale mais.
+    if (sellerDocs?.company_type === 'BR' && !cadastroV2(seller.config)) {
       const { data: cnpjRelease } = await supabase
         .from('seller_activation_requests')
         .select('id')
@@ -568,6 +603,11 @@ export class CrmService {
 
     // Vendedor sabe que já pode vender: métodos, taxas e primeiros passos.
     void notifySellerAccount(sellerId, 'approved', { enabledMethods: dto.enabledMethods, fees: sellerFeesRow(fees) })
+
+    // Cadastro único: a conta Kontino (onde o dinheiro cai) abre sozinha agora,
+    // em segundo plano. A aprovação não espera nem depende da Kontino.
+    void iniciarAberturaAposAprovacao(sellerId).catch((e) =>
+      console.error('[CrmService.approveSeller] abertura da conta Kontino:', e?.message))
 
     // Saque pela master (KOOPFY_WHOP_MASTER_PAYOUTS_ENABLED): prepara a conta de
     // recebimento. Desligado, o saque segue o fluxo de conta conectada da main e

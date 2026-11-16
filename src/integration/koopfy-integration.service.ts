@@ -449,7 +449,7 @@ export class KoopfyIntegrationService {
   }
 
   /** Conta do pay de quem conecta; cria a principal quando ainda não existe. */
-  private async sellerForConnection(email: string, accountSellerId: string | null): Promise<{ sellerId: string; userId: string }> {
+  async sellerForConnection(email: string, accountSellerId: string | null): Promise<{ sellerId: string; userId: string }> {
     const normEmail = normalizeEmail(email);
     if (!normEmail) throw new NotFoundException('Conta Koopfy Pay não encontrada.');
 

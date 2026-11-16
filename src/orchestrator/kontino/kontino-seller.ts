@@ -226,14 +226,33 @@ export async function iniciarContaKontino(i: {
  */
 export async function contaKontinoMudou(contaId: string): Promise<{ ok: boolean; reason?: string }> {
   const conta = await buscarContaKontino(contaId)
-  const sellerId = conta.external_id
-  if (!sellerId) return { ok: false, reason: 'account without external_id' }
-  const config = await configDoSeller(sellerId)
-  if (config === null) return { ok: false, reason: 'seller not found' }
-  const atual: string | undefined = config.kontino?.connection_id
-  if (atual && atual !== conta.id) return { ok: false, reason: 'seller has another connection' }
-  await guardarConta(sellerId, conta)
-  return { ok: true }
+  // Dono (external_id) + outros sellers da mesma empresa que reaproveitam a conexão.
+  const sellers = new Set<string>()
+  if (conta.external_id) sellers.add(conta.external_id)
+  for (const id of await sellersDaConexao(conta.id)) sellers.add(id)
+  if (!sellers.size) return { ok: false, reason: 'account without external_id' }
+  let gravou = false
+  for (const sellerId of sellers) {
+    const config = await configDoSeller(sellerId)
+    if (config === null) continue
+    const atual: string | undefined = config.kontino?.connection_id
+    if (atual && atual !== conta.id) continue
+    await guardarConta(sellerId, conta)
+    gravou = true
+  }
+  return gravou ? { ok: true } : { ok: false, reason: 'seller not found or has another connection' }
+}
+
+async function sellersDaConexao(contaId: string): Promise<string[]> {
+  try {
+    const { data, error } = await supabase.from('seller_profiles').select('id').eq('config->kontino->>connection_id', contaId).limit(50)
+    if (error) throw new Error(error.message)
+    return (data ?? []).map((r: any) => String(r.id))
+  } catch (e: any) {
+    // Sem a lista, o dono (external_id) ainda é atualizado.
+    console.warn(`[kontino-seller] sellers da conexão ${contaId}: ${e?.message}`)
+    return []
+  }
 }
 
 /**

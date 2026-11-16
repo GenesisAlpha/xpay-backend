@@ -46,6 +46,8 @@ export class ErroKontino extends Error {
     readonly status: number,
     readonly code: string,
     message: string,
+    /** Campos extras do erro (ex.: `existing_account` no 409 de empresa já conectada). */
+    readonly dados: Record<string, unknown> = {},
   ) {
     super(message)
   }
@@ -81,7 +83,10 @@ async function chamar<T>(metodo: 'GET' | 'POST', caminho: string, corpo?: unknow
   } catch {
     /* corpo não-JSON */
   }
-  if (!r.ok) throw new ErroKontino(r.status, json?.error?.code ?? 'kontino_error', json?.error?.message ?? `Kontino respondeu ${r.status}.`)
+  if (!r.ok) {
+    const erro = json?.error && typeof json.error === 'object' ? json.error : {}
+    throw new ErroKontino(r.status, erro.code ?? 'kontino_error', erro.message ?? `Kontino respondeu ${r.status}.`, erro)
+  }
   return json as T
 }
 
@@ -196,6 +201,8 @@ export type ContaKontino = {
   connection_type: 'onboarding' | 'connect_existing' | string
   capabilities?: Record<string, string>
   requirements?: unknown
+  /** A empresa (país + documento fiscal) já tinha conta Kontino: só o status, sem dados dela. */
+  existing_company?: { status: 'active' | 'verifying' | 'action_required' | 'rejected' | 'closed' | string } | null
 }
 
 export type LinkDaContaKontino = { url: string; expires_at: string; type: string; account: string }
@@ -207,6 +214,8 @@ export function criarContaKontino(i: {
   tipo: 'individual' | 'business'
   pais: string
   retorno?: string | null
+  /** Documento fiscal da empresa: a Kontino confere se a empresa já tem conta antes de abrir outra. */
+  documento?: string | null
 }) {
   return chamar<ContaKontino>(
     'POST',
@@ -216,6 +225,7 @@ export function criarContaKontino(i: {
       ...(i.nome ? { name: i.nome.slice(0, 140) } : {}),
       type: i.tipo,
       country: i.pais.toUpperCase(),
+      ...(i.tipo === 'business' && i.documento ? { tax_id: i.documento } : {}),
       external_id: i.sellerId,
       metadata: { koopfy_seller_id: i.sellerId },
       ...(i.retorno ? { return_url: i.retorno } : {}),
@@ -249,4 +259,23 @@ export async function contaKontinoPorSeller(sellerId: string, mensagem409?: stri
 
 export function linkDaContaKontino(id: string, retorno?: string | null) {
   return chamar<LinkDaContaKontino>('POST', `/accounts/${encodeURIComponent(id)}/onboarding_links`, retorno ? { return_url: retorno } : {})
+}
+
+/**
+ * Envia à Kontino o cadastro (KYC/KYB) que o seller já fez na Koopfy, com a
+ * evidência do aceite dos termos. A Kontino baixa os arquivos (URLs https
+ * temporárias) e cuida da verificação no banco parceiro.
+ */
+export function enviarVerificacaoKontino(
+  id: string,
+  corpo: {
+    type: 'individual' | 'business'
+    business?: Record<string, unknown>
+    individual?: Record<string, unknown>
+    tos: { accepted_at: string; ip_address: string; user_agent: string }
+  },
+) {
+  return chamar<ContaKontino>('POST', `/accounts/${encodeURIComponent(id)}/verification`, corpo)
+  // Sem chave de idempotência: o próprio endpoint recusa um segundo envio (409), e uma
+  // tentativa que falhou no banco parceiro precisa poder ser refeita.
 }

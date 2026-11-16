@@ -24,6 +24,8 @@ import { KoopfyPaymentDomainsController } from './koopfy-payment-domains.control
 import { KoopfyPaymentDomainsService } from './koopfy-payment-domains.service';
 import { SellerRefundService } from './seller-refund.service';
 import { WebhookModule } from '../webhooks/webhook.module';
+import { CadastroService } from './cadastro.service';
+import { KontinoAprovacaoCron } from '../orchestrator/kontino/kontino-aprovacao';
 
 @Module({
   // WalletDashModule exporta o WalletService — o saldo do card da home do
@@ -47,7 +49,7 @@ import { WebhookModule } from '../webhooks/webhook.module';
     WebhookModule,
   ],
   controllers: [KoopfyIntegrationController, KoopfyFinanceController, KoopfyPaymentDomainsController],
-  providers: [KoopfyIntegrationService, KoopfyFinanceService, StorageService, AnticipationService, KoopfyPaymentDomainsService, SellerRefundService],
+  providers: [KoopfyIntegrationService, KoopfyFinanceService, StorageService, AnticipationService, KoopfyPaymentDomainsService, SellerRefundService, CadastroService, KontinoAprovacaoCron],
   // O CRM cria a conta de pagamento de quem recebe o provedor externo sem ter
   // passado pelo Koopfy Payments (CrmCheckoutService.setExternalProvider).
   exports: [KoopfyIntegrationService],

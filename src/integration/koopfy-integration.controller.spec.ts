@@ -19,6 +19,7 @@ describe('KoopfyIntegrationController onboarding', () => {
     const controller = new KoopfyIntegrationController(
       integration as never,
       onboarding as never,
+      {} as never,
     );
     const req = {
       sellerCtx: {
@@ -58,6 +59,7 @@ describe('KoopfyIntegrationController onboarding', () => {
     const controller = new KoopfyIntegrationController(
       integration as never,
       onboarding as never,
+      {} as never,
     );
     const req = { sellerCtx: { userId: 'verified-user' } };
 
