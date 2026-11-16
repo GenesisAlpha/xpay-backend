@@ -425,6 +425,12 @@ export class KoopfyIntegrationService {
     body: { country?: string; type?: string; name?: string; email?: string; returnUrl?: string },
   ) {
     const { sellerId, userId } = await this.sellerForConnection(email, accountSellerId);
+    // A conta Kontino tem custo mensal: só nasce para seller aprovado pela Koopfy.
+    // No cadastro único ela abre sozinha na aprovação; aqui fica para quem já era aprovado.
+    const { data: perfil } = await supabase.from('seller_profiles').select('status, config').eq('id', sellerId).maybeSingle();
+    if (perfil?.status !== 'active') {
+      throw new BadRequestException('A conta Kontino abre automaticamente quando a Koopfy aprovar o seu cadastro.');
+    }
     let nome = String(body?.name ?? '').trim() || null;
     if (!nome) {
       const { data: user } = await supabase.from('users').select('name').eq('id', userId).maybeSingle();
