@@ -153,6 +153,14 @@ export class PaymentController {
     return this.paymentService.uploadSpeiProof(req.sellerId as string, transactionId, body);
   }
 
+  // Bancos do PSE (Colômbia) para o comprador escolher no checkout. Vêm da
+  // Kontino, que cobra o PSE em nome da conta conectada do seller.
+  @Get('pse/banks')
+  @UseGuards(ApiKeyGuard)
+  pseBanks() {
+    return this.paymentService.pseBanks();
+  }
+
   @Get('spei/:transactionId/status')
   @UseGuards(ApiKeyGuard)
   speiProofStatus(@Req() req: Request, @Param('transactionId') transactionId: string) {

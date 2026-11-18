@@ -71,6 +71,13 @@ export class PaymentDataDto {
     // MBWay
     @IsOptional() @IsString() @MaxLength(20)
     phone?: string;
+
+    // PSE (Colômbia): banco do comprador e tipo do documento (CC, CE, NIT, PASS, PEP).
+    @IsOptional() @IsString() @MaxLength(20)
+    bankCode?: string;
+
+    @IsOptional() @IsString() @IsIn(['CC', 'CE', 'NIT', 'PASS', 'PEP'])
+    documentType?: string;
 }
 
 // ─── Main DTO ──────────────────────────────────────────────────────────────────
@@ -81,13 +88,15 @@ export class CreatePaymentDto {
     @IsNumber() @Min(1)
     amount!: number;
 
-    @IsString() @IsIn(['EUR', 'BRL', 'USD', 'GBP', 'CHF', 'SEK', 'DKK', 'PLN', 'NOK', 'MXN'])
+    @IsString() @IsIn(['EUR', 'BRL', 'USD', 'GBP', 'CHF', 'SEK', 'DKK', 'PLN', 'NOK', 'MXN', 'ARS', 'COP'])
     currency!: string;
 
     @IsString() @IsIn([
         'card', 'pix', 'mbway', 'multibanco',
         'ideal', 'bancontact', 'apple_pay', 'google_pay',
         'eps', 'p24', 'swish', 'twint', 'blik', 'mobile_pay', 'klarna', 'spei',
+        // Kontino: Transferencias 3.0 (Argentina) e PSE (Colômbia).
+        'transfers_ar', 'pse',
         // Whop Elements: o PaymentElement também oferece cripto.
         'crypto',
         // PayPal na conta do próprio seller (botões do PayPal no checkout).

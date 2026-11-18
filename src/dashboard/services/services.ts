@@ -1255,6 +1255,7 @@ export class PaymentMethodsService {
       metricsByMethod[method].total += Number(k.total_transactions)
     }
 
+    const KONTINO_ONLY = new Set(['spei', 'transfers_ar', 'pse'])
     const ALL_METHODS = [
       { id: 'card', name: 'Cartões', icon: 'card', category: 'card', countries: ['*'] },
       { id: 'apple_pay', name: 'Apple Pay', icon: 'apple_pay', category: 'wallet', countries: ['*'] },
@@ -1269,6 +1270,9 @@ export class PaymentMethodsService {
       // seller e no checkout, mas esta lista nunca o devolvia — e o painel
       // depende dela para mostrar o nome do beneficiário (speiBeneficiaryName).
       { id: 'spei', name: 'SPEI', icon: 'spei', category: 'bank', countries: ['MX'] },
+      // Kontino: Transferencias 3.0 (Argentina, CVU) e PSE (Colômbia, link do banco).
+      { id: 'transfers_ar', name: 'Transferencias 3.0', icon: 'transfers_ar', category: 'bank', countries: ['AR'] },
+      { id: 'pse', name: 'PSE', icon: 'pse', category: 'bank', countries: ['CO'] },
       { id: 'ideal', name: 'iDEAL', icon: 'ideal', category: 'instant', countries: ['NL'] },
       { id: 'bancontact', name: 'Bancontact', icon: 'bancontact', category: 'instant', countries: ['BE'] },
       { id: 'sepa_debit', name: 'SEPA Direct Debit', icon: 'sepa_debit', category: 'bank', countries: ['EU'] },
@@ -1316,7 +1320,8 @@ export class PaymentMethodsService {
         // Na Whop os métodos padrão são resolvidos automaticamente por país,
         // moeda, dispositivo e elegibilidade do comprador.
         // SPEI não é método da Whop: só vale para quem o tem liberado no cadastro (Clip).
-        enabled: m.id === 'spei' ? enabledMethods.has('spei') : isWhopSeller || enabledMethods.has(m.id),
+        // Trilhos da Kontino também só com o método liberado no cadastro.
+        enabled: KONTINO_ONLY.has(m.id) ? enabledMethods.has(m.id) : isWhopSeller || enabledMethods.has(m.id),
         volume,           // já convertido via fromCents
         transactions: txs,
         approvalRate: rate,

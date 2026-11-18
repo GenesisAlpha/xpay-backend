@@ -25,20 +25,29 @@ export type RoutedProvider =
   | 'rox_pay' | 'coinflow' | 'paypal' | 'slash'
 
 export type PaymentMethodKey =
-  | 'card' | 'apple_pay' | 'google_pay' | 'pix' | 'spei' | 'boleto' | 'mbway' | 'crypto' | 'paypal' | 'link'
+  | 'card' | 'apple_pay' | 'google_pay' | 'pix' | 'spei' | 'transfers_ar' | 'pse'
 
-/** Catálogo exibido no CRM: o que cada método aceita e o rótulo. */
+/**
+ * Catálogo exibido no Admin: o que cada método aceita e o rótulo. Desde 18/11
+ * a Koopfy orquestra só dois provedores: Kaja Payments (cartão e carteiras) e
+ * Kontino (trilhos locais, na conta conectada do seller).
+ */
 export const METHOD_CATALOG: Record<PaymentMethodKey, { label: string; providers: RoutedProvider[] }> = {
-  card:       { label: 'Cartão',     providers: ['kaja', 'stripe', 'whop', 'clip', 'rox_pay', 'setinel_gate', 'approvebly', 'slash'] },
-  apple_pay:  { label: 'Apple Pay',  providers: ['kaja', 'stripe', 'whop', 'setinel_gate'] },
-  google_pay: { label: 'Google Pay', providers: ['kaja', 'stripe', 'whop', 'setinel_gate'] },
-  pix:        { label: 'Pix',        providers: ['kontino', 'approvebly', 'whop'] },
-  spei:       { label: 'SPEI',       providers: ['kontino', 'clip'] },
-  boleto:     { label: 'Boleto',     providers: ['approvebly'] },
-  mbway:      { label: 'MB WAY',     providers: ['setinel_gate'] },
-  crypto:     { label: 'Cripto',     providers: ['coinflow', 'whop'] },
-  paypal:     { label: 'PayPal',     providers: ['paypal'] },
-  link:       { label: 'Link',       providers: ['stripe'] },
+  card:         { label: 'Cartão',             providers: ['kaja'] },
+  apple_pay:    { label: 'Apple Pay',          providers: ['kaja'] },
+  google_pay:   { label: 'Google Pay',         providers: ['kaja'] },
+  pix:          { label: 'Pix',                providers: ['kontino'] },
+  spei:         { label: 'SPEI',               providers: ['kontino'] },
+  transfers_ar: { label: 'Transferencias 3.0', providers: ['kontino'] },
+  pse:          { label: 'PSE',                providers: ['kontino'] },
+}
+
+/** Provedores em operação. Os demais ficam só para ler o histórico. */
+export const ACTIVE_PROVIDERS: ReadonlySet<RoutedProvider> = new Set(['kaja', 'kontino'])
+
+/** Moeda fixa de cada trilho da Kontino. */
+export const KONTINO_CURRENCY: Partial<Record<PaymentMethodKey, string>> = {
+  pix: 'BRL', spei: 'MXN', transfers_ar: 'ARS', pse: 'COP',
 }
 
 export const PROVIDER_LABEL: Record<RoutedProvider, string> = {
@@ -162,9 +171,9 @@ export function validateRule(input: {
   if (new Set(list).size !== list.length) return 'Provedor repetido na cadeia.'
   const wrong = list.find(p => !allowed.has(p))
   if (wrong) return `${PROVIDER_LABEL[wrong as RoutedProvider] ?? wrong} não atende ${METHOD_CATALOG[method].label}.`
-  // Kontino cobra por trilho local com moeda fixa (SPEI só MXN, Pix só BRL).
+  // Kontino cobra por trilho local com moeda fixa (Pix BRL, SPEI MXN, Transferencias ARS, PSE COP).
   if (list.includes('kontino') && input.currency) {
-    const fixed = method === 'pix' ? 'BRL' : method === 'spei' ? 'MXN' : null
+    const fixed = KONTINO_CURRENCY[method] ?? null
     if (fixed && upper(input.currency) !== fixed) return `Kontino cobra ${METHOD_CATALOG[method].label} só em ${fixed}.`
   }
   return null

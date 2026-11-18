@@ -24,8 +24,12 @@ import { createHmac, timingSafeEqual } from 'node:crypto'
  */
 
 export const KONTINO_METODOS = {
-  spei: { moeda: 'MXN' },
-  pix: { moeda: 'BRL' },
+  spei: { moeda: 'MXN', rotulo: 'SPEI' },
+  pix: { moeda: 'BRL', rotulo: 'Pix' },
+  // Argentina: o comprador transfere para um CVU exclusivo; exige o CUIT/CUIL dele.
+  transfers_ar: { moeda: 'ARS', rotulo: 'Transferencias 3.0' },
+  // Colômbia (ACH Colombia): o comprador paga no site do banco dele pelo link do PSE.
+  pse: { moeda: 'COP', rotulo: 'PSE' },
 } as const
 export type MetodoKontino = keyof typeof KONTINO_METODOS
 
@@ -38,7 +42,19 @@ export type CobrancaKontino = {
   amount: number
   currency: string
   reference: string
-  instructions: { type: 'clabe' | 'cvu' | 'pix'; clabe?: string | null; copy_paste?: string | null; reference?: string; bank?: string | null; beneficiary?: string | null }
+  instructions: {
+    type: 'clabe' | 'cvu' | 'pix' | 'link'
+    clabe?: string | null
+    copy_paste?: string | null
+    reference?: string
+    bank?: string | null
+    beneficiary?: string | null
+    /** Transferencias 3.0: CVU exclusivo da cobrança e CUIT de quem recebe. */
+    cvu?: string | null
+    beneficiary_tax_id?: string | null
+    /** PSE: link do banco do comprador. */
+    url?: string | null
+  }
   expires_at: string
   settlement?: { gross: number; fee: number; net: number; fx_rate: number } | null
 }
@@ -99,7 +115,9 @@ export async function criarCobranca(i: {
   valorMinor: number
   moeda: string
   referencia?: string | null
-  comprador?: { nome?: string | null; email?: string | null; documento?: string | null }
+  comprador?: { nome?: string | null; email?: string | null; documento?: string | null; telefone?: string | null }
+  /** PSE: banco escolhido e tipo do documento do comprador. */
+  pse?: { banco?: string | null; tipoDocumento?: string | null } | null
   /** Conta Kontino do seller (acct_…). Obrigatória: sem ela não há cobrança. */
   contaConectada: string
   /** Taxa da venda em centavos de USD, tirada da conta do seller quando paga (receita da Kontino). */
@@ -113,7 +131,8 @@ export async function criarCobranca(i: {
   const pagador = {
     ...(i.comprador?.nome ? { name: i.comprador.nome.slice(0, 140) } : {}),
     ...(email ? { email: email.slice(0, 200) } : {}),
-    ...(i.comprador?.documento && i.comprador.documento !== 'N/A' ? { tax_id: i.comprador.documento.replace(/\D/g, '').slice(0, 20) } : {}),
+    ...(i.comprador?.documento && i.comprador.documento !== 'N/A' ? { tax_id: documentoDoPagador(i.metodo, i.comprador.documento, i.pse?.tipoDocumento) } : {}),
+    ...(i.metodo === 'pse' ? pagadorPse(i.comprador?.telefone, i.pse) : {}),
   }
   return chamar<CobrancaKontino>(
     'POST',
@@ -130,6 +149,31 @@ export async function criarCobranca(i: {
     },
     `koopfy-${i.transactionId}`,
   )
+}
+
+/** Passaporte e PEP têm letras; os demais documentos são só números. */
+function documentoDoPagador(metodo: MetodoKontino, documento: string, tipo?: string | null): string {
+  const alfanumerico = metodo === 'pse' && (tipo === 'PASS' || tipo === 'PEP')
+  return (alfanumerico ? documento.replace(/[^A-Za-z0-9]/g, '').toUpperCase() : documento.replace(/\D/g, '')).slice(0, 20)
+}
+
+/** Campos que só o PSE pede: celular colombiano, banco e tipo do documento. */
+function pagadorPse(telefone: string | null | undefined, pse: { banco?: string | null; tipoDocumento?: string | null } | null | undefined) {
+  const digitos = String(telefone ?? '').replace(/\D/g, '')
+  const celular = digitos.length === 10 && digitos.startsWith('3') ? `+57${digitos}` : digitos.length === 12 && digitos.startsWith('573') ? `+${digitos}` : null
+  return {
+    ...(celular ? { phone: celular } : {}),
+    ...(pse?.banco ? { bank_code: String(pse.banco).slice(0, 20) } : {}),
+    ...(pse?.tipoDocumento ? { document_type: String(pse.tipoDocumento).toUpperCase().slice(0, 4) } : {}),
+  }
+}
+
+/** Bancos do PSE (para o comprador escolher no checkout). */
+export async function bancosPse(): Promise<Array<{ code: string; name: string }>> {
+  const r = await chamar<{ data?: Array<{ code?: string; name?: string }> }>('GET', '/collections/pse/banks')
+  return (r?.data ?? [])
+    .filter((b) => b?.code && b?.name)
+    .map((b) => ({ code: String(b.code), name: String(b.name) }))
 }
 
 export const buscarCobranca = (id: string) => chamar<CobrancaKontino>('GET', `/collections/${encodeURIComponent(id)}`)
@@ -153,6 +197,35 @@ export function assinaturaKontinoValida(segredo: string, corpo: string, cabecalh
 
 /** Resposta ao checkout no mesmo formato dos outros provedores (SPEI e Pix). */
 export function respostaAoCheckout(transactionId: string, c: CobrancaKontino, valorMinor: number) {
+  if (c.method === 'transfers_ar') {
+    return {
+      success: true,
+      status: 'pending',
+      transactionId,
+      provider: 'kontino',
+      transferencia: {
+        cvu: c.instructions.cvu ?? null,
+        beneficiaryTaxId: c.instructions.beneficiary_tax_id ?? null,
+        chargeMinor: valorMinor,
+        currency: 'ARS',
+        expiresAt: c.expires_at,
+        referencia: c.instructions.reference ?? c.reference,
+        // Sem comprovante: a confirmação chega sozinha pelo webhook.
+        automatico: true,
+      },
+    }
+  }
+  if (c.method === 'pse') {
+    const url = c.instructions.url ?? null
+    return {
+      success: true,
+      status: 'pending',
+      transactionId,
+      provider: 'kontino',
+      redirectUrl: url,
+      pse: { url, expiresAt: c.expires_at },
+    }
+  }
   if (c.method === 'spei') {
     return {
       success: true,

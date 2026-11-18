@@ -17,7 +17,7 @@ export const AVAILABLE_METHODS = [
   'ideal', 'bancontact', 'blik', 'twint', 'klarna',
   'afterpay', 'affirm', 'alipay', 'wechat', 'mercadopago',
   'revolut_pay', 'mobilepay', 'p24', 'eps', 'giropay',
-  'spei', 'oxxo', 'pse', 'nequi', 'daviplata', 'khipu',
+  'spei', 'transfers_ar', 'oxxo', 'pse', 'nequi', 'daviplata', 'khipu',
   'webpay', 'rapipago', 'pagofacil', 'bank_transfer',
 ] as const
 

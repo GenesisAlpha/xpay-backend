@@ -58,7 +58,7 @@ export type VisaoKontino = {
 }
 
 export const KONTINO_BANCO_URL = 'https://kontino.co/entrar'
-const METODOS = ['pix', 'spei']
+const METODOS = Object.keys(KONTINO_METODOS)
 
 export class ErroContaKontino extends Error {
   constructor(

@@ -34,8 +34,9 @@ import { customerSubscriptionView, isSubscriptionTransaction } from './customer-
 import { SLASH_CURRENCIES } from '../orchestrator/providers/slash.provider'
 import { MethodRoutingService } from '../orchestrator/method-routing/method-routing.service'
 import { DIRECT_PROVIDERS } from '../orchestrator/method-routing/method-routing'
-import { ErroKontino, KONTINO_METODOS, criarCobranca, ehMetodoKontino, kontinoConfigurado, respostaAoCheckout, toKontinoOwnAccountId, type MetodoKontino } from '../orchestrator/kontino/kontino'
+import { ErroKontino, KONTINO_METODOS, bancosPse, criarCobranca, ehMetodoKontino, kontinoConfigurado, respostaAoCheckout, toKontinoOwnAccountId, type MetodoKontino } from '../orchestrator/kontino/kontino'
 import { kontinoPelaContaDoSeller } from '../orchestrator/kontino/kontino-seller'
+import { dadosDoPagadorKontino } from '../orchestrator/kontino/pagador'
 
 export interface ExternalFeeInput {
     recipient_id: string
@@ -563,8 +564,9 @@ export class PaymentService {
         }
         __mark('transaction insert')
 
-        // ── Kontino Connect: SPEI e Pix com confirmação automática ─────────────
-        // Cada cobrança tem a própria CLABE (ou código Pix) e o Kontino avisa o
+        // ── Kontino Connect: SPEI, Pix, Transferencias 3.0 e PSE ──────────────
+        // Cada cobrança tem a própria CLABE / código Pix / CVU (ou o link do banco,
+        // no PSE) e o Kontino avisa o
         // pagamento por webhook assinado (/webhook/kontino): sem comprovante.
         if (effectiveProvider === 'kontino' && ehMetodoKontino(dto.method)) {
             // Reserva da regra (ex.: SPEI → Clip, Pix → Approvebly): falha técnica
@@ -1791,7 +1793,6 @@ export class PaymentService {
         return { released: true }
     }
 
-    /** Cobrança local pelo Kontino Connect (SPEI em MXN, Pix em BRL). */
     /**
      * Provedor do formulário de cartão pela regra de método. `routed: false` =
      * sem regra (vale o provider_default). Com regra e nenhuma conta, provider
@@ -1815,6 +1816,22 @@ export class PaymentService {
         return { routed: true, provider: null }
     }
 
+    /** Bancos do PSE (Colômbia), em cache por 10 minutos. */
+    private bancosPseCache: { at: number; data: Array<{ code: string; name: string }> } | null = null
+    async pseBanks() {
+        if (this.bancosPseCache && Date.now() - this.bancosPseCache.at < 10 * 60_000) return { data: this.bancosPseCache.data }
+        if (!kontinoConfigurado()) throw new ServiceUnavailableException('PSE indisponível no momento.')
+        try {
+            const data = await bancosPse()
+            if (data.length) this.bancosPseCache = { at: Date.now(), data }
+            return { data }
+        } catch (e: any) {
+            console.error('[PaymentService] bancos do PSE indisponíveis:', e?.message ?? e)
+            if (this.bancosPseCache) return { data: this.bancosPseCache.data }
+            throw new ServiceUnavailableException('PSE indisponível no momento.')
+        }
+    }
+
     /**
      * Cobra pelo Kontino. Com `fallbackTo`, uma falha TÉCNICA (não de regra do
      * trilho, como valor fora da faixa) devolve null e a transação volta a ficar
@@ -1822,12 +1839,16 @@ export class PaymentService {
      */
     private async cobrarPeloKontino(seller: any, dto: any, transaction: any, amountMinor: number, currency: string, opts: { fallbackTo?: string | null; contaKontino: string; taxaKontinoUsdCents: number; fallbackOnRange?: boolean }) {
         const metodo = dto.method as MetodoKontino
+        const rotulo = KONTINO_METODOS[metodo].rotulo
         if (currency.toUpperCase() !== KONTINO_METODOS[metodo].moeda) {
-            throw new BadRequestException(`${metodo === 'spei' ? 'SPEI' : 'Pix'} está disponível apenas em ${KONTINO_METODOS[metodo].moeda}.`)
+            throw new BadRequestException(`${rotulo} está disponível apenas em ${KONTINO_METODOS[metodo].moeda}.`)
         }
         const enabled = new Set((seller.enabled_methods ?? []).map((m: any) => String(m).toLowerCase()))
-        if (!enabled.has(metodo)) throw new ForbiddenException(`${metodo === 'spei' ? 'SPEI' : 'Pix'} não está habilitado para este seller.`)
+        if (!enabled.has(metodo)) throw new ForbiddenException(`${rotulo} não está habilitado para este seller.`)
         if (!kontinoConfigurado()) throw new BadRequestException('Pagamento indisponível no momento. Selecione outro método.')
+        // Dados que o trilho exige do comprador (o checkout já valida; aqui é a trava).
+        const faltando = dadosDoPagadorKontino(metodo, dto)
+        if (faltando) throw new BadRequestException(faltando)
 
         try {
             const cobranca = await criarCobranca({
@@ -1836,7 +1857,8 @@ export class PaymentService {
                 valorMinor: amountMinor,
                 moeda: currency,
                 referencia: dto.metadata?.order_number ?? dto.metadata?.orderId ?? null,
-                comprador: { nome: dto.customer?.name, email: dto.customer?.email, documento: dto.customer?.document },
+                comprador: { nome: dto.customer?.name, email: dto.customer?.email, documento: dto.customer?.document, telefone: dto.customer?.phone ?? dto.payment_data?.phone },
+                pse: metodo === 'pse' ? { banco: dto.payment_data?.bankCode, tipoDocumento: dto.payment_data?.documentType } : null,
                 contaConectada: opts.contaKontino,
                 comissaoUsdCents: opts.taxaKontinoUsdCents,
             })

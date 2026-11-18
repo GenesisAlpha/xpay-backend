@@ -3,7 +3,7 @@ import { supabase } from '../../lib/supabase.client'
 import { getActiveProviderAccounts } from '../provider-accounts.config'
 import { kontinoConfigurado } from '../kontino/kontino'
 import {
-  METHOD_CATALOG, PROVIDER_LABEL, normalizeMethod, resolveMethodRoute, validateRule,
+  ACTIVE_PROVIDERS, METHOD_CATALOG, PROVIDER_LABEL, normalizeMethod, resolveMethodRoute, validateRule,
   type MethodRoute, type MethodRouteRule, type ProviderAvailability, type RoutedProvider,
 } from './method-routing'
 
@@ -47,7 +47,10 @@ export class MethodRoutingService {
     const stat = getActiveProviderAccounts() as Array<{ provider: string }>
     const out: ProviderAvailability = {}
     for (const p of Object.keys(PROVIDER_LABEL)) {
-      if (p === 'kontino') {
+      if (!ACTIVE_PROVIDERS.has(p as RoutedProvider)) {
+        // Fora de operação: regra antiga que ainda cite o provedor pula ele.
+        out[p] = { available: false, reason: 'Fora de operação na Koopfy' }
+      } else if (p === 'kontino') {
         out[p] = kontinoConfigurado()
           ? { available: true }
           : { available: false, reason: 'KONTINO_SECRET_KEY não configurada' }
@@ -82,7 +85,7 @@ export class MethodRoutingService {
     const availability = this.availability()
     return {
       catalog: Object.entries(METHOD_CATALOG).map(([key, v]) => ({ method: key, label: v.label, providers: v.providers })),
-      providers: Object.entries(PROVIDER_LABEL).map(([key, label]) => ({ provider: key, label, ...availability[key] })),
+      providers: [...ACTIVE_PROVIDERS].map(key => ({ provider: key, label: PROVIDER_LABEL[key], ...availability[key] })),
       rules: rules ?? [],
       history: history ?? [],
     }
