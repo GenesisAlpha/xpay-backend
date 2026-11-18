@@ -4,17 +4,17 @@
 -- carteiras) e Kontino (Pix, SPEI, Transferencias 3.0 e PSE, na conta
 -- conectada do seller). Idempotente: pode rodar mais de uma vez.
 
--- 1. Tira das cadeias todo provedor fora de Kaja e Kontino.
+-- 1. Sai a regra que ficaria sem provedor (nenhum é Kaja ou Kontino) e a de
+--    método que nem Kaja nem Kontino atendem (boleto, MB WAY, cripto, PayPal, Link).
+delete from public.payment_method_routes
+ where not exists (select 1 from unnest(providers) as p where p in ('kaja', 'kontino'))
+    or method not in ('card', 'apple_pay', 'google_pay', 'pix', 'spei', 'transfers_ar', 'pse');
+
+-- 2. Nas que sobraram, tira da cadeia todo provedor fora de Kaja e Kontino.
 update public.payment_method_routes
    set providers = array(select p from unnest(providers) as p where p in ('kaja', 'kontino')),
        updated_by = 'migration', updated_at = now()
  where exists (select 1 from unnest(providers) as p where p not in ('kaja', 'kontino'));
-
--- 2. Regra que ficou sem provedor, ou de método que nem Kaja nem Kontino
---    atendem (boleto, MB WAY, cripto, PayPal, Link), sai.
-delete from public.payment_method_routes
- where cardinality(providers) = 0
-    or method not in ('card', 'apple_pay', 'google_pay', 'pix', 'spei', 'transfers_ar', 'pse');
 
 -- 3. Regras da plataforma. Cartão e carteiras na Kaja ficam DESLIGADAS até a
 --    integração da Kaja estar no ar (ligar antes deixaria o cartão sem
