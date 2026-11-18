@@ -69,7 +69,8 @@ export class CadastroService {
     const temCadastroV2 = !!cadastroV2(s?.config)
     // A consulta ao provedor externo só é necessária para conta antiga ainda não aprovada.
     let externo = false
-    if (s && !temCadastroV2 && s.status && !['active', 'suspended', 'rejected'].includes(s.status)) {
+    // Só o seller que ainda não está no cadastro único pode estar vendendo pelo provedor externo.
+    if (s && !temCadastroV2 && s.status) {
       const ext: any = await this.integration.externalProviderStatus(s.id).catch(() => null)
       externo = Boolean(ext?.charging)
     }
@@ -81,7 +82,8 @@ export class CadastroService {
     const u = userId ? await this.usuario(userId) : { nome: null, documentosAntigos: false }
     const cad = cadastroV2(s?.config)
     let conta: ContaKontinoResumo = null
-    if (s && cad && s.status === 'active' && s.config?.kontino?.connection_id) {
+    // Conta Kontino de seller aprovado (cadastro único ou aprovado no fluxo antigo).
+    if (s && s.status === 'active' && s.config?.kontino?.connection_id) {
       const v = await estadoKontino(s.id)
       conta = v.account
         ? { status: v.account.status, connectionType: v.account.connectionType, requirements: v.account.requirements, verifying: v.account.verifying, errors: v.account.errors }

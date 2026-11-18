@@ -171,8 +171,10 @@ describe('elegivel', () => {
     expect(elegivel({ ...base, sellerStatus: null })).toBe(true)
     expect(elegivel(base)).toBe(true)
   })
-  it('antigo aprovado, suspenso ou com provedor externo fica no antigo', () => {
-    expect(elegivel({ ...base, sellerStatus: 'active' })).toBe(false)
+  it('só quem vende pelo provedor externo fica no fluxo antigo', () => {
+    // Aprovado no fluxo antigo também vê o fluxo novo (conta aprovada + conta de recebimento).
+    expect(elegivel({ ...base, sellerStatus: 'active' })).toBe(true)
+    expect(elegivel({ ...base, sellerStatus: 'suspended' })).toBe(true)
     // Cadastro antigo (LLC) em análise vai para o novo: o antigo não aceita CPF/CNPJ.
     expect(elegivel({ ...base, documentosAntigosEnviados: true })).toBe(true)
     expect(elegivel({ ...base, provedorExternoCobrando: true })).toBe(false)
@@ -221,5 +223,28 @@ describe('estadoDoCadastro', () => {
   })
   it('sem cadastro: começar', () => {
     expect(estadoDoCadastro({ ...base, cadastro: null, sellerStatus: null }).stage).toBe('start')
+  })
+})
+
+describe('aprovado no fluxo antigo (sem cadastro único)', () => {
+  const base = {
+    email: 'a@b.co', nome: 'Ana', sellerStatus: 'active', reviewedAt: '2026-10-01T00:00:00.000Z', rejectionReason: null, cadastro: null,
+    andamento: null, conta: null, contaAtiva: false, configurado: true, eligible: true, bankUrl: 'https://kontino.co/entrar',
+  }
+  it('sem conta Kontino: aprovado, abre a conta de recebimento e saca como sempre', () => {
+    const s = estadoDoCadastro(base)
+    expect(s.stage).toBe('approved')
+    expect(s.kontino.stage).toBe('setup')
+    expect(s.capabilities).toEqual({ card: true, local: false, payouts: 'enabled' })
+  })
+  it('conta Kontino aberta por ele e ainda sem dados: conclui na Kontino', () => {
+    const s = estadoDoCadastro({ ...base, conta: { status: 'pending', connectionType: 'onboarding', requirements: ['verification'], verifying: false, errors: [] } })
+    expect(s.kontino.stage).toBe('action_required')
+    expect(s.kontino.message).toBe('Conclua a abertura da sua conta na Kontino.')
+  })
+  it('conta Kontino ativa: tudo liberado', () => {
+    const s = estadoDoCadastro({ ...base, contaAtiva: true, conta: { status: 'active', connectionType: 'onboarding', requirements: [], verifying: false, errors: [] } })
+    expect(s.kontino.stage).toBe('active')
+    expect(s.capabilities).toEqual({ card: true, local: true, payouts: 'enabled' })
   })
 })
