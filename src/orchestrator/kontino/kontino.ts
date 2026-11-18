@@ -13,9 +13,11 @@ import { createHmac, timingSafeEqual } from 'node:crypto'
  *
  * Sem conta conectada o Kontino NÃO é usado: receber em nome de um seller na
  * conta da Koopfy é "nesting" e a BlindPay recusa (blindpay.com/docs/kb/nested-payments).
- * O dinheiro cai na conta do seller; a comissão da Koopfy vai em
- * `application_fee_amount` (centavos de USD) e a venda não entra na carteira da
- * Koopfy (ver isKontinoOwnAccountId).
+ * O dinheiro cai na conta do seller e a venda não entra na carteira da Koopfy
+ * (ver isKontinoOwnAccountId). A taxa da venda vai em `application_fee_amount`
+ * (centavos de USD) e é receita da KONTINO, não da Koopfy: a Koopfy é parceiro
+ * sem receita no Connect (Partner.revenueToKontino), e a Kontino manda essa taxa
+ * para a tesouraria dela.
  *
  * Variáveis: KONTINO_API_URL (padrão produção), KONTINO_SECRET_KEY (sk_live_ ou
  * sk_test_), KONTINO_WEBHOOK_SECRET (whsec_ do endpoint cadastrado no painel).
@@ -100,7 +102,7 @@ export async function criarCobranca(i: {
   comprador?: { nome?: string | null; email?: string | null; documento?: string | null }
   /** Conta Kontino do seller (acct_…). Obrigatória: sem ela não há cobrança. */
   contaConectada: string
-  /** Comissão da Koopfy em centavos de USD, tirada da conta do seller quando paga. */
+  /** Taxa da venda em centavos de USD, tirada da conta do seller quando paga (receita da Kontino). */
   comissaoUsdCents?: number | null
 }) {
   if (!i.contaConectada) throw new ErroKontino(400, 'account_required', 'Seller sem conta Kontino conectada.')

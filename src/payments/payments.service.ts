@@ -575,7 +575,8 @@ export class PaymentService {
             // na conta da Koopfy é "nesting" (recusado pela BlindPay).
             const kontino = contaKontino
                 ? await this.cobrarPeloKontino(seller, dto, transaction, amount, String(currency), {
-                    fallbackTo: nextProvider, contaKontino, comissaoUsdCents: saleFees.platformFeeCents,
+                    // A taxa que seria da Koopfy é cobrada igual, mas é receita da Kontino.
+                    fallbackTo: nextProvider, contaKontino, taxaKontinoUsdCents: saleFees.platformFeeCents,
                     // Ligada pela conta do seller (sem regra): valor fora da faixa da
                     // Kontino volta para o provedor de antes em vez de recusar.
                     fallbackOnRange: !routedByMethod,
@@ -1819,7 +1820,7 @@ export class PaymentService {
      * trilho, como valor fora da faixa) devolve null e a transação volta a ficar
      * livre para o próximo provedor da regra.
      */
-    private async cobrarPeloKontino(seller: any, dto: any, transaction: any, amountMinor: number, currency: string, opts: { fallbackTo?: string | null; contaKontino: string; comissaoUsdCents: number; fallbackOnRange?: boolean }) {
+    private async cobrarPeloKontino(seller: any, dto: any, transaction: any, amountMinor: number, currency: string, opts: { fallbackTo?: string | null; contaKontino: string; taxaKontinoUsdCents: number; fallbackOnRange?: boolean }) {
         const metodo = dto.method as MetodoKontino
         if (currency.toUpperCase() !== KONTINO_METODOS[metodo].moeda) {
             throw new BadRequestException(`${metodo === 'spei' ? 'SPEI' : 'Pix'} está disponível apenas em ${KONTINO_METODOS[metodo].moeda}.`)
@@ -1837,18 +1838,20 @@ export class PaymentService {
                 referencia: dto.metadata?.order_number ?? dto.metadata?.orderId ?? null,
                 comprador: { nome: dto.customer?.name, email: dto.customer?.email, documento: dto.customer?.document },
                 contaConectada: opts.contaKontino,
-                comissaoUsdCents: opts.comissaoUsdCents,
+                comissaoUsdCents: opts.taxaKontinoUsdCents,
             })
             await supabase.from('transactions').update({
                 provider: 'kontino',
-                // Conta do próprio seller: a venda não entra na carteira da Koopfy;
-                // a comissão (fee) sai da conta dele como application fee.
+                // Conta do próprio seller: a venda não entra na carteira da Koopfy.
+                // A taxa sai da conta dele como application fee e vai para a Kontino
+                // (parceiro sem receita): não é receita da Koopfy, então fee = 0 e o
+                // valor fica registrado em metadata.taxa_kontino_usd_cents.
                 provider_account_id: toKontinoOwnAccountId(opts.contaKontino),
-                fee: opts.comissaoUsdCents,
+                fee: 0,
                 provider_transaction_id: cobranca.id,
                 provider_status: cobranca.status,
                 status: 'pending',
-                metadata: { ...(transaction.metadata ?? {}), kontino_collection_id: cobranca.id, kontino_expires_at: cobranca.expires_at },
+                metadata: { ...(transaction.metadata ?? {}), kontino_collection_id: cobranca.id, kontino_expires_at: cobranca.expires_at, taxa_kontino_usd_cents: Math.round(opts.taxaKontinoUsdCents) },
                 updated_at: new Date().toISOString(),
             }).eq('id', transaction.id)
             return respostaAoCheckout(transaction.id, cobranca, amountMinor)
