@@ -997,6 +997,19 @@ export class KoopfyIntegrationService {
     }
   }
 
+  /** Seller que ainda cobra pela Whop e não tem conta Kontino ativa. */
+  private async dependeDaWhop(sellerId: string): Promise<boolean> {
+    const { data, error } = await supabase
+      .from('seller_profiles')
+      .select('provider_default, config')
+      .eq('id', sellerId)
+      .maybeSingle();
+    // Sem conseguir ler, mantém a regra antiga (mais restritiva).
+    if (error || !data) return true;
+    if (String((data as any).config?.kontino_account_id ?? '').trim()) return false;
+    return String((data as any).provider_default ?? '').trim().toLowerCase() === 'whop';
+  }
+
   async activate(ctx: SellerCtx) {
     const seller = ctx.seller;
     if (!seller) {
@@ -1013,8 +1026,13 @@ export class KoopfyIntegrationService {
     // Conta conectada ainda em verificação na Whop: não ativa (ver
     // connectedActivationBlocker). O painel já esconde o botão; isto cobre
     // chamada direta e painel antigo em cache.
-    const blocker = await this.connectedActivationBlocker(seller.id);
-    if (blocker) throw new ConflictException(blocker);
+    // Desde 18/11 a Koopfy cobra só por Kaja e Kontino: a espera pela Whop só
+    // vale para quem ainda cobra pela Whop e não tem conta Kontino ativa. Sem
+    // isto, seller aprovado com Kontino ativa nunca ativava a loja nova.
+    if (await this.dependeDaWhop(seller.id)) {
+      const blocker = await this.connectedActivationBlocker(seller.id);
+      if (blocker) throw new ConflictException(blocker);
+    }
 
     const publishableKey = generateKey('pk_live');
     const secretKey = generateKey('sk_live');
