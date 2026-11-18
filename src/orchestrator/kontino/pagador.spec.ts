@@ -16,7 +16,8 @@ describe('dados do comprador por trilho da Kontino', () => {
     expect(dadosDoPagadorKontino('pse', { ...ok, payment_data: { documentType: 'XX', bankCode: '1007' } })).toMatch(/tipo de documento/)
     expect(dadosDoPagadorKontino('pse', { ...ok, payment_data: { documentType: 'CC' } })).toMatch(/banco/)
     expect(dadosDoPagadorKontino('pse', { ...ok, customer: { document: '1020304050', phone: '+55 11 99999 0000' } })).toMatch(/celular/)
-    expect(dadosDoPagadorKontino('pse', { ...ok, customer: { document: 'AB12345', phone: '3001234567' }, payment_data: { documentType: 'PASS', bankCode: '1007' } })).toBeNull()
+    expect(dadosDoPagadorKontino('pse', { ...ok, payment_data: { documentType: 'PASS', bankCode: '1007' } })).toMatch(/tipo de documento/)
+    expect(dadosDoPagadorKontino('pse', { ...ok, customer: { document: '900.123.456', phone: '3001234567' }, payment_data: { documentType: 'NIT', bankCode: '1007' } })).toBeNull()
   })
 
   it('Pix e SPEI não pedem nada a mais', () => {

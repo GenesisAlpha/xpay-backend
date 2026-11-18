@@ -151,10 +151,9 @@ export async function criarCobranca(i: {
   )
 }
 
-/** Passaporte e PEP têm letras; os demais documentos são só números. */
-function documentoDoPagador(metodo: MetodoKontino, documento: string, tipo?: string | null): string {
-  const alfanumerico = metodo === 'pse' && (tipo === 'PASS' || tipo === 'PEP')
-  return (alfanumerico ? documento.replace(/[^A-Za-z0-9]/g, '').toUpperCase() : documento.replace(/\D/g, '')).slice(0, 20)
+/** Documento do comprador só com dígitos (no PSE, NIT sem o dígito verificador). */
+function documentoDoPagador(_metodo: MetodoKontino, documento: string, _tipo?: string | null): string {
+  return documento.replace(/\D/g, '').slice(0, 20)
 }
 
 /** Campos que só o PSE pede: celular colombiano, banco e tipo do documento. */

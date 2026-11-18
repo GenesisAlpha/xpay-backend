@@ -16,8 +16,8 @@ export function dadosDoPagadorKontino(
   if (metodo === 'pse') {
     const tipo = String(dto.payment_data?.documentType ?? '').toUpperCase()
     if (!TIPOS_PSE.has(tipo)) return 'Elegí el tipo de documento para pagar con PSE.'
-    const limpo = tipo === 'PASS' || tipo === 'PEP' ? documento.replace(/[^A-Za-z0-9]/g, '') : documento.replace(/\D/g, '')
-    if (limpo.length < 5) return 'Ingresá el número de documento para pagar con PSE.'
+    const limpo = documento.replace(/\D/g, '')
+    if (limpo.length < 5 || limpo.length > 15) return 'Ingresá el número de documento (solo números; NIT sin dígito de verificación) para pagar con PSE.'
     if (!String(dto.payment_data?.bankCode ?? '').trim()) return 'Elegí tu banco para pagar con PSE.'
     const celular = String(dto.customer?.phone ?? dto.payment_data?.phone ?? '').replace(/\D/g, '')
     const ok = (celular.length === 10 && celular.startsWith('3')) || (celular.length === 12 && celular.startsWith('573'))
@@ -26,8 +26,8 @@ export function dadosDoPagadorKontino(
   return null
 }
 
-/** Tipos de documento aceitos pelo PSE. */
-export const TIPOS_PSE = new Set(['CC', 'CE', 'NIT', 'PASS', 'PEP'])
+/** Tipos de documento aceitos pelo PSE da Kontino/BlindPay: cédula e NIT. */
+export const TIPOS_PSE = new Set(['CC', 'NIT'])
 
 /** CUIT/CUIL argentino: 11 dígitos com dígito verificador (mod 11). */
 export function cuitValido(v: string): boolean {

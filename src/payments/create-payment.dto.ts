@@ -72,11 +72,11 @@ export class PaymentDataDto {
     @IsOptional() @IsString() @MaxLength(20)
     phone?: string;
 
-    // PSE (Colômbia): banco do comprador e tipo do documento (CC, CE, NIT, PASS, PEP).
+    // PSE (Colômbia): banco do comprador e tipo do documento (CC ou NIT).
     @IsOptional() @IsString() @MaxLength(20)
     bankCode?: string;
 
-    @IsOptional() @IsString() @IsIn(['CC', 'CE', 'NIT', 'PASS', 'PEP'])
+    @IsOptional() @IsString() @IsIn(['CC', 'NIT'])
     documentType?: string;
 }
 
