@@ -171,9 +171,10 @@ describe('elegivel', () => {
     expect(elegivel({ ...base, sellerStatus: null })).toBe(true)
     expect(elegivel(base)).toBe(true)
   })
-  it('antigo aprovado, em análise ou com provedor externo fica no antigo', () => {
+  it('antigo aprovado, suspenso ou com provedor externo fica no antigo', () => {
     expect(elegivel({ ...base, sellerStatus: 'active' })).toBe(false)
-    expect(elegivel({ ...base, documentosAntigosEnviados: true })).toBe(false)
+    // Cadastro antigo (LLC) em análise vai para o novo: o antigo não aceita CPF/CNPJ.
+    expect(elegivel({ ...base, documentosAntigosEnviados: true })).toBe(true)
     expect(elegivel({ ...base, provedorExternoCobrando: true })).toBe(false)
   })
   it('cadastro v2 e recusado no antigo entram no novo', () => {

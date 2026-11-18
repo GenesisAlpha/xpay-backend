@@ -340,9 +340,9 @@ export function mensagemKontino(etapa: EtapaKontino, conta: ContaKontinoResumo):
 }
 
 /**
- * Quem entra no fluxo novo: cadastro v2 já enviado, conta nova, ou conta ainda
- * sem nada enviado pelo fluxo antigo (ou recusada nele). Seller aprovado ou com
- * o cadastro antigo em análise continua no fluxo antigo até a migração.
+ * Quem entra no fluxo novo: todo seller ainda não aprovado (conta nova, em
+ * análise ou recusado, com ou sem o cadastro antigo enviado). Fica no fluxo
+ * antigo só quem já está aprovado, suspenso ou vendendo por provedor externo.
  */
 export function elegivel(i: {
   temCadastroV2: boolean
@@ -354,8 +354,11 @@ export function elegivel(i: {
   if (!i.sellerStatus) return true
   if (i.provedorExternoCobrando) return false
   if (i.sellerStatus === 'active' || i.sellerStatus === 'suspended') return false
-  if (i.sellerStatus === 'rejected') return true
-  return !i.documentosAntigosEnviados
+  // Não aprovado (em análise ou recusado), mesmo com o cadastro antigo (LLC/Whop)
+  // enviado: o cadastro antigo não serve mais (só LLC), e o novo aceita CPF e CNPJ.
+  // `documentosAntigosEnviados` fica no contrato da função para leitura/log.
+  void i.documentosAntigosEnviados
+  return true
 }
 
 export function estadoDoCadastro(i: {
