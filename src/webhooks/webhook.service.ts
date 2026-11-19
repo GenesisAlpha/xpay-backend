@@ -42,6 +42,7 @@ import * as crypto from 'crypto'
 import { WhopPayoutWebhookService } from '../payouts/whop-payout-webhook.service'
 import { assinaturaKontinoValida, buscarCobranca } from '../orchestrator/kontino/kontino'
 import { contaKontinoMudou } from '../orchestrator/kontino/kontino-seller'
+import { valoresDaLiquidacaoKontino } from './kontino-liquidacao'
 
 // Status do Sentinel Gate → status canônico do handleWebhookProvider.
 const SENTINEL_WEBHOOK_STATUS: Record<string, 'PAID' | 'PENDING' | 'FAILED' | 'PROCESSING'> = {
@@ -533,7 +534,7 @@ export class WebhookService {
     if (!id) return { ignored: true, reason: 'collection id missing' }
 
     const { data: tx } = await supabase
-      .from('transactions').select('id, status, metadata')
+      .from('transactions').select('id, status, metadata, amount')
       .eq('provider', 'kontino').eq('provider_transaction_id', id)
       .maybeSingle()
     if (!tx) {
@@ -553,6 +554,9 @@ export class WebhookService {
     if (cobranca.status === 'paid') {
       await supabase.from('transactions').update({
         metadata: { ...(tx.metadata ?? {}), kontino_settlement: cobranca.settlement ?? null },
+        // Valor real em dólar: o câmbio da BlindPay difere do de referência
+        // (ARS: ~12% em 18/11) e o painel mostrava mais do que entrou.
+        ...valoresDaLiquidacaoKontino(cobranca.settlement, (tx as any).amount, Number((tx.metadata as any)?.taxa_kontino_usd_cents ?? 0)),
       }).eq('id', tx.id)
       return this.handleWebhookProvider({ reference: tx.id, status: 'PAID', type: 'TRANSACTION' })
     }

@@ -1864,6 +1864,9 @@ export class PaymentService {
             })
             await supabase.from('transactions').update({
                 provider: 'kontino',
+                // Transação reaproveitada (mesmo pedido, outro método antes): grava
+                // o método e o valor desta cobrança.
+                method: dto.method, amount: amountMinor, currency: currency.toUpperCase(),
                 // Conta do próprio seller: a venda não entra na carteira da Koopfy.
                 // A taxa sai da conta dele como application fee e vai para a Kontino
                 // (parceiro sem receita): não é receita da Koopfy, então fee = 0 e o
@@ -1890,6 +1893,7 @@ export class PaymentService {
             console.error(`[PaymentService] Kontino recusou a cobrança tx=${transaction.id}:`, motivo)
             await supabase.from('transactions').update({
                 provider: 'kontino', status: 'failed', provider_status: 'failed',
+                method: dto.method, amount: amountMinor, currency: currency.toUpperCase(),
                 failure_code: e instanceof ErroKontino ? `KONTINO_${e.code}`.toUpperCase().slice(0, 60) : 'KONTINO_ERROR',
                 failure_message: motivo.slice(0, 500), updated_at: new Date().toISOString(),
             }).eq('id', transaction.id)
