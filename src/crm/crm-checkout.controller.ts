@@ -130,6 +130,25 @@ export class CrmCheckoutController {
     return result
   }
 
+  /** Ferramentas do painel liberadas para a loja (lista final dos interruptores). */
+  @Post('stores/:workspaceId/tools')
+  @Roles('admin')
+  @HttpCode(HttpStatus.OK)
+  async setStoreTools(
+    @Param('workspaceId') workspaceId: string,
+    @Req() req: any,
+    @Body() body: { tools?: unknown },
+  ) {
+    const ctx = ctxFromReq(req)
+    const result = await this.checkout.setStoreTools(workspaceId, body?.tools)
+    await logCheckoutAction(ctx, 'checkout.store_tools_changed', workspaceId, {
+      workspace_id: workspaceId,
+      previous_tools: result.previousTools,
+      tools: result.tools,
+    })
+    return result
+  }
+
   /**
    * Libera (ou corta) o provedor externo do seller: liberado, o painel dele em
    * Koopfy Payments mostra "Conecte seu provedor externo" e ele cola a chave da

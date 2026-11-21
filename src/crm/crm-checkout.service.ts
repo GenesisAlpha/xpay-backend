@@ -403,6 +403,23 @@ export class CrmCheckoutService {
   }
 
   /**
+   * Ferramentas do painel liberadas para a loja (anúncios, lojas, sites,
+   * automações, pedidos). Manda a lista final; o checkout descarta o que não
+   * conhece e devolve o que ficou gravado.
+   */
+  async setStoreTools(workspaceId: string, tools: unknown) {
+    const list = Array.isArray(tools) ? tools.map((tool) => String(tool ?? '').trim()).filter(Boolean) : []
+    const result = await checkoutInternal<{ workspaceId: string; previousTools: string[]; tools: string[] }>(
+      `admin/workspaces/${encodeURIComponent(workspaceId)}/tools`,
+      { tools: list },
+    )
+    if (result === null) {
+      throw new ServiceUnavailableException(checkoutFailureMessage('salvar as ferramentas da loja'))
+    }
+    return result
+  }
+
+  /**
    * Libera (ou corta) o modo provedor externo para o seller: com ele liberado, o
    * painel mostra "Conecte seu provedor externo" em Koopfy Payments e o seller
    * cola a chave da conta Whop dele — sem cadastro nem documentos da Koopfy.

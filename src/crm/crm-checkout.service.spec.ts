@@ -360,3 +360,21 @@ describe('provedor externo', () => {
     await expect(service.setExternalProvider('chk-x', true, { managerId: 'm-1' })).rejects.toThrow('e-mail')
   })
 })
+
+describe('setStoreTools', () => {
+  it('manda a lista final ao checkout e devolve o que ficou gravado', async () => {
+    respostas['admin/workspaces/w-1/tools'] = { workspaceId: 'w-1', previousTools: [], tools: ['ads', 'stores'] }
+
+    const result = await service.setStoreTools('w-1', ['ads', ' stores ', '', null])
+
+    expect(result.tools).toEqual(['ads', 'stores'])
+    const [url, init] = fetchMock.mock.calls.at(-1) as any
+    expect(String(url)).toBe('http://checkout.test/internal/admin/workspaces/w-1/tools')
+    expect(JSON.parse(init.body)).toEqual({ tools: ['ads', 'stores'] })
+  })
+
+  it('checkout fora do ar é 503, não um sucesso vazio', async () => {
+    const erro: any = await service.setStoreTools('w-1', ['ads']).catch(e => e)
+    expect(erro).toBeInstanceOf(ServiceUnavailableException)
+  })
+})
