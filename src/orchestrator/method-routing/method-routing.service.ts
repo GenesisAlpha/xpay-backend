@@ -39,9 +39,8 @@ export class MethodRoutingService {
 
   /**
    * Disponível = dá para tentar cobrar. Kaja ainda não tem integração (API e
-   * credenciais pendentes): fica configurável e é pulada. Whop/Stripe/PayPal/
-   * Slash/Clip dependem da conta do seller ou do pool dinâmico: o router decide
-   * por cobrança, então aqui contam como disponíveis.
+   * credenciais pendentes): fica configurável e é pulada. Clip depende do pool
+   * e da reserva: quem decide é a cobrança, então aqui conta como disponível.
    */
   availability(): ProviderAvailability {
     const stat = getActiveProviderAccounts() as Array<{ provider: string }>

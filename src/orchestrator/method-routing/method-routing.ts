@@ -28,12 +28,12 @@ export type PaymentMethodKey =
   | 'card' | 'apple_pay' | 'google_pay' | 'pix' | 'spei' | 'transfers_ar' | 'pse'
 
 /**
- * Catálogo exibido no Admin: o que cada método aceita e o rótulo. Desde 18/11
- * a Koopfy orquestra só dois provedores: Kaja Payments (cartão e carteiras) e
+ * Catálogo exibido no Admin: o que cada método aceita e o rótulo. A Koopfy
+ * orquestra Kaja Payments (cartão e carteiras), Clip (só cartão, no México) e
  * Kontino (trilhos locais, na conta conectada do seller).
  */
 export const METHOD_CATALOG: Record<PaymentMethodKey, { label: string; providers: RoutedProvider[] }> = {
-  card:         { label: 'Cartão',             providers: ['kaja'] },
+  card:         { label: 'Cartão',             providers: ['kaja', 'clip'] },
   apple_pay:    { label: 'Apple Pay',          providers: ['kaja'] },
   google_pay:   { label: 'Google Pay',         providers: ['kaja'] },
   pix:          { label: 'Pix',                providers: ['kontino'] },
@@ -43,7 +43,10 @@ export const METHOD_CATALOG: Record<PaymentMethodKey, { label: string; providers
 }
 
 /** Provedores em operação. Os demais ficam só para ler o histórico. */
-export const ACTIVE_PROVIDERS: ReadonlySet<RoutedProvider> = new Set(['kaja', 'kontino'])
+export const ACTIVE_PROVIDERS: ReadonlySet<RoutedProvider> = new Set(['kaja', 'kontino', 'clip'])
+
+/** País das contas Clip: fora dele a Clip não entra em nenhuma regra. */
+export const CLIP_COUNTRY = 'MX'
 
 /** Moeda fixa de cada trilho da Kontino. */
 export const KONTINO_CURRENCY: Partial<Record<PaymentMethodKey, string>> = {
@@ -58,7 +61,7 @@ export const PROVIDER_LABEL: Record<RoutedProvider, string> = {
 
 /**
  * Provedores que não usam o pool de contas do router: cobram por API própria,
- * antes do failover (Kontino: cobrança Connect; Clip SPEI: reserva de CLABE).
+ * antes do failover (Kontino: cobrança Connect).
  */
 export const DIRECT_PROVIDERS: ReadonlySet<RoutedProvider> = new Set(['kontino'])
 
@@ -176,5 +179,47 @@ export function validateRule(input: {
     const fixed = KONTINO_CURRENCY[method] ?? null
     if (fixed && upper(input.currency) !== fixed) return `Kontino cobra ${METHOD_CATALOG[method].label} só em ${fixed}.`
   }
+  // A conta Clip é mexicana e cobra em peso. O checkout ainda não sabe a moeda
+  // final ao escolher o formulário (para a Clip ela vira MXN), então a regra é
+  // pelo país, com a moeda em branco.
+  if (list.includes('clip')) {
+    if (upper(input.country) !== CLIP_COUNTRY) return 'A Clip atende só o México: use o país MX nesta regra.'
+    if (input.currency) return 'Deixe a moeda em branco: a Clip sempre cobra em MXN.'
+  }
   return null
+}
+
+/**
+ * Cartão na Clip só cobra com a reserva feita antes do formulário: o token do
+ * cartão nasce preso à conta reservada. Com reserva, a cobrança é da Clip mesmo
+ * que o endereço digitado tire o comprador da regra. Sem reserva, o formulário
+ * foi de outro provedor e a Clip sai da cadeia.
+ */
+export function rotaDoCartaoClip(
+  route: MethodRoute | null,
+  ctx: { method: unknown; temReserva: boolean; provedorPadrao?: string | null },
+): MethodRoute | null {
+  if (!route || normalizeMethod(ctx.method) !== 'card') return route
+  if (ctx.temReserva) {
+    if (!route.ruleId && ctx.provedorPadrao === 'clip') return route
+    return { ...route, ruleId: route.ruleId ?? 'reserva_clip', configured: ['clip'], chain: ['clip'], skipped: [] }
+  }
+  if (!route.chain.includes('clip')) return route
+  const skipped = [...route.skipped, { provider: 'clip', reason: 'Sem reserva de cartão' }]
+  const chain = route.chain.filter(p => p !== 'clip')
+  return chain.length
+    ? { ...route, chain, skipped }
+    : { ruleId: null, scope: 'legacy', configured: [], chain: [], skipped }
+}
+
+/**
+ * Métodos do checkout quando o cartão é da Clip: ela só atende cartão. SPEI e
+ * os outros trilhos locais ficam só para quem tem conta Kontino, que é quem os
+ * cobra.
+ */
+export function metodosComClip(metodos: string[], temContaKontino: boolean): string[] {
+  return metodos.filter(m => {
+    const key = normalizeMethod(m)
+    return key === 'card' || (temContaKontino && key in KONTINO_CURRENCY)
+  })
 }

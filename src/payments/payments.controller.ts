@@ -88,8 +88,10 @@ export class PaymentController {
     @Query('link') link?: string,
     // CSV de shopify,digistore24: contas por link que podem concorrer ao cartão (padrão: shopify).
     @Query('linkProviders') linkProviders?: string,
+    // País do comprador para a regra de cartão (ex.: México → Clip).
+    @Query('buyerCountry') buyerCountry?: string,
   ) {
-    return this.paymentService.getPaymentConfig(req.sellerId as string, { routingKey, country, currency, link, linkProviders });
+    return this.paymentService.getPaymentConfig(req.sellerId as string, { routingKey, country, currency, link, linkProviders, buyerCountry });
   }
 
   // ─── Contas por link no roteamento (lojas Shopify, Digistore24) ────────

@@ -41,9 +41,11 @@ describe('resposta ao checkout dos trilhos novos', () => {
   })
 })
 
-describe('catálogo só com Kaja e Kontino', () => {
-  it('nenhum método aceita provedor fora de Kaja e Kontino', () => {
-    for (const m of Object.values(METHOD_CATALOG)) for (const p of m.providers) expect(['kaja', 'kontino']).toContain(p)
+describe('catálogo com Kaja, Kontino e Clip só no cartão', () => {
+  it('nenhum método aceita provedor fora do catálogo, e a Clip só entra no cartão', () => {
+    for (const [method, m] of Object.entries(METHOD_CATALOG)) {
+      for (const p of m.providers) expect(method === 'card' ? ['kaja', 'clip'] : ['kaja', 'kontino']).toContain(p)
+    }
     expect(validateRule({ method: 'pix', providers: ['kontino', 'whop'] })).toMatch(/não atende/)
   })
 

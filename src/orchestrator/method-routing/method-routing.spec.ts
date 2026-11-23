@@ -1,4 +1,4 @@
-import { normalizeMethod, pickRule, resolveMethodRoute, validateRule, type MethodRouteRule } from './method-routing'
+import { metodosComClip, normalizeMethod, pickRule, resolveMethodRoute, rotaDoCartaoClip, validateRule, type MethodRoute, type MethodRouteRule } from './method-routing'
 
 const rule = (over: Partial<MethodRouteRule>): MethodRouteRule => ({
   id: over.id ?? 'r', method: 'card', country: null, currency: null, seller_id: null, providers: ['stripe'], enabled: true, ...over,
@@ -71,5 +71,54 @@ describe('failover com a cadeia da regra', () => {
   })
   it('respeita o limite de saltos', () => {
     expect(buildFailoverOrder({ chain: ['stripe', 'whop', 'rox_pay', 'setinel_gate'] }).length).toBe(3)
+  })
+})
+
+describe('Clip só no cartão', () => {
+  const rota = (over: Partial<MethodRoute> = {}): MethodRoute => ({
+    ruleId: 'r', scope: 'country', configured: ['clip'], chain: ['clip'], skipped: [], ...over,
+  })
+
+  it('entra em regra de cartão do México, sem moeda', () => {
+    expect(validateRule({ method: 'card', country: 'MX', providers: ['clip'] })).toBeNull()
+    expect(validateRule({ method: 'card', country: 'mx', providers: ['clip', 'kaja'] })).toBeNull()
+  })
+
+  it('fora do México, com moeda ou em outro método é recusada', () => {
+    expect(validateRule({ method: 'card', providers: ['clip'] })).toContain('México')
+    expect(validateRule({ method: 'card', country: 'BR', providers: ['clip'] })).toContain('México')
+    expect(validateRule({ method: 'card', country: 'MX', currency: 'MXN', providers: ['clip'] })).toContain('moeda')
+    for (const method of ['spei', 'apple_pay', 'google_pay', 'pix']) {
+      expect(validateRule({ method, country: 'MX', providers: ['clip'] })).toContain('não atende')
+    }
+  })
+
+  it('com reserva, o cartão fica na Clip mesmo fora da regra', () => {
+    const r = rotaDoCartaoClip(rota({ configured: ['kaja'], chain: ['kaja'] }), { method: 'credit_card', temReserva: true })
+    expect(r?.chain).toEqual(['clip'])
+    expect(rotaDoCartaoClip(rota({ ruleId: null, scope: 'legacy', chain: [], configured: [] }), { method: 'card', temReserva: true })?.chain).toEqual(['clip'])
+  })
+
+  it('seller com Clip padrão e sem regra segue pelo caminho antigo', () => {
+    const legada = rota({ ruleId: null, scope: 'legacy', chain: [], configured: [] })
+    expect(rotaDoCartaoClip(legada, { method: 'card', temReserva: true, provedorPadrao: 'clip' })).toBe(legada)
+  })
+
+  it('sem reserva, a Clip sai da cadeia e sobra a reserva ou o provedor do seller', () => {
+    expect(rotaDoCartaoClip(rota({ chain: ['clip', 'kaja'] }), { method: 'card', temReserva: false })?.chain).toEqual(['kaja'])
+    const semOutro = rotaDoCartaoClip(rota(), { method: 'card', temReserva: false })
+    expect(semOutro?.ruleId).toBeNull()
+    expect(semOutro?.scope).toBe('legacy')
+  })
+
+  it('não mexe em outros métodos', () => {
+    const r = rota({ configured: ['kontino'], chain: ['kontino'] })
+    expect(rotaDoCartaoClip(r, { method: 'spei', temReserva: true })).toBe(r)
+  })
+
+  it('checkout com Clip: só cartão, e trilhos locais só com conta Kontino', () => {
+    const m = ['credit_card', 'apple_pay', 'google_pay', 'spei', 'mbway']
+    expect(metodosComClip(m, false)).toEqual(['credit_card'])
+    expect(metodosComClip(m, true)).toEqual(['credit_card', 'spei'])
   })
 })

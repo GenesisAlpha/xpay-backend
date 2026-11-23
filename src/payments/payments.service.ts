@@ -33,7 +33,7 @@ import { WhopProvider, type WhopMembershipState } from '../orchestrator/provider
 import { customerSubscriptionView, isSubscriptionTransaction } from './customer-subscription'
 import { SLASH_CURRENCIES } from '../orchestrator/providers/slash.provider'
 import { MethodRoutingService } from '../orchestrator/method-routing/method-routing.service'
-import { DIRECT_PROVIDERS } from '../orchestrator/method-routing/method-routing'
+import { CLIP_COUNTRY, DIRECT_PROVIDERS, metodosComClip, rotaDoCartaoClip } from '../orchestrator/method-routing/method-routing'
 import { ErroKontino, KONTINO_METODOS, bancosPse, criarCobranca, ehMetodoKontino, kontinoConfigurado, respostaAoCheckout, toKontinoOwnAccountId, type MetodoKontino } from '../orchestrator/kontino/kontino'
 import { kontinoPelaContaDoSeller } from '../orchestrator/kontino/kontino-seller'
 import { dadosDoPagadorKontino } from '../orchestrator/kontino/pagador'
@@ -84,6 +84,8 @@ interface SettlementPayload {
 
 // Minutos que uma reserva de CARTÃO sobrevive sem virar cobrança.
 const CARD_HOLD_TTL_MIN = Number(process.env.CLIP_CARD_HOLD_TTL_MIN ?? 25)
+// Decisão de 23/11/2026: Clip só no cartão.
+const CLIP_SPEI_ATIVO = false as boolean
 
 // Resumo do erro do provider guardado na transação: código, tipo, mensagem e o
 // que foi enviado — nunca o corpo inteiro, que pode trazer dado do comprador.
@@ -237,7 +239,7 @@ export class PaymentService {
         // cartão → Kaja). Com regra, a cabeça da cadeia substitui o antigo
         // seller.provider_default em TODA decisão abaixo; sem regra, nada muda.
         // Upsell segue a compra-mãe (conta já decidida).
-        const methodRoute = !upsellParent && this.methodRouting
+        const rotaDaRegra = !upsellParent && this.methodRouting
             ? await this.methodRouting.resolve({
                 method: dto.method,
                 country: dto.billing_address?.country ?? dto.customer?.country ?? (dto.method === 'mbway' ? 'PT' : null),
@@ -248,6 +250,11 @@ export class PaymentService {
                 return null
             })
             : null
+        const methodRoute = rotaDoCartaoClip(rotaDaRegra, {
+            method: dto.method,
+            temReserva: Boolean(dto.payment_data?.clipReservationId),
+            provedorPadrao: this.normalizeProviderName(seller?.provider_default),
+        })
         const routedByMethod = Boolean(methodRoute?.ruleId)
         if (routedByMethod && methodRoute!.chain.length === 0) {
             console.error(
@@ -597,6 +604,12 @@ export class PaymentService {
         // abre o modal de instruções e a transação permanece pending até o
         // comprovante ser analisado.
         if (effectiveProvider === 'clip' && dto.method === 'spei') {
+            // A Clip atende só cartão: SPEI é da Kontino. O bloco abaixo fica
+            // para ler o desenho antigo; comprovantes já enviados seguem em
+            // speiReceipt.
+            if (!CLIP_SPEI_ATIVO) {
+                throw new BadRequestException('SPEI indisponível no momento. Selecione outro método.')
+            }
             if (String(currency).toUpperCase() !== 'MXN') {
                 throw new BadRequestException('SPEI está disponível apenas em MXN.')
             }
@@ -1632,7 +1645,16 @@ export class PaymentService {
         if (!seller || seller.status !== 'active') {
             throw new ForbiddenException('Seller não está ativo para receber pagamentos.')
         }
-        if (this.normalizeProviderName(seller.provider_default) !== 'clip') {
+        if (method !== 'card') {
+            throw new BadRequestException('A Clip atende só cartão.')
+        }
+        // Clip como provedor padrão do seller ou pela regra de cartão do México.
+        const clipPadrao = this.normalizeProviderName(seller.provider_default) === 'clip'
+        const clipPorRegra = !clipPadrao && (await this.cardProviderByMethod(sellerId, {
+            country: CLIP_COUNTRY,
+            riskLevel: seller.risk_level ?? null,
+        })).provider === 'clip'
+        if (!clipPadrao && !clipPorRegra) {
             throw new ForbiddenException('Provider Clip não está configurado para este seller.')
         }
 
@@ -1656,38 +1678,9 @@ export class PaymentService {
         // Precedência: o que a origem declarou → cadastro do seller → MX.
         // Sellers antigos não têm country, e sem o último degrau eles parariam
         // de rotear de um dia para o outro.
-        const country = String(body?.country ?? seller.country ?? 'MX').toUpperCase()
-        const currency = String(body?.currency ?? 'MXN').toUpperCase()
-
-        if (method === 'spei') {
-            const hold = await this.clipAccounts.holdSpei({
-                amountMinor, externalReference, sellerId, country, currency,
-                riskLevel: riskLevel as 'WHITE' | 'GRAY',
-            })
-            // Sem capacidade NÃO é erro transitório: é o teto funcionando. Um
-            // 503 aqui faria o front dar retry e martelar um pool cheio.
-            if (!hold) return { available: false, method: 'spei' as const }
-
-            return {
-                available: true,
-                method: 'spei' as const,
-                reservation_id: hold.reservation_id,
-                account_id: hold.account_id,
-                clabe: hold.clabe,
-                banco: hold.banco,
-                beneficiario: hold.beneficiario,
-                // ⚠️ O VALOR A COBRAR É ESTE, não o que o front calculou.
-                // Os centavos são únicos por pedido (ver gw_hold_spei): sem
-                // API, o valor no extrato é a ÚNICA chave de conciliação, e
-                // dois pedidos do mesmo valor na mesma CLABE no mesmo dia são
-                // indistinguíveis para sempre.
-                charge_minor: hold.charge_minor,
-            }
-        }
-
-        if (method !== 'card') {
-            throw new BadRequestException(`Método Clip não suportado: ${method}.`)
-        }
+        // Pela regra, o país é o da regra: o cadastro do seller pode ser outro.
+        const country = clipPorRegra ? CLIP_COUNTRY : String(body?.country ?? seller.country ?? 'MX').toUpperCase()
+        const currency = clipPorRegra ? 'MXN' : String(body?.currency ?? 'MXN').toUpperCase()
 
         // ⚠️ TTL CURTO NO CARTÃO — 3h era herança do SPEI e está errado aqui.
         // O SPEI precisa de horas: o comprador sai para o app do banco. O cartão
@@ -1801,7 +1794,7 @@ export class PaymentService {
      */
     private async cardProviderByMethod(
         sellerId: string,
-        opts: { country?: string | null; currency?: string | null },
+        opts: { country?: string | null; currency?: string | null; riskLevel?: string | null },
     ): Promise<{ routed: boolean; provider: string | null }> {
         if (!this.methodRouting) return { routed: false, provider: null }
         const route = await this.methodRouting.resolve({
@@ -1809,9 +1802,18 @@ export class PaymentService {
         }).catch(() => null)
         if (!route?.ruleId) return { routed: false, provider: null }
         for (const candidate of route.chain.filter(p => !DIRECT_PROVIDERS.has(p))) {
-            const account = await this.accountRouter.getAccountByProvider({ sellerId, provider: candidate }).catch(() => null)
+            // Na Clip o risco decide a conta (a reserva filtra por ele): sem conta
+            // do nível do seller, o formulário abriria e não reservaria.
+            const account = await this.accountRouter.getAccountByProvider({
+                sellerId,
+                provider: candidate,
+                ...(candidate === 'clip' ? { riskLevel: opts.riskLevel ?? null } : {}),
+            }).catch(() => null)
             if (account) return { routed: true, provider: candidate }
         }
+        // Regra só de Clip e nenhuma conta do nível de risco deste seller: ele
+        // segue no provedor dele, em vez de perder o cartão.
+        if (route.chain.length && route.chain.every(p => p === 'clip')) return { routed: false, provider: null }
         console.error(`[PaymentService] cartão sem provedor com conta para o seller ${sellerId} na regra ${route.ruleId}`)
         return { routed: true, provider: null }
     }
@@ -1922,11 +1924,11 @@ export class PaymentService {
         // session) e, quando o checkout já sabe, país/moeda para os filtros.
         // `linkProviders` (CSV de shopify,digistore24): quais contas por link
         // podem concorrer ao cartão; sem ele, só Shopify (como antes).
-        routingOpts: { routingKey?: string | null; country?: string | null; currency?: string | null; link?: string | null; linkProviders?: string | null } = {},
+        routingOpts: { routingKey?: string | null; country?: string | null; currency?: string | null; link?: string | null; linkProviders?: string | null; buyerCountry?: string | null } = {},
     ) {
         const { data: seller } = await supabase
             .from('seller_profiles')
-            .select('status, provider_default, enabled_methods, provider_mid, config')
+            .select('status, provider_default, enabled_methods, provider_mid, config, risk_level')
             .eq('id', sellerId)
             .maybeSingle()
 
@@ -1950,7 +1952,13 @@ export class PaymentService {
         // Provedor por método: com regra para cartão, o formulário é o do
         // primeiro provedor da cadeia que tem conta para este seller — a mesma
         // ordem que createPayment percorre. Sem regra, o provider_default.
-        const cardByMethod = ownStripe ? null : await this.cardProviderByMethod(sellerId, routingOpts)
+        const cardByMethod = ownStripe ? null : await this.cardProviderByMethod(sellerId, {
+            // `buyerCountry` é o país do comprador; `country` segue sendo só o
+            // filtro das contas do roteamento do seller.
+            country: routingOpts.buyerCountry ?? routingOpts.country ?? null,
+            currency: routingOpts.currency ?? null,
+            riskLevel: seller.risk_level ?? null,
+        })
         const provider = ownStripe
             ? 'stripe'
             : cardByMethod?.routed
@@ -2017,7 +2025,13 @@ export class PaymentService {
         const legacy = {
             active: await sellerMayOperate({ id: sellerId, status: seller.status }),
             provider, // ex.: 'setinel_gate' | 'approvebly' | 'coinflow' | 'stripe'
-            methods: ownStripe ? await stripeMethods(ownStripe) : approved || ownCard ? sellerMethods : [],
+            methods: ownStripe
+                ? await stripeMethods(ownStripe)
+                : !(approved || ownCard)
+                    ? []
+                    : provider === 'clip'
+                        ? metodosComClip(sellerMethods, Boolean(seller.config?.kontino_account_id))
+                        : sellerMethods,
             providerConfig: provider
                 ? this.buildProviderPublicConfig(provider, mid, seller.config, stripeAccount, whopAccount)
                 : null,
