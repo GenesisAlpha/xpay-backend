@@ -28,7 +28,7 @@ jest.mock('../../lib/supabase.client', () => ({
   },
 }))
 
-import { conectarContaExistente, configComConta, contaKontinoMudou, estadoKontino, iniciarContaKontino, kontinoPelaContaDoSeller, mascararEmail } from './kontino-seller'
+import { cancelarPedidoDeConexao, conectarContaExistente, configComConta, contaKontinoMudou, estadoKontino, iniciarContaKontino, kontinoPelaContaDoSeller, linkDoPedidoDeConexao, mascararEmail } from './kontino-seller'
 import type { ContaKontino } from './kontino'
 
 const conta = (o: Partial<ContaKontino> = {}): ContaKontino => ({
@@ -256,5 +256,72 @@ describe('conectar conta Kontino existente pelo e-mail do titular', () => {
 
   it('mascara o e-mail', () => {
     expect(mascararEmail('financeiro@empresa.com')).toBe('fi***@empresa.com')
+  })
+
+  it('guarda que o pedido foi por e-mail (o painel mostra "aguardando o titular")', async () => {
+    linhas['seller-1'] = { id: 'seller-1', config: {} }
+    respostas = [
+      ok(conta({ id: 'acct_ex', connection_type: 'connect_existing', email: 'financeiro@empresa.com', external_id: null })),
+      ok({ expires_at: null, emailed_to: 'fi***@empresa.com' }),
+    ]
+    const r = await conectarContaExistente({ sellerId: 'seller-1', email: 'financeiro@empresa.com' })
+    expect(linhas['seller-1'].config.kontino).toMatchObject({ por_email: true, email_mascarado: 'fi***@empresa.com' })
+    expect(r.state.account).toMatchObject({ byEmail: true, emailMasked: 'fi***@empresa.com', inReview: false })
+  })
+
+  it('manda a empresa do cadastro único (tax_id) para a Kontino comparar com o titular', async () => {
+    linhas['seller-1'] = {
+      id: 'seller-1',
+      config: { cadastro: { version: 2, envio: { type: 'business', country: 'BR', business: { tax_id: '12.345.678/0001-90' } } } },
+    }
+    respostas = [ok(conta({ id: 'acct_ex', connection_type: 'connect_existing', email: 'f@e.com' })), ok({ expires_at: null, emailed_to: 'f***@e.com' })]
+    await conectarContaExistente({ sellerId: 'seller-1', email: 'f@e.com' })
+    expect(corpo(0)).toMatchObject({ type: 'business', country: 'BR', tax_id: '12.345.678/0001-90', existing_only: true })
+  })
+
+  it('sem e-mail: reenvia o pedido que já espera o titular', async () => {
+    linhas['seller-1'] = { id: 'seller-1', config: { kontino: { connection_id: 'acct_ex', status: 'pending', por_email: true } } }
+    respostas = [ok(conta({ id: 'acct_ex', connection_type: 'connect_existing', email: 'financeiro@empresa.com' })), ok({ expires_at: null, emailed_to: 'fi***@empresa.com' })]
+    const r = await conectarContaExistente({ sellerId: 'seller-1', email: '' })
+    expect(chamadas.map((c) => c.url.replace(/^.*\/v1/, ''))).toEqual(['/accounts/acct_ex', '/account_links'])
+    expect(r.emailedTo).toBe('fi***@empresa.com')
+  })
+
+  it('sem e-mail e sem pedido pendente: pede o e-mail', async () => {
+    linhas['seller-1'] = { id: 'seller-1', config: {} }
+    await expect(conectarContaExistente({ sellerId: 'seller-1', email: '' })).rejects.toThrow('Informe o e-mail')
+  })
+
+  it('link do pedido para mandar por outro canal', async () => {
+    linhas['seller-1'] = { id: 'seller-1', config: { kontino: { connection_id: 'acct_ex', status: 'pending', por_email: true } } }
+    respostas = [
+      ok(conta({ id: 'acct_ex', connection_type: 'connect_existing' })),
+      ok({ url: 'https://kontino.co/conectar?t=abc', expires_at: '2026-11-26T00:00:00Z', type: 'connect_existing', account: 'acct_ex' }),
+    ]
+    const r = await linkDoPedidoDeConexao('seller-1')
+    expect(chamadas[1].url).toMatch(/\/accounts\/acct_ex\/onboarding_links$/)
+    expect(r.url).toBe('https://kontino.co/conectar?t=abc')
+  })
+
+  it('cancelar o pedido desfaz a conexão e tira do seller (não vira "conexão encerrada")', async () => {
+    linhas['seller-1'] = { id: 'seller-1', config: { outra: 1, kontino: { connection_id: 'acct_ex', status: 'pending', por_email: true } } }
+    respostas = [ok(conta({ id: 'acct_ex', connection_type: 'connect_existing' })), ok(conta({ id: 'acct_ex', status: 'disconnected' }))]
+    const v = await cancelarPedidoDeConexao('seller-1')
+    expect(chamadas[1].url).toMatch(/\/accounts\/acct_ex\/disconnect$/)
+    expect(linhas['seller-1'].config).toEqual({ outra: 1 })
+    expect(v.account).toBeNull()
+  })
+
+  it('cancelar sem pedido pendente: recusa', async () => {
+    linhas['seller-1'] = { id: 'seller-1', config: { kontino: { connection_id: 'acct_1', status: 'active' } } }
+    respostas = [ok(conta({ status: 'active' }))]
+    await expect(cancelarPedidoDeConexao('seller-1')).rejects.toThrow('Não há pedido')
+  })
+
+  it('conferência do time Kontino aparece como inReview', async () => {
+    linhas['seller-1'] = { id: 'seller-1', config: { kontino: { connection_id: 'acct_ex', status: 'pending', por_email: true } } }
+    respostas = [ok(conta({ id: 'acct_ex', connection_type: 'connect_existing', requirements: { currently_due: [], pending_verification: ['kontino_review'], errors: [] } }))]
+    const v = await estadoKontino('seller-1')
+    expect(v.account).toMatchObject({ inReview: true, verifying: true, byEmail: true })
   })
 })

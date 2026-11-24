@@ -83,10 +83,20 @@ export class CadastroService {
     const cad = cadastroV2(s?.config)
     let conta: ContaKontinoResumo = null
     // Conta Kontino de seller aprovado (cadastro único ou aprovado no fluxo antigo).
-    if (s && s.status === 'active' && s.config?.kontino?.connection_id) {
+    // Pedido de conexão por e-mail: lido também antes da aprovação (o seller acompanha o titular).
+    if (s && s.config?.kontino?.connection_id && (s.status === 'active' || s.config.kontino.por_email)) {
       const v = await estadoKontino(s.id)
       conta = v.account
-        ? { status: v.account.status, connectionType: v.account.connectionType, requirements: v.account.requirements, verifying: v.account.verifying, errors: v.account.errors }
+        ? {
+            status: v.account.status,
+            connectionType: v.account.connectionType,
+            requirements: v.account.requirements,
+            verifying: v.account.verifying,
+            errors: v.account.errors,
+            byEmail: v.account.byEmail,
+            inReview: v.account.inReview,
+            emailMasked: v.account.emailMasked,
+          }
         : null
     }
     return estadoDoCadastro({

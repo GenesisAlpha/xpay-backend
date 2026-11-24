@@ -6,7 +6,7 @@ import { supabase } from '../lib/supabase.client'
 import { CurrencyService } from '../currency/currency.service'
 import { WalletService } from '../wallets/wallet.service'
 import { AccountRouterService } from '../orchestrator/router/account-router.service'
-import { DEFAULT_FEE_SETTINGS, calculateSaleFees, getEffectiveSellerFees, saleFeePct } from '../shared/fee.calculator'
+import { DEFAULT_FEE_SETTINGS, calculateSaleFees, getEffectiveSellerFees, saleFeePct, ehMetodoLocal } from '../shared/fee.calculator'
 import { sellerMayOperate } from '../orchestrator/whop/whop-linked.service'
 import { ownAccountCommissionPct, resolveOwnSale } from '../orchestrator/seller-provider/seller-provider-accounts.service'
 import {
@@ -415,7 +415,8 @@ export class PaymentService {
             }
             : await getEffectiveSellerFees(effectiveSellerId)
         const currencyConverted = String(currency).toUpperCase() !== 'USD'
-        const saleFees = calculateSaleFees(Math.round(fx.grossUSD * 100), sellerFees, { currencyConverted })
+        // Pix, SPEI, Transferencias 3.0 e PSE: processamento próprio, se o time definiu (a Kontino cobra o dela à parte).
+        const saleFees = calculateSaleFees(Math.round(fx.grossUSD * 100), sellerFees, { currencyConverted, localMethod: ehMetodoLocal(dto.method) })
         __mark('calculateSaleFees')
         const grossUSDcents = saleFees.grossCents
         // Venda na conta do seller: o checkout acumula esta comissão (USD) em

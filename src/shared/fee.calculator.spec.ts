@@ -143,3 +143,23 @@ describe('seller_fees rows', () => {
     expect(fees).toMatchObject({ processingFeePct: 7, checkoutFeePct: 0, orchestrationFeePct: 0.5, feeFixedUsd: 0, reservePercentage: 0, chargebackFeeUsd: 0 })
   })
 })
+
+describe('processamento nos métodos locais', () => {
+  it('sem taxa própria: Pix paga o mesmo do cartão', () => {
+    const a = calculateSaleFees(10000, DEFAULT_FEE_SETTINGS, { currencyConverted: false, localMethod: true })
+    const b = calculateSaleFees(10000, DEFAULT_FEE_SETTINGS, { currencyConverted: false })
+    expect(a.platformFeeCents).toBe(b.platformFeeCents)
+  })
+  it('com taxa própria: só o processamento muda, e só no método local', () => {
+    const fees = { ...DEFAULT_FEE_SETTINGS, localProcessingFeePct: 1 }
+    // 1,9% + 1% + 0,9% + US$ 0,59 sobre US$ 100
+    expect(calculateSaleFees(10000, fees, { currencyConverted: false, localMethod: true }).platformFeeCents).toBe(190 + 100 + 90 + 59)
+    expect(calculateSaleFees(10000, fees, { currencyConverted: false }).platformFeeCents).toBe(190 + 890 + 90 + 59)
+  })
+  it('a coluna só vai na escrita quando definida, e volta da linha', () => {
+    expect(sellerFeesRow(DEFAULT_FEE_SETTINGS)).not.toHaveProperty('local_processing_fee_pct')
+    expect(sellerFeesRow({ ...DEFAULT_FEE_SETTINGS, localProcessingFeePct: 1.5 })).toMatchObject({ local_processing_fee_pct: 1.5 })
+    expect(sellerFeesFromRow({ processing_fee_pct: 8.9, local_processing_fee_pct: '1.5' }).localProcessingFeePct).toBe(1.5)
+    expect(sellerFeesFromRow({ processing_fee_pct: 8.9 }).localProcessingFeePct).toBeNull()
+  })
+})

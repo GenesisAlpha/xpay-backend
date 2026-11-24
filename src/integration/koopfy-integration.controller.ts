@@ -187,6 +187,20 @@ export class KoopfyIntegrationController {
     return this.svc.kontinoConnectExisting(req.tokenEmail, req.accountSellerId ?? null, body ?? {});
   }
 
+  /** Link do pedido de conexão (para mandar ao titular por WhatsApp etc.). */
+  @Post('kontino/connect-existing/link')
+  @UseGuards(CrossServiceTokenGuard)
+  kontinoConnectExistingLink(@Req() req: any, @Body() body: any) {
+    return this.svc.kontinoConnectExistingLink(req.tokenEmail, req.accountSellerId ?? null, body ?? {});
+  }
+
+  /** Cancela o pedido de conexão que espera o titular. */
+  @Post('kontino/connect-existing/cancel')
+  @UseGuards(CrossServiceTokenGuard)
+  kontinoConnectExistingCancel(@Req() req: any) {
+    return this.svc.kontinoConnectExistingCancel(req.tokenEmail, req.accountSellerId ?? null);
+  }
+
   // ─── Provedor externo (conta Whop do próprio seller) ───────────────────────
   // Liberado para todos; o CRM só corta.
 

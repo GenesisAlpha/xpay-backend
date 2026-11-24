@@ -30,7 +30,7 @@ import { StripeRiskService } from '../orchestrator/stripe/stripe-risk.service'
 import { StripeEfwService } from '../orchestrator/stripe/stripe-efw.service'
 import { AffiliateRiskService } from '../orchestrator/stripe/affiliate-risk.service'
 import { CurrencyService } from '../currency/currency.service'
-import { calculateSaleFees, getEffectiveSellerFees } from '../shared/fee.calculator'
+import { calculateSaleFees, ehMetodoLocal, getEffectiveSellerFees } from '../shared/fee.calculator'
 import {
   isWhopRenewalPayment,
   renewalEconomics,
@@ -2791,6 +2791,7 @@ export class WebhookService {
     }
     const fees = calculateSaleFees(gross, await getEffectiveSellerFees(tx.seller_id), {
       currencyConverted: String(tx.currency ?? '').toUpperCase() !== 'USD',
+      localMethod: ehMetodoLocal((tx as any).method),
     })
     const patch = {
       fee: fees.platformFeeCents,

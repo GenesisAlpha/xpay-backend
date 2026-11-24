@@ -276,6 +276,8 @@ export type EtapaKontino =
   | 'review'
   | 'unavailable'
   | 'setup'            // aprovado no fluxo antigo, sem conta Kontino: o seller abre a dele
+  | 'awaiting_holder'  // pedido de conexão enviado por e-mail: quem autoriza é o titular da conta Kontino
+  | 'kontino_review'   // conexão autorizada esperando a conferência do time Kontino (titular e taxas)
 
 export type EstadoCadastro = {
   eligible: boolean
@@ -284,7 +286,7 @@ export type EstadoCadastro = {
   reviewedAt: string | null
   rejectionReason: string | null
   summary: { type: 'business' | 'individual'; country: string; name: string; taxId: string } | null
-  kontino: { stage: EtapaKontino; message: string | null; bankUrl: string | null }
+  kontino: { stage: EtapaKontino; message: string | null; bankUrl: string | null; emailMasked: string | null }
   capabilities: { card: boolean; local: boolean; payouts: 'locked' | 'held' | 'enabled' }
   prefill: { email: string; name: string | null }
 }
@@ -296,6 +298,11 @@ export type ContaKontinoResumo = {
   requirements: string[]
   verifying: boolean
   errors: string[]
+  /** Pedido de conexão por e-mail a um titular. */
+  byEmail?: boolean
+  /** Esperando a conferência do time Kontino. */
+  inReview?: boolean
+  emailMasked?: string | null
 } | null
 
 const MENSAGENS: Partial<Record<EtapaKontino, string>> = {
@@ -310,6 +317,8 @@ const MENSAGENS: Partial<Record<EtapaKontino, string>> = {
   review: 'Nossa equipe está cuidando da sua conta de recebimento e fala com você em breve.',
   unavailable: 'A conta de recebimento estará disponível em breve.',
   setup: 'Abra sua conta de recebimento na Kontino para ligar Pix e SPEI e receber nela.',
+  awaiting_holder: 'Pedido de conexão enviado ao titular da conta Kontino. A conta fica ligada aqui depois que ele autorizar e a Kontino conferir.',
+  kontino_review: 'O titular autorizou. A Kontino está conferindo a conexão (titular e taxas) e avisa quando liberar.',
 }
 
 /** Etapa da Kontino a partir da conexão e do andamento. Puro: testável sem banco. */
@@ -321,6 +330,9 @@ export function etapaKontino(i: {
   /** Aprovado no fluxo antigo, sem o cadastro único: não há pacote para a Koopfy enviar. */
   legado?: boolean
 }): EtapaKontino {
+  // Pedido por e-mail a um titular: o estado dele vale mesmo antes da aprovação da Koopfy.
+  const p = i.conta
+  if (p?.byEmail && p.status === 'pending' && p.connectionType === 'connect_existing') return p.inReview ? 'kontino_review' : p.verifying ? 'verifying' : 'awaiting_holder'
   if (!i.aprovado) return 'waiting'
   if (!i.configurado) return 'unavailable'
   const c = i.conta
@@ -329,6 +341,7 @@ export function etapaKontino(i: {
   if (c.status === 'rejected' || c.status === 'disabled') return 'rejected'
   if (c.status === 'disconnected') return 'review'
   if (i.andamento?.etapa === 'equipe') return 'review'
+  if (c.inReview) return 'kontino_review'
   if (c.connectionType === 'connect_existing') return 'authorize'
   if (c.requirements.includes('tos_acceptance')) return 'terms'
   // Pacote ainda não entregue à Kontino (nova tentativa agendada).
@@ -394,7 +407,8 @@ export function estadoDoCadastro(i: {
   const aprovado = stage === 'approved'
   // Aprovado no fluxo antigo (sem cadastro único): sem pacote para enviar à Kontino.
   const legado = !enviado && aprovado
-  const etapa = enviado || legado ? etapaKontino({ aprovado, configurado: i.configurado, conta: i.conta, andamento: i.andamento, legado }) : 'waiting'
+  const porEmail = !!i.conta?.byEmail
+  const etapa = enviado || legado || porEmail ? etapaKontino({ aprovado, configurado: i.configurado, conta: i.conta, andamento: i.andamento, legado }) : 'waiting'
   const local = aprovado && (etapa === 'active' || i.contaAtiva)
   return {
     eligible: i.eligible,
@@ -405,7 +419,12 @@ export function estadoDoCadastro(i: {
     summary: c
       ? { type: c.envio.type, country: c.envio.country, name: nomeDoEnvio(c.envio), taxId: documentoMascarado(documentoDoEnvio(c.envio)) }
       : null,
-    kontino: { stage: etapa, message: mensagemKontino(etapa, i.conta, legado), bankUrl: etapa === 'active' ? i.bankUrl : null },
+    kontino: {
+      stage: etapa,
+      message: mensagemKontino(etapa, i.conta, legado),
+      bankUrl: etapa === 'active' ? i.bankUrl : null,
+      emailMasked: porEmail ? (i.conta?.emailMasked ?? null) : null,
+    },
     // Repasse retido só no cadastro único (até a Kontino verificar); o aprovado antigo saca como sempre.
     capabilities: { card: aprovado, local, payouts: !aprovado ? 'locked' : local || legado ? 'enabled' : 'held' },
     prefill: { email: i.email, name: i.nome },

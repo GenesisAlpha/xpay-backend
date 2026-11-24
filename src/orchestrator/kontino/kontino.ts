@@ -277,6 +277,8 @@ export type ContaKontino = {
   requirements?: unknown
   /** A empresa (país + documento fiscal) já tinha conta Kontino: só o status, sem dados dela. */
   existing_company?: { status: 'active' | 'verifying' | 'action_required' | 'rejected' | 'closed' | string } | null
+  /** Só no GET /accounts/:id: o que o cliente paga na Kontino (preço do parceiro ou o desta conta, definido na conferência). */
+  pricing?: { custom: boolean; rates: Array<{ method: string; percent_bps: number; fixed_cents: number }> } | null
 }
 
 export type LinkDaContaKontino = { url: string; expires_at: string; type: string; account: string }
@@ -324,11 +326,14 @@ export function conectarContaKontinoExistente(i: {
   tipo: 'individual' | 'business'
   pais: string
   retorno?: string | null
+  /** Documento fiscal da empresa do cadastro: a Kontino avisa o time se o titular for outra empresa. */
+  documento?: string | null
 }) {
   return chamar<ContaKontino>('POST', '/accounts', {
     email: i.email,
     type: i.tipo,
     country: i.pais.toUpperCase(),
+    ...(i.tipo === 'business' && i.documento ? { tax_id: i.documento } : {}),
     existing_only: true,
     metadata: { koopfy_seller_id: i.sellerId },
     ...(i.retorno ? { return_url: i.retorno } : {}),

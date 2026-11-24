@@ -3,7 +3,7 @@
 import { BadRequestException } from '@nestjs/common'
 import { DEFAULT_FEE_SETTINGS, type FeeSettings } from '../shared/fee.calculator'
 
-type NumericFeeKey = Exclude<keyof FeeSettings, 'anticipationEnabled'>
+type NumericFeeKey = Exclude<keyof FeeSettings, 'anticipationEnabled' | 'localProcessingFeePct'>
 
 interface FeeField {
   key: NumericFeeKey
@@ -30,6 +30,12 @@ export const FEE_FIELDS: FeeField[] = [
   { key: 'payoutFxFeePct', column: 'payout_fx_fee_pct', min: 0, max: 20, label: 'Spread de saque em outra moeda (%)' },
   { key: 'anticipationFeePct', column: 'anticipation_fee_pct', min: 0, max: 50, label: 'Taxa de antecipação (%)' },
 ]
+
+/**
+ * Processamento nos métodos locais (Pix, SPEI, Transferencias 3.0, PSE). Em
+ * branco = o mesmo do cartão. `null` explícito limpa.
+ */
+export const LOCAL_FEE_FIELD = { key: 'localProcessingFeePct' as const, column: 'local_processing_fee_pct', min: 0, max: 50, label: 'Processamento em métodos locais (%)' }
 
 /** Liga/desliga por seller. */
 export const FEE_TOGGLES: Array<{ key: 'anticipationEnabled'; column: string; label: string }> = [
@@ -61,6 +67,18 @@ export function parseFeeSettings(input: unknown, base: FeeSettings = DEFAULT_FEE
     result[field.key] = Math.round(value * 100) / 100
   }
 
+  {
+    const f = LOCAL_FEE_FIELD
+    const tem = f.key in source || f.column in source
+    const raw = f.key in source ? source[f.key] : source[f.column]
+    if (tem && (raw === null || raw === '')) result.localProcessingFeePct = null
+    else if (raw !== undefined && raw !== null) {
+      const value = typeof raw === 'string' ? Number(raw.replace(',', '.')) : Number(raw)
+      if (!Number.isFinite(value) || value < f.min || value > f.max) errors.push(`${f.label}: use um valor entre ${f.min} e ${f.max}, ou deixe em branco.`)
+      else result.localProcessingFeePct = Math.round(value * 100) / 100
+    }
+  }
+
   for (const toggle of FEE_TOGGLES) {
     const raw = source[toggle.key] ?? source[toggle.column]
     if (raw === undefined || raw === null || raw === '') continue
@@ -77,10 +95,15 @@ export function parseFeeSettings(input: unknown, base: FeeSettings = DEFAULT_FEE
 /** O que mudou entre duas tarifas (para o log de auditoria). */
 export function feeChanges(before: FeeSettings, after: FeeSettings) {
   return Object.fromEntries(
-    [...FEE_FIELDS, ...FEE_TOGGLES]
-      .filter((f) => before[f.key] !== after[f.key])
-      .map((f) => [f.column, { from: before[f.key], to: after[f.key] }]),
+    [...FEE_FIELDS, ...FEE_TOGGLES, LOCAL_FEE_FIELD]
+      .filter((f) => (before[f.key] ?? null) !== (after[f.key] ?? null))
+      .map((f) => [f.column, { from: before[f.key] ?? null, to: after[f.key] ?? null }]),
   )
+}
+
+/** A coluna dos métodos locais quando mudou (inclusive para limpar: volta a ser a do cartão). */
+export function localFeeWrite(before: FeeSettings, after: FeeSettings) {
+  return (before.localProcessingFeePct ?? null) === (after.localProcessingFeePct ?? null) ? {} : { local_processing_fee_pct: after.localProcessingFeePct ?? null }
 }
 
 /**

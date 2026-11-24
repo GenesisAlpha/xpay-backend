@@ -30,7 +30,16 @@ export interface FeeSettings {
   /** Seller pode antecipar o saldo a liquidar pagando `anticipationFeePct`. */
   anticipationEnabled: boolean
   anticipationFeePct: number
+  /**
+   * Processamento nos métodos locais (Pix, SPEI, Transferencias 3.0, PSE),
+   * que já pagam a taxa da Kontino pelo processamento. null = o mesmo do cartão.
+   */
+  localProcessingFeePct: number | null
 }
+
+/** Métodos locais (saem pela conta Kontino do seller ou pela reserva da regra). */
+export const METODOS_LOCAIS = ['pix', 'spei', 'transfers_ar', 'pse'] as const
+export const ehMetodoLocal = (m: unknown) => (METODOS_LOCAIS as readonly string[]).includes(String(m ?? '').toLowerCase())
 
 import { type CheckoutFeeSource, PLAN_FREE_CHECKOUT_FEE_PCT, normalizeCheckoutFeeSource } from './checkout-fee-source'
 export * from './checkout-fee-source'
@@ -59,6 +68,7 @@ export const DEFAULT_FEE_SETTINGS: FeeSettings = {
   payoutFxFeePct: 2,
   anticipationEnabled: false,
   anticipationFeePct: 4.99,
+  localProcessingFeePct: null,
 }
 
 /**
@@ -93,6 +103,9 @@ export function sellerFeesRow(fees: FeeSettings) {
     fee_percentage: saleFeePct(fees),
     anticipation_enabled: fees.anticipationEnabled,
     anticipation_fee_pct: fees.anticipationFeePct,
+    // Só vai na escrita quando definida: sem ela a linha segue igual ao cartão
+    // (e quem ainda não tem a coluna no banco continua gravando normalmente).
+    ...(fees.localProcessingFeePct != null ? { local_processing_fee_pct: fees.localProcessingFeePct } : {}),
   }
 }
 
@@ -150,6 +163,7 @@ export function sellerFeesFromRow(data: Record<string, any>): SellerFees {
     payoutFxFeePct: num(data.payout_fx_fee_pct, D.payoutFxFeePct),
     anticipationEnabled: data.anticipation_enabled === true,
     anticipationFeePct: num(data.anticipation_fee_pct, D.anticipationFeePct),
+    localProcessingFeePct: data.local_processing_fee_pct === null || data.local_processing_fee_pct === undefined || data.local_processing_fee_pct === '' ? null : num(data.local_processing_fee_pct, D.processingFeePct),
     checkoutFeeSource: normalizeCheckoutFeeSource(data.checkout_fee_source),
     checkoutFeeUpdatedAt: data.checkout_fee_updated_at ? String(data.checkout_fee_updated_at) : null,
   }
@@ -250,14 +264,15 @@ export interface SaleFeeResult {
 export function calculateSaleFees(
   grossCents: number,
   fees: FeeSettings,
-  options: { currencyConverted: boolean; now?: Date },
+  options: { currencyConverted: boolean; now?: Date; /** Pix, SPEI, Transferencias 3.0 ou PSE. */ localMethod?: boolean },
 ): SaleFeeResult {
   const gross = Math.max(0, Math.round(grossCents))
   const pct = (rate: number) => Math.round((gross * rate) / 100)
 
   const fxFeeCents = options.currencyConverted ? pct(fees.fxFeePct) : 0
   const checkoutFeeCents = pct(fees.checkoutFeePct)
-  const processingFeeCents = pct(fees.processingFeePct)
+  // Método local com taxa própria de processamento (a Kontino já cobra o dela pelo processamento).
+  const processingFeeCents = pct(options.localMethod && fees.localProcessingFeePct != null ? fees.localProcessingFeePct : fees.processingFeePct)
   const orchestrationFeeCents = pct(fees.orchestrationFeePct)
   const fixedFeeCents = Math.round(fees.feeFixedUsd * 100)
 

@@ -20,7 +20,7 @@ import { supabase } from '../lib/supabase.client';
 import { StorageService } from '../lib/storage.service';
 import { generateKey, hashKey } from '../utils/apikeys.utils';
 import { SellerCtx } from './cross-service-jwt.guard';
-import { ErroContaKontino, conectarContaExistente, estadoKontino, iniciarContaKontino } from '../orchestrator/kontino/kontino-seller';
+import { ErroContaKontino, conectarContaExistente, estadoKontino, iniciarContaKontino, linkDoPedidoDeConexao, cancelarPedidoDeConexao } from '../orchestrator/kontino/kontino-seller';
 import {
   AccountState,
   accountAliasEmail,
@@ -469,18 +469,43 @@ export class KoopfyIntegrationService {
     try {
       return await conectarContaExistente({
         sellerId,
+        // Sem e-mail: reenvia o pedido que já espera o titular.
         email: String(body?.email ?? ''),
-        tipo: body?.type === 'individual' ? 'individual' : 'business',
+        tipo: body?.type === 'individual' ? 'individual' : body?.type === 'business' ? 'business' : undefined,
         pais: body?.country ?? null,
         retorno: body?.returnUrl ?? null,
       });
     } catch (err) {
-      if (err instanceof ErroContaKontino) {
-        if (err.code === 'provider') throw new ServiceUnavailableException(err.message);
-        throw new BadRequestException(err.message);
-      }
-      throw err;
+      this.erroKontino(err);
     }
+  }
+
+  /** Link do pedido de conexão, para o seller mandar ao titular por outro canal. */
+  async kontinoConnectExistingLink(email: string, accountSellerId: string | null, body: { returnUrl?: string }) {
+    const { sellerId } = await this.sellerForConnection(email, accountSellerId);
+    try {
+      return await linkDoPedidoDeConexao(sellerId, body?.returnUrl ?? null);
+    } catch (err) {
+      this.erroKontino(err);
+    }
+  }
+
+  /** Cancela o pedido de conexão que espera o titular. */
+  async kontinoConnectExistingCancel(email: string, accountSellerId: string | null) {
+    const { sellerId } = await this.sellerForConnection(email, accountSellerId);
+    try {
+      return await cancelarPedidoDeConexao(sellerId);
+    } catch (err) {
+      this.erroKontino(err);
+    }
+  }
+
+  private erroKontino(err: unknown): never {
+    if (err instanceof ErroContaKontino) {
+      if (err.code === 'provider') throw new ServiceUnavailableException(err.message);
+      throw new BadRequestException(err.message);
+    }
+    throw err;
   }
 
   /** Conta do pay de quem conecta; cria a principal quando ainda não existe. */

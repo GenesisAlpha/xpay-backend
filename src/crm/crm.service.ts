@@ -9,6 +9,7 @@ import { supabase } from '../lib/supabase.client'
 import { StorageService } from '../lib/storage.service'
 import { abrirKontinoAposAprovacao, cadastroV2, iniciarAberturaAposAprovacao } from '../orchestrator/kontino/kontino-aprovacao'
 import { arquivosDoEnvio } from '../onboarding/cadastro-v2'
+import { buscarContaKontino, kontinoConfigurado } from '../orchestrator/kontino/kontino'
 import { CryptoService } from '../crypto/crypto.service'
 import { WhopAccountsService } from '../orchestrator/whop/whop-accounts.service'
 import { WhopProvider } from '../orchestrator/providers/whop.provider'
@@ -16,7 +17,7 @@ import { ClipAccountsService } from '../orchestrator/clip/clip-accounts.service'
 import { WebhookService } from '../webhooks/webhook.service'
 import { notifySellerAccount } from '../utils/seller-mail'
 import { DEFAULT_FEE_SETTINGS, getSellerFees, sellerFeesRow, type FeeSettings } from '../shared/fee.calculator'
-import { FEE_FIELDS, FEE_TOGGLES, checkoutFeeWrite, feeChanges, parseFeeSettings } from './fee-config'
+import { FEE_FIELDS, FEE_TOGGLES, checkoutFeeWrite, feeChanges, parseFeeSettings, LOCAL_FEE_FIELD, localFeeWrite } from './fee-config'
 import { SellerPayoutAccountService } from '../payouts/seller-payout-account.service'
 import * as bcrypt from 'bcrypt'
 import { LoginAttemptLimiter } from './crm-login-limiter'
@@ -340,7 +341,32 @@ export class CrmService {
       arquivos,
       aceite: cad.aceite,
       empresa_chave: config?.cadastro_chave ?? null,
-      kontino: { conexao: config?.kontino ?? null, andamento: config?.cadastro_kontino ?? null },
+      kontino: { conexao: config?.kontino ?? null, andamento: config?.cadastro_kontino ?? null, ...(await this.kontinoAoVivo(config)) },
+    }
+  }
+
+  /**
+   * O que a Kontino diz agora da conexão: requisitos (inclusive a conferência
+   * do time Kontino) e o preço que o seller paga lá. Falha da Kontino não
+   * derruba a ficha.
+   */
+  private async kontinoAoVivo(config: Record<string, any> | null) {
+    const id: string | undefined = config?.kontino?.connection_id
+    if (!id || !kontinoConfigurado()) return { preco: null, requisitos: null }
+    try {
+      const c = await buscarContaKontino(id)
+      const r = (c.requirements ?? {}) as Record<string, unknown>
+      return {
+        preco: c.pricing ?? null,
+        requisitos: {
+          pendentes: Array.isArray(r.currently_due) ? r.currently_due.map(String) : [],
+          emVerificacao: Array.isArray(r.pending_verification) ? r.pending_verification.map(String) : [],
+          erros: Array.isArray(r.errors) ? r.errors.map(String) : [],
+        },
+      }
+    } catch (e: any) {
+      console.warn(`[crm] conta Kontino ${id}: ${e?.message}`)
+      return { preco: null, requisitos: null }
     }
   }
 
@@ -567,6 +593,7 @@ export class CrmService {
         risk_level: dto.riskLevel,
         ...sellerFeesRow(fees),
         ...checkoutFromCrm,
+        ...localFeeWrite(currentFees ?? DEFAULT_FEE_SETTINGS, fees),
         anticipation_days: 0,
         overridden_by: customized ? managerId : null,
         override_notes: customized ? (dto.notes ?? null) : null,
@@ -829,6 +856,7 @@ export class CrmService {
       // Editou "Checkout (%)": a taxa da equipe passa a valer em toda venda,
       // até a próxima troca de plano.
       ...checkoutFeeWrite(base, after),
+      ...localFeeWrite(base, after),
       overridden_by: managerId,
       override_notes: notes,
       updated_at: new Date(),
@@ -846,6 +874,7 @@ export class CrmService {
       fields: [
         ...FEE_FIELDS.map(({ key, column, min, max, integer, label }) => ({ key, column, min, max, integer: !!integer, boolean: false, label })),
         ...FEE_TOGGLES.map(({ key, column, label }) => ({ key, column, min: 0, max: 1, integer: true, boolean: true, label })),
+        { key: LOCAL_FEE_FIELD.key, column: LOCAL_FEE_FIELD.column, min: LOCAL_FEE_FIELD.min, max: LOCAL_FEE_FIELD.max, integer: false, boolean: false, nullable: true, label: LOCAL_FEE_FIELD.label },
       ],
     }
   }

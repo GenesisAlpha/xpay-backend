@@ -158,6 +158,16 @@ describe('etapaKontino', () => {
     expect(e(conta({ verifying: true }))).toBe('verifying')
     expect(e(conta({ requirements: ['documents'] }))).toBe('action_required')
   })
+  it('pedido por e-mail: aguardando o titular, depois conferência da Kontino (mesmo antes da aprovação)', () => {
+    const pedido = conta({ connectionType: 'connect_existing', byEmail: true, requirements: ['verification'] })
+    expect(e(pedido)).toBe('awaiting_holder')
+    expect(e(pedido, null, false)).toBe('awaiting_holder')
+    expect(e(conta({ connectionType: 'connect_existing', byEmail: true, verifying: true, inReview: true }))).toBe('kontino_review')
+    expect(e(conta({ connectionType: 'connect_existing', byEmail: true, verifying: true }))).toBe('verifying')
+    // Conexão da própria empresa aberta pela Koopfy (sem pedido por e-mail): o seller autoriza.
+    expect(e(conta({ connectionType: 'connect_existing' }))).toBe('authorize')
+    expect(e(conta({ verifying: true, inReview: true }))).toBe('kontino_review')
+  })
   it('estados finais', () => {
     expect(e(conta({ status: 'active' }))).toBe('active')
     expect(e(conta({ status: 'rejected' }))).toBe('rejected')
