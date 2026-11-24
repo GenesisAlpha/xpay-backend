@@ -313,6 +313,43 @@ export function criarContaKontino(i: {
 export const buscarContaKontino = (id: string) => chamar<ContaKontino>('GET', `/accounts/${encodeURIComponent(id)}`)
 
 /**
+ * Conecta uma conta Kontino que JÁ EXISTE, pelo e-mail do titular. A Kontino
+ * recusa (404 no_kontino_account) se o e-mail não tem conta, sem abrir outra.
+ * Sem external_id: o seller acha a conexão por `config.kontino.connection_id`,
+ * e um pedido novo (outro e-mail) não esbarra no anterior.
+ */
+export function conectarContaKontinoExistente(i: {
+  sellerId: string
+  email: string
+  tipo: 'individual' | 'business'
+  pais: string
+  retorno?: string | null
+}) {
+  return chamar<ContaKontino>('POST', '/accounts', {
+    email: i.email,
+    type: i.tipo,
+    country: i.pais.toUpperCase(),
+    existing_only: true,
+    metadata: { koopfy_seller_id: i.sellerId },
+    ...(i.retorno ? { return_url: i.retorno } : {}),
+    dashboard: 'kontino',
+  })
+}
+
+/** Manda ao titular, por e-mail, o pedido de conexão (link de 7 dias). A URL não volta para a Koopfy. */
+export function pedirConexaoPorEmailKontino(contaId: string, retorno?: string | null) {
+  return chamar<{ expires_at: string; emailed_to: string | null }>('POST', '/account_links', {
+    account: contaId,
+    type: 'connect_existing',
+    send_email: true,
+    ...(retorno ? { return_url: retorno } : {}),
+  })
+}
+
+/** Cancela uma conexão (ex.: pedido pendente trocado por outro e-mail). */
+export const desconectarContaKontino = (id: string) => chamar<ContaKontino>('POST', `/accounts/${encodeURIComponent(id)}/disconnect`, {})
+
+/**
  * A conta que o Kontino já tem para este seller (external_id = id do seller).
  * O 409 de "já existe" traz o id na mensagem; sem ele, procura nas contas do
  * parceiro, página a página.

@@ -20,7 +20,7 @@ import { supabase } from '../lib/supabase.client';
 import { StorageService } from '../lib/storage.service';
 import { generateKey, hashKey } from '../utils/apikeys.utils';
 import { SellerCtx } from './cross-service-jwt.guard';
-import { ErroContaKontino, estadoKontino, iniciarContaKontino } from '../orchestrator/kontino/kontino-seller';
+import { ErroContaKontino, conectarContaExistente, estadoKontino, iniciarContaKontino } from '../orchestrator/kontino/kontino-seller';
 import {
   AccountState,
   accountAliasEmail,
@@ -443,6 +443,35 @@ export class KoopfyIntegrationService {
         nome,
         tipo: body?.type === 'individual' ? 'individual' : 'business',
         pais: String(body?.country ?? ''),
+        retorno: body?.returnUrl ?? null,
+      });
+    } catch (err) {
+      if (err instanceof ErroContaKontino) {
+        if (err.code === 'provider') throw new ServiceUnavailableException(err.message);
+        throw new BadRequestException(err.message);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Conecta a conta Kontino que o seller já tem, pelo e-mail do titular: a
+   * Kontino manda o pedido e a conexão fica ativa quando o titular autoriza.
+   * Sem custo até ativar; vale também antes da aprovação do cadastro (a
+   * abertura automática reaproveita a conexão pendente).
+   */
+  async kontinoConnectExisting(
+    email: string,
+    accountSellerId: string | null,
+    body: { email?: string; country?: string; type?: string; returnUrl?: string },
+  ) {
+    const { sellerId } = await this.sellerForConnection(email, accountSellerId);
+    try {
+      return await conectarContaExistente({
+        sellerId,
+        email: String(body?.email ?? ''),
+        tipo: body?.type === 'individual' ? 'individual' : 'business',
+        pais: body?.country ?? null,
         retorno: body?.returnUrl ?? null,
       });
     } catch (err) {

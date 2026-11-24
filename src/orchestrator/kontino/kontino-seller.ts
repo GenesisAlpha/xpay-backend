@@ -5,10 +5,13 @@ import {
   KONTINO_METODOS,
   ehMetodoKontino,
   buscarContaKontino,
+  conectarContaKontinoExistente,
   contaKontinoPorSeller,
   criarContaKontino,
+  desconectarContaKontino,
   kontinoConfigurado,
   linkDaContaKontino,
+  pedirConexaoPorEmailKontino,
 } from './kontino'
 
 /**
@@ -50,6 +53,8 @@ export type VisaoKontino = {
     verifying: boolean
     /** Avisos da verificação (o que corrigir). */
     errors: string[]
+    /** E-mail da conexão, mascarado (o pedido de conexão foi para ele). */
+    emailMasked: string | null
   }
   /** Onde o seller usa a Kontino como banco (saldo, saques, cartão). */
   bankUrl: string
@@ -128,13 +133,14 @@ function visao(conta: ContaKontino | null, cache?: KontinoNoSeller | null): Visa
         type: String(conta.type ?? ''),
         capabilities: (conta.capabilities as Record<string, string>) ?? {},
         ...pendencias(conta.requirements),
+        emailMasked: conta.email ? mascararEmail(conta.email) : null,
       },
     }
   }
   if (cache?.connection_id) {
     return {
       ...base,
-      account: { id: cache.connection_id, status: cache.status, connectionType: cache.connection_type, country: cache.country, type: cache.type, capabilities: {}, requirements: [], verifying: false, errors: [] },
+      account: { id: cache.connection_id, status: cache.status, connectionType: cache.connection_type, country: cache.country, type: cache.type, capabilities: {}, requirements: [], verifying: false, errors: [], emailMasked: null },
     }
   }
   return { ...base, account: null }
@@ -217,6 +223,71 @@ export async function iniciarContaKontino(i: {
     }
     throw err
   }
+}
+
+/**
+ * Conecta uma conta Kontino que o seller (ou a empresa dele) JÁ TEM, pelo
+ * e-mail do titular. A Kontino manda o pedido a esse e-mail; quando o titular
+ * autoriza no app dela, a conexão fica ativa e o webhook `account.updated`
+ * grava `kontino_account_id` (ver contaKontinoMudou).
+ *
+ * Pedido pendente para o MESMO e-mail: só reenvia. Pedido pendente de outro
+ * tipo (conta nova, outro e-mail) é cancelado antes. Conta já ativa: recusa.
+ */
+export async function conectarContaExistente(i: {
+  sellerId: string
+  email: string
+  tipo?: 'individual' | 'business'
+  pais?: string | null
+  retorno?: string | null
+}): Promise<{ emailedTo: string | null; expiresAt: string | null; state: VisaoKontino }> {
+  if (!kontinoConfigurado()) throw new ErroContaKontino('not_configured', 'A Kontino ainda não está disponível na sua conta.')
+  const email = String(i.email ?? '').trim().toLowerCase()
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new ErroContaKontino('invalid', 'Informe o e-mail da conta Kontino.')
+  const pais = String(i.pais ?? '').trim().toUpperCase()
+  const retorno = i.retorno && /^https:\/\//.test(i.retorno) ? i.retorno : null
+  const config = await configDoSeller(i.sellerId)
+  if (config === null) throw new ErroContaKontino('invalid', 'Conta Koopfy não encontrada.')
+
+  try {
+    const ja: string | undefined = config.kontino?.connection_id
+    let conta: ContaKontino | null = ja ? await buscarContaKontino(ja).catch(() => null) : null
+    if (conta?.status === 'active') throw new ErroContaKontino('invalid', 'Você já tem uma conta Kontino conectada.')
+    const mesmoPedido = conta?.status === 'pending' && conta.connection_type === 'connect_existing' && String(conta.email ?? '').toLowerCase() === email
+    if (conta && conta.status === 'pending' && !mesmoPedido) {
+      await desconectarContaKontino(conta.id).catch((e) => console.warn(`[kontino-seller] cancelar conexão ${conta?.id}:`, e?.message))
+      conta = null
+    }
+    if (!mesmoPedido) {
+      conta = await conectarContaKontinoExistente({
+        sellerId: i.sellerId,
+        email,
+        tipo: i.tipo === 'individual' ? 'individual' : 'business',
+        pais: PAIS.test(pais) ? pais : String(config.kontino?.country ?? '').toUpperCase() || 'US',
+        retorno,
+      })
+      await guardarConta(i.sellerId, conta)
+    }
+    const link = await pedirConexaoPorEmailKontino(conta!.id, retorno)
+    console.log(`[kontino-seller] seller ${i.sellerId}: pedido de conexão ${conta!.id} enviado ao titular (${link.emailed_to ?? '—'})`)
+    return { emailedTo: link.emailed_to ?? null, expiresAt: link.expires_at ?? null, state: visao(conta) }
+  } catch (err) {
+    if (err instanceof ErroContaKontino) throw err
+    if (err instanceof ErroKontino) {
+      console.error(`[kontino-seller] seller ${i.sellerId} conectar existente: ${err.status} ${err.code} ${err.message}`)
+      if (err.code === 'no_kontino_account') throw new ErroContaKontino('invalid', 'Este e-mail não tem conta Kontino. Confira o e-mail ou abra uma conta nova.')
+      if (err.status >= 400 && err.status < 500 && err.code !== 'not_configured') throw new ErroContaKontino('invalid', err.message)
+      throw new ErroContaKontino('provider', 'A Kontino não respondeu agora. Tente de novo em instantes.')
+    }
+    throw err
+  }
+}
+
+/** "fi***@empresa.com" */
+export function mascararEmail(email: string): string {
+  const [nome, dominio] = String(email).split('@')
+  if (!dominio) return '***'
+  return `${nome.slice(0, Math.min(2, Math.max(1, nome.length - 1)))}***@${dominio}`
 }
 
 /**

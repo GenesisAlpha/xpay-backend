@@ -28,7 +28,7 @@ jest.mock('../../lib/supabase.client', () => ({
   },
 }))
 
-import { configComConta, contaKontinoMudou, estadoKontino, iniciarContaKontino, kontinoPelaContaDoSeller } from './kontino-seller'
+import { conectarContaExistente, configComConta, contaKontinoMudou, estadoKontino, iniciarContaKontino, kontinoPelaContaDoSeller, mascararEmail } from './kontino-seller'
 import type { ContaKontino } from './kontino'
 
 const conta = (o: Partial<ContaKontino> = {}): ContaKontino => ({
@@ -194,5 +194,67 @@ describe('Pix e SPEI pela conta Kontino do seller', () => {
     expect(kontinoPelaContaDoSeller({ ...base, metodo: 'card' })).toBeNull()
     expect(kontinoPelaContaDoSeller({ ...base, moeda: 'USD' })).toBeNull()
     expect(kontinoPelaContaDoSeller({ ...base, metodosDoSeller: ['card'] })).toBeNull()
+  })
+})
+
+describe('conectar conta Kontino existente pelo e-mail do titular', () => {
+  const ok = (body: any) => () => ({ status: 200, body })
+  const corpo = (i: number) => JSON.parse(chamadas[i].init.body)
+
+  it('cria a conexão só de conta existente e pede a aprovação por e-mail', async () => {
+    linhas['seller-1'] = { id: 'seller-1', config: {} }
+    respostas = [
+      ok(conta({ id: 'acct_ex', connection_type: 'connect_existing', email: 'financeiro@empresa.com', external_id: null })),
+      ok({ object: 'account_link', url: null, expires_at: '2026-12-01T00:00:00Z', emailed_to: 'fi***@empresa.com' }),
+    ]
+    const r = await conectarContaExistente({ sellerId: 'seller-1', email: ' Financeiro@Empresa.com ', pais: 'mx' })
+    expect(chamadas[0].url).toMatch(/\/accounts$/)
+    expect(corpo(0)).toMatchObject({ email: 'financeiro@empresa.com', existing_only: true, country: 'MX', type: 'business' })
+    expect(corpo(0).external_id).toBeUndefined()
+    expect(chamadas[1].url).toMatch(/\/account_links$/)
+    expect(corpo(1)).toEqual({ account: 'acct_ex', type: 'connect_existing', send_email: true })
+    expect(r.emailedTo).toBe('fi***@empresa.com')
+    expect(linhas['seller-1'].config.kontino.connection_id).toBe('acct_ex')
+    expect(linhas['seller-1'].config.kontino_account_id).toBeUndefined()
+  })
+
+  it('mesmo e-mail com pedido pendente: só reenvia', async () => {
+    linhas['seller-1'] = { id: 'seller-1', config: { kontino: { connection_id: 'acct_ex', status: 'pending' } } }
+    respostas = [
+      ok(conta({ id: 'acct_ex', connection_type: 'connect_existing', email: 'financeiro@empresa.com' })),
+      ok({ expires_at: '2026-12-01T00:00:00Z', emailed_to: 'fi***@empresa.com' }),
+    ]
+    await conectarContaExistente({ sellerId: 'seller-1', email: 'financeiro@empresa.com' })
+    expect(chamadas.map((c) => c.url.replace(/^.*\/v1/, ''))).toEqual(['/accounts/acct_ex', '/account_links'])
+  })
+
+  it('pedido pendente de outro tipo é cancelado antes', async () => {
+    linhas['seller-1'] = { id: 'seller-1', config: { kontino: { connection_id: 'acct_velha', status: 'pending', country: 'BR' } } }
+    respostas = [
+      ok(conta({ id: 'acct_velha', connection_type: 'onboarding' })),
+      ok(conta({ id: 'acct_velha', status: 'disconnected' })),
+      ok(conta({ id: 'acct_ex', connection_type: 'connect_existing', email: 'f@e.com' })),
+      ok({ expires_at: null, emailed_to: 'f***@e.com' }),
+    ]
+    await conectarContaExistente({ sellerId: 'seller-1', email: 'f@e.com' })
+    expect(chamadas[1].url).toMatch(/\/accounts\/acct_velha\/disconnect$/)
+    expect(corpo(2)).toMatchObject({ country: 'BR' })
+    expect(linhas['seller-1'].config.kontino.connection_id).toBe('acct_ex')
+  })
+
+  it('conta já ativa: recusa', async () => {
+    linhas['seller-1'] = { id: 'seller-1', config: { kontino: { connection_id: 'acct_1', status: 'active' }, kontino_account_id: 'acct_1' } }
+    respostas = [ok(conta({ status: 'active' }))]
+    await expect(conectarContaExistente({ sellerId: 'seller-1', email: 'f@e.com' })).rejects.toThrow('já tem uma conta Kontino conectada')
+  })
+
+  it('e-mail sem conta Kontino: mensagem clara', async () => {
+    linhas['seller-1'] = { id: 'seller-1', config: {} }
+    respostas = [() => ({ status: 404, body: { error: { code: 'no_kontino_account', message: 'x' } } })]
+    await expect(conectarContaExistente({ sellerId: 'seller-1', email: 'f@e.com' })).rejects.toThrow('não tem conta Kontino')
+  })
+
+  it('mascara o e-mail', () => {
+    expect(mascararEmail('financeiro@empresa.com')).toBe('fi***@empresa.com')
   })
 })

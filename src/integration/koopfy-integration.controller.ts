@@ -180,6 +180,13 @@ export class KoopfyIntegrationController {
     return this.svc.kontinoStart(req.tokenEmail, req.accountSellerId ?? null, body ?? {});
   }
 
+  /** Conectar conta Kontino existente: a Kontino manda o pedido ao e-mail do titular. */
+  @Post('kontino/connect-existing')
+  @UseGuards(CrossServiceTokenGuard)
+  kontinoConnectExisting(@Req() req: any, @Body() body: any) {
+    return this.svc.kontinoConnectExisting(req.tokenEmail, req.accountSellerId ?? null, body ?? {});
+  }
+
   // ─── Provedor externo (conta Whop do próprio seller) ───────────────────────
   // Liberado para todos; o CRM só corta.
 
