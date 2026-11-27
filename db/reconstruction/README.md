@@ -4,7 +4,7 @@ O esquema inicial cobre o checkout europeu em sandbox a partir do contrato obser
 
 ## Aplicar e verificar
 
-1. Numa base nova, executar `001_xpay_sandbox_foundation.sql` como migração transacional. As roles `anon`, `authenticated` e `service_role` são provisionadas pelo Supabase.
+1. Numa base nova, executar `001_xpay_sandbox_foundation.sql` e `002_xpay_wallet_contract.sql` em ordem como migrações transacionais. As roles `anon`, `authenticated` e `service_role` são provisionadas pelo Supabase.
 2. Numa instância de validação PostgreSQL 17 sem tráfego, executar `001_xpay_sandbox_foundation.check.sql` com `ON_ERROR_STOP=1`. As fixtures são eliminadas pelo rollback.
 3. Confirmar 21 tabelas de aplicação com RLS, 5 códigos de tier sem tarifas aprovadas e nenhum prestador ativo antes de escrever credenciais. As interfaces acedem à API autenticada. O browser não recebe a chave de serviço nem acede às tabelas.
 4. Manter esta migração fora da sequência histórica automática enquanto as restantes dependências estiverem por recuperar. A sequência original pode voltar a criar objetos já presentes ou pressupor tabelas, views e funções em falta.
@@ -44,6 +44,8 @@ O OrbiaCRM é a fonte do catálogo comercial e do negócio. O XPAY é a fonte do
 | Roteamento e provedores | `seller_provider_accounts`, `seller_routing_settings`, `seller_routing_accounts`, `routing_assignments`, `stripe_risk_events`, `stripe_efw_decisions`, `stripe_account_linkage_audit`, RPCs de limites e risco; adicionais por PSP |
 | Contabilidade | `add_pending_balance`, `add_available_balance`, `debit_balance`, settlement, reservas, payout, chargebacks, antecipação, reconciliação e funções de relatórios. Há funções incrementais recuperáveis no repositório. |
 | Comércio e extensões | Modelo persistente de link, produtos, itens de pedido e preços recorrentes. Afiliados, payout, assinaturas e faturação do seller têm módulos e migrações próprios. |
+
+O ensaio da cadeia original numa base PostgreSQL 17 descartável passou 28 de 33 ficheiros Supabase após alinhar `wallet_ledger.id` como texto e incluir `wallet_balance.withdrawing_balance`. Os demais pararam em dependências de KYC, documentos, Whop Connected, Clip e SPEI. Executar o DDL com sucesso não comprova o comportamento dos RPCs sobre dinheiro.
 
 Um dump do esquema original ajuda a recuperar tipos, defaults, índices, grants, triggers, policies e funções com menos hipóteses. Se for indisponível, cada contrato deve ser reconstituído e testado por fluxo sem importar dados ou credenciais.
 
