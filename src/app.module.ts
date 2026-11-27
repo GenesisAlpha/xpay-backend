@@ -19,9 +19,15 @@ import { AppController } from './app.controller';
 import { PayoutModule } from './payouts/payout.module';
 import { SellerBillingModule } from './seller-billing/seller-billing.module';
 
+const scheduledJobs = process.env.XPAY_DISABLE_SCHEDULED_JOBS !== 'true';
+
 @Module({
   imports: [
-    ScheduleModule.forRoot(),
+    ScheduleModule.forRoot({
+      cronJobs: scheduledJobs,
+      intervals: scheduledJobs,
+      timeouts: scheduledJobs,
+    }),
     ConfigModule.forRoot({
       isGlobal: true,
       envFilePath: '.env',
