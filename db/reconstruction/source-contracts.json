@@ -1,0 +1,521 @@
+{
+  "backend_commit": "dad3e55f3eda6b42d64712081a5612572fce2712",
+  "method": "Literal calls to Supabase from and rpc in production TypeScript. Includes views and storage identifiers. Dynamic names are not included.",
+  "relation_references": {
+    "account_daily_metrics": [
+      "crm",
+      "orchestrator"
+    ],
+    "affiliate_accounts": [
+      "affiliates"
+    ],
+    "affiliate_commissions": [
+      "affiliates"
+    ],
+    "affiliate_payout_cycles": [
+      "affiliates"
+    ],
+    "affiliate_risk_snapshots": [
+      "orchestrator"
+    ],
+    "api_keys": [
+      "auth",
+      "dashboard",
+      "integration",
+      "middleware"
+    ],
+    "avatars": [
+      "dashboard"
+    ],
+    "chargebacks": [
+      "crm"
+    ],
+    "checkout_sessions": [
+      "checkout-session"
+    ],
+    "crm_action_log": [
+      "activation",
+      "affiliates",
+      "crm",
+      "integration",
+      "orchestrator"
+    ],
+    "crm_assignments": [
+      "crm"
+    ],
+    "crm_managers": [
+      "crm"
+    ],
+    "crm_notes": [
+      "crm"
+    ],
+    "disputes": [
+      "dashboard"
+    ],
+    "gw_capacity": [
+      "crm",
+      "orchestrator"
+    ],
+    "gw_captures": [
+      "crm"
+    ],
+    "gw_card_accounts": [
+      "crm",
+      "orchestrator"
+    ],
+    "gw_card_secrets": [
+      "orchestrator"
+    ],
+    "gw_card_usage": [
+      "crm"
+    ],
+    "gw_clip_accounts": [
+      "crm"
+    ],
+    "gw_clip_upsell_tokens": [
+      "orchestrator"
+    ],
+    "gw_embed_origins": [
+      "checkout-session"
+    ],
+    "gw_reservations": [
+      "crm",
+      "orchestrator"
+    ],
+    "gw_spei_accounts": [
+      "crm",
+      "orchestrator"
+    ],
+    "gw_spei_confidence": [
+      "crm"
+    ],
+    "gw_spei_ledger": [
+      "crm"
+    ],
+    "gw_spei_receipts": [
+      "crm",
+      "orchestrator"
+    ],
+    "kyc_info": [
+      "crm",
+      "dashboard",
+      "onboarding",
+      "orchestrator"
+    ],
+    "offers": [
+      "crm",
+      "dashboard",
+      "integration",
+      "onboarding",
+      "payments"
+    ],
+    "operation_config": [
+      "integration",
+      "onboarding",
+      "orchestrator"
+    ],
+    "payment_method_route_history": [
+      "orchestrator"
+    ],
+    "payment_method_routes": [
+      "orchestrator"
+    ],
+    "payout_executions": [
+      "dashboard",
+      "payouts"
+    ],
+    "payout_fee_rules": [
+      "payouts"
+    ],
+    "payout_request_keys": [
+      "payouts"
+    ],
+    "paypal_webhook_events": [
+      "webhooks"
+    ],
+    "provider_accounts": [
+      "dashboard",
+      "providers"
+    ],
+    "seller_activation_requests": [
+      "crm"
+    ],
+    "seller_billing_charges": [
+      "seller-billing"
+    ],
+    "seller_billing_methods": [
+      "seller-billing"
+    ],
+    "seller_documents": [
+      "crm",
+      "onboarding",
+      "orchestrator"
+    ],
+    "seller_fees": [
+      "crm",
+      "integration",
+      "onboarding",
+      "orchestrator",
+      "sellers",
+      "shared"
+    ],
+    "seller_kpis": [
+      "crm",
+      "dashboard"
+    ],
+    "seller_link_accounts": [
+      "orchestrator"
+    ],
+    "seller_payout_accounts": [
+      "payouts"
+    ],
+    "seller_payout_methods": [
+      "dashboard",
+      "payouts"
+    ],
+    "seller_profiles": [
+      "activation",
+      "affiliates",
+      "auth",
+      "checkout-session",
+      "crm",
+      "dashboard",
+      "integration",
+      "onboarding",
+      "orchestrator",
+      "payments",
+      "payouts",
+      "sellers",
+      "utils",
+      "webhooks"
+    ],
+    "seller_provider_accounts": [
+      "dashboard"
+    ],
+    "seller_referrals": [
+      "affiliates"
+    ],
+    "sentinel_mids": [
+      "crm",
+      "orchestrator"
+    ],
+    "stripe_account_linkage_audit": [
+      "orchestrator"
+    ],
+    "stripe_accounts": [
+      "orchestrator"
+    ],
+    "stripe_efw_decisions": [
+      "orchestrator"
+    ],
+    "stripe_risk_events": [
+      "orchestrator"
+    ],
+    "stripe_webhook_events": [
+      "webhooks"
+    ],
+    "transaction_attempts": [
+      "payments"
+    ],
+    "transactions": [
+      "affiliates",
+      "crm",
+      "dashboard",
+      "integration",
+      "orchestrator",
+      "payments",
+      "webhooks"
+    ],
+    "users": [
+      "activation",
+      "affiliates",
+      "auth",
+      "crm",
+      "dashboard",
+      "integration",
+      "onboarding",
+      "sellers"
+    ],
+    "v_admin_seller_balances": [
+      "crm"
+    ],
+    "v_admin_withdrawals": [
+      "crm"
+    ],
+    "v_crm_affiliates": [
+      "affiliates"
+    ],
+    "v_crm_sellers": [
+      "crm"
+    ],
+    "wallet_balance": [
+      "auth",
+      "crm",
+      "dashboard",
+      "integration",
+      "orchestrator",
+      "sellers",
+      "wallets"
+    ],
+    "wallet_ledger": [
+      "crm",
+      "dashboard",
+      "integration",
+      "orchestrator",
+      "wallets",
+      "webhooks"
+    ],
+    "whop_accounts": [
+      "crm",
+      "orchestrator"
+    ],
+    "whop_connected_accounts": [
+      "orchestrator"
+    ],
+    "whop_linked_accounts": [
+      "dashboard"
+    ],
+    "whop_plan_mappings": [
+      "orchestrator"
+    ],
+    "whop_subscriptions": [
+      "dashboard",
+      "integration",
+      "payments",
+      "webhooks"
+    ],
+    "whop_webhook_events": [
+      "webhooks"
+    ]
+  },
+  "rpc_references": {
+    "add_available_balance": [
+      "wallets"
+    ],
+    "add_pending_balance": [
+      "dashboard",
+      "wallets"
+    ],
+    "affiliate_pool_risk_window": [
+      "orchestrator"
+    ],
+    "affiliate_risk_window": [
+      "orchestrator"
+    ],
+    "anticipate_pending_balance": [
+      "wallets"
+    ],
+    "apply_provider_payout_state": [
+      "payouts"
+    ],
+    "attach_recovered_provider_payout": [
+      "payouts"
+    ],
+    "cancel_reserve_hold": [
+      "crm",
+      "webhooks"
+    ],
+    "claim_payout_dispatch": [
+      "payouts"
+    ],
+    "claim_payout_reconciliation": [
+      "payouts"
+    ],
+    "count_reserve_hold": [
+      "wallets"
+    ],
+    "credit_balance": [
+      "crm",
+      "orchestrator"
+    ],
+    "crm_balance_totals": [
+      "crm"
+    ],
+    "crm_revenue_breakdown": [
+      "crm"
+    ],
+    "debit_available_balance": [
+      "wallets"
+    ],
+    "debit_balance": [
+      "crm",
+      "orchestrator",
+      "webhooks"
+    ],
+    "finalize_payout_outflow": [
+      "payouts"
+    ],
+    "get_seller_transfer_totals": [
+      "dashboard"
+    ],
+    "gw_capture": [
+      "orchestrator"
+    ],
+    "gw_card_has_secret": [
+      "crm"
+    ],
+    "gw_card_secret": [
+      "orchestrator"
+    ],
+    "gw_finalize": [
+      "orchestrator"
+    ],
+    "gw_hold_card": [
+      "orchestrator"
+    ],
+    "gw_hold_spei": [
+      "orchestrator"
+    ],
+    "gw_release": [
+      "orchestrator"
+    ],
+    "gw_set_card_secret": [
+      "crm"
+    ],
+    "gw_spei_confirm_receipt": [
+      "orchestrator"
+    ],
+    "gw_spei_log_receipt": [
+      "orchestrator"
+    ],
+    "gw_spei_withdraw": [
+      "orchestrator"
+    ],
+    "gw_take_clip_upsell_token": [
+      "orchestrator"
+    ],
+    "increment_account_volume": [
+      "orchestrator"
+    ],
+    "increment_kpi_safe": [
+      "payments",
+      "webhooks"
+    ],
+    "increment_webhook_attempts": [
+      "webhooks"
+    ],
+    "mark_payout_create_started": [
+      "payouts"
+    ],
+    "mark_payout_requote_required": [
+      "payouts"
+    ],
+    "move_pending_to_available": [
+      "wallets"
+    ],
+    "release_payout_reservation": [
+      "payouts"
+    ],
+    "request_payout": [
+      "dashboard"
+    ],
+    "request_payout_idempotent": [
+      "dashboard"
+    ],
+    "request_provider_payout_idempotent": [
+      "payouts"
+    ],
+    "requeue_requoted_payout": [
+      "payouts"
+    ],
+    "resolve_payout_create_failure": [
+      "payouts"
+    ],
+    "restore_provider_payout_funds": [
+      "payouts"
+    ],
+    "run_affiliate_settlement_batch": [
+      "affiliates"
+    ],
+    "run_reserve_release_batch": [
+      "wallets"
+    ],
+    "run_settlement_batch": [
+      "wallets"
+    ],
+    "stripe_account_risk_window": [
+      "orchestrator"
+    ],
+    "stripe_account_volume_baseline": [
+      "orchestrator"
+    ],
+    "stripe_pool_risk_window": [
+      "orchestrator"
+    ],
+    "transfer_balance": [
+      "crm"
+    ],
+    "whop_connected_risk_window": [
+      "orchestrator"
+    ]
+  },
+  "tables_defined_in_existing_migrations": [
+    "actionticket",
+    "affiliate_accounts",
+    "affiliate_commissions",
+    "affiliate_payout_cycles",
+    "apikey",
+    "currency",
+    "gatewayconfig",
+    "gw_clip_accounts",
+    "gw_clip_upsell_tokens",
+    "ledgerentry",
+    "ledgertransaction",
+    "notification",
+    "payment_method_route_history",
+    "payment_method_routes",
+    "payout",
+    "payout_executions",
+    "payout_fee_rules",
+    "payout_request_keys",
+    "paypal_webhook_events",
+    "routing_assignments",
+    "routing_link_sales",
+    "seller_activation_requests",
+    "seller_billing_charges",
+    "seller_billing_methods",
+    "seller_link_accounts",
+    "seller_payout_accounts",
+    "seller_payout_methods",
+    "seller_provider_accounts",
+    "seller_referrals",
+    "seller_routing_accounts",
+    "seller_routing_settings",
+    "swap",
+    "transaction",
+    "user",
+    "wallet",
+    "webhookevent",
+    "whop_connected_accounts",
+    "whop_connected_risk_events",
+    "whop_connected_transfers",
+    "whop_linked_accounts",
+    "whop_linked_withdrawals",
+    "whop_plan_mappings",
+    "whop_rfi_submissions",
+    "whop_subscriptions"
+  ],
+  "foundation_tables": [
+    "users",
+    "seller_profiles",
+    "api_keys",
+    "fee_tiers",
+    "fee_tier_versions",
+    "seller_fees",
+    "stripe_accounts",
+    "account_daily_metrics",
+    "payment_method_routes",
+    "payment_method_route_history",
+    "offers",
+    "checkout_sessions",
+    "transactions",
+    "transaction_attempts",
+    "stripe_webhook_events",
+    "gw_embed_origins",
+    "wallet_balance",
+    "wallet_ledger",
+    "xpay_orbia_merchants",
+    "xpay_orbia_products",
+    "xpay_event_outbox"
+  ]
+}
