@@ -218,6 +218,14 @@ export class WebhookService {
       // há retentativa (a próxima chamada sai em `alreadyProcessed`).
       await this.ensureSaleFees(tx)
 
+      if (process.env.XPAY_ATOMIC_STRIPE_APPROVAL === 'true' &&
+          tx.provider === 'stripe' && !isOwnProviderAccountId(tx.provider_account_id)) {
+        const result = await this.creditPaidWallet(tx, true)
+        if (result.alreadyProcessed) return { alreadyProcessed: true }
+        await this.runPaidSideEffects(tx, opts, true)
+        return { received: true }
+      }
+
       const { data: approvedRows, error: updateError } = await supabase
         .from('transactions')
         .update({
@@ -2675,7 +2683,7 @@ export class WebhookService {
   // Carteira, volume do roteador, KPI e aviso ao checkout. Separado do
   // handleWebhookProvider para o reprocessamento (reprocessApprovedSale) rodar
   // exatamente o mesmo caminho.
-  private async runPaidSideEffects(tx: any, opts: { skipDispatch?: boolean } = {}): Promise<void> {
+  private async runPaidSideEffects(tx: any, opts: { skipDispatch?: boolean } = {}, walletAlreadyCredited = false): Promise<void> {
     // ── Side effects ─────────────────────────────────────────────────
 
     // 1) Crédito pendente na wallet (com external_fee se houver)
@@ -2689,28 +2697,7 @@ export class WebhookService {
         + `(${tx.provider_account_id}) — sem crédito na carteira da Koopfy.`,
       )
     } else {
-    await this.walletService.creditPending({
-      sellerId: tx.seller_id,
-      transactionId: tx.id,
-      amount: tx.net_amount,
-      fee: tx.fee,
-      reserveAmount: tx.reserve_amount,
-      availableAt: tx.available_at,
-      reserveUntil: tx.reserve_until,
-      externalFee: tx.external_fee_cents
-        ? { amount: tx.external_fee_cents, recipientId: tx.external_fee_recipient_id }
-        : null,
-      // 🔥 NOVO
-      platformFee: tx.fee > 0 && tx.platform_partner
-        ? {
-          amount: tx.fee,
-          walletRef: tx.platform_partner === 'koopfy'
-            ? process.env.KOOPFY_PLATFORM_WALLET_REF!
-            : process.env.NEXOR_PLATFORM_WALLET_REF!,
-          partner: tx.platform_partner,
-        }
-        : null,
-    })
+      if (!walletAlreadyCredited) await this.creditPaidWallet(tx)
     }
 
     // 2) Contabiliza volume PAGO no router
@@ -2776,6 +2763,31 @@ export class WebhookService {
         }
         : {}),
     })
+  }
+
+  private creditPaidWallet(tx: any, approveStripePayment = false) {
+    return this.walletService.creditPending({
+      sellerId: tx.seller_id,
+      transactionId: tx.id,
+      amount: tx.net_amount,
+      fee: tx.fee,
+      reserveAmount: tx.reserve_amount,
+      availableAt: tx.available_at,
+      reserveUntil: tx.reserve_until,
+      externalFee: tx.external_fee_cents
+        ? { amount: tx.external_fee_cents, recipientId: tx.external_fee_recipient_id }
+        : null,
+      // 🔥 NOVO
+      platformFee: tx.fee > 0 && tx.platform_partner
+        ? {
+          amount: tx.fee,
+          walletRef: tx.platform_partner === 'koopfy'
+            ? process.env.KOOPFY_PLATFORM_WALLET_REF!
+            : process.env.NEXOR_PLATFORM_WALLET_REF!,
+          partner: tx.platform_partner,
+        }
+        : null,
+    }, { approveStripePayment })
   }
 
   // Venda sem taxa/líquido gravados (o SPEI da Clip era criado assim): calcula
