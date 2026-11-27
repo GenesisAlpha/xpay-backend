@@ -9,7 +9,7 @@ async function main() {
   const order = randomUUID()
   const session = await stripe('checkout/sessions', {}, {
     mode: 'payment',
-    'payment_method_types[0]': 'mb_way',
+    'allowed_payment_method_types[0]': 'mb_way',
     'line_items[0][price_data][currency]': 'eur',
     'line_items[0][price_data][unit_amount]': '990',
     'line_items[0][price_data][product_data][name]': 'XPAY MB WAY Pro sandbox',
