@@ -52,7 +52,7 @@ export class WalletService {
     externalFee?: ExternalFeeArgs | null
     platformFee?: PlatformFeeArgs | null
     affiliateCommission?: AffiliateCommissionArgs | null
-  }) {
+  }, options: { approveStripePayment?: boolean } = {}) {
     const toISO = (d: Date | string | null): string => {
       if (!d) return new Date().toISOString()
       if (d instanceof Date) return d.toISOString()
@@ -172,6 +172,15 @@ export class WalletService {
         created_at: now,
         metadata: { source_seller_id: sellerId },
       })
+    }
+
+    if (options.approveStripePayment) {
+      const { data, error } = await supabase.rpc('xpay_approve_stripe_payment', {
+        p_transaction_id: transactionId,
+        p_ledger_rows: ledgerRows,
+      })
+      if (error) throw new Error('Failed to book Stripe payment: ' + error.message)
+      return data === true ? { success: true } : { alreadyProcessed: true }
     }
 
     const { error: insertError } = await supabase
