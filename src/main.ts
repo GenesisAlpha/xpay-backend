@@ -13,16 +13,22 @@ async function bootstrap() {
     rawBody: true,
   });
 
-  // The sandbox service exposes only health and its registered Stripe webhook.
+  // Limit each pilot runtime to its own Stripe webhook and health endpoint.
   const sandboxStripeAccount = process.env.XPAY_SANDBOX_STRIPE_ACCOUNT_ID;
-  if (sandboxStripeAccount) {
-    if (!/^[a-z0-9_-]+$/.test(sandboxStripeAccount) ||
+  const liveStripeAccount = process.env.XPAY_LIVE_STRIPE_ACCOUNT_ID;
+  const liveSchema = process.env.XPAY_DB_SCHEMA === 'xpay_live';
+  if ((sandboxStripeAccount && liveStripeAccount) || liveSchema !== Boolean(liveStripeAccount)) {
+    throw new Error('XPAY pilot Stripe mode must match its database schema');
+  }
+  const pilotStripeAccount = sandboxStripeAccount || liveStripeAccount;
+  if (pilotStripeAccount) {
+    if (!/^[a-z0-9_-]+$/.test(pilotStripeAccount) ||
         process.env.XPAY_DISABLE_SCHEDULED_JOBS !== 'true') {
-      throw new Error('Invalid XPAY sandbox configuration');
+      throw new Error('Invalid XPAY pilot configuration');
     }
     app.use((req: express.Request, res: express.Response, next: express.NextFunction) => {
       const isHealth = req.method === 'GET' && req.path === '/health';
-      const stripePath = `/webhook/stripe/${sandboxStripeAccount}`;
+      const stripePath = `/webhook/stripe/${pilotStripeAccount}`;
       const isStripeWebhook = req.method === 'POST' && req.path === stripePath;
       if (isHealth || isStripeWebhook) return next();
       return res.sendStatus(404);
