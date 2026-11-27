@@ -13,6 +13,22 @@ async function bootstrap() {
     rawBody: true,
   });
 
+  // The sandbox service exposes only health and its registered Stripe webhook.
+  const sandboxStripeAccount = process.env.XPAY_SANDBOX_STRIPE_ACCOUNT_ID;
+  if (sandboxStripeAccount) {
+    if (!/^[a-z0-9_-]+$/.test(sandboxStripeAccount) ||
+        process.env.XPAY_DISABLE_SCHEDULED_JOBS !== 'true') {
+      throw new Error('Invalid XPAY sandbox configuration');
+    }
+    app.use((req: express.Request, res: express.Response, next: express.NextFunction) => {
+      const isHealth = req.method === 'GET' && req.path === '/health';
+      const stripePath = `/webhook/stripe/${sandboxStripeAccount}`;
+      const isStripeWebhook = req.method === 'POST' && req.path === stripePath;
+      if (isHealth || isStripeWebhook) return next();
+      return res.sendStatus(404);
+    });
+  }
+
   // =========================================
   // 🔐 CORS (PRIMEIRO — garante o header até em respostas de erro,
   //    ex.: 413 Payload Too Large antes do bodyParser)
