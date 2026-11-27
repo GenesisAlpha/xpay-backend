@@ -1580,7 +1580,6 @@ export class PaymentService {
         if (result.next_action) body.next_action = result.next_action
         if (result.data?.card) body.card = result.data.card  // { last4, network, eci }
 
-        console.log('[buildResponse] →', JSON.stringify(body))
         return body
     }
 
