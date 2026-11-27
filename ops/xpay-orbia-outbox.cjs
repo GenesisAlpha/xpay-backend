@@ -38,8 +38,12 @@ function createDelivery({ xpayKey, orbiaKey, fetcher = global.fetch }) {
 
   async function deliver(event) {
     const body = event.body
-    if (event.event_type !== 'payment.approved' || body?.installation !== workerInstallation
-      || event.event_key !== 'payment.approved:' + body.transactionId || !body.organizationId) {
+    const refund = event.event_type === 'payment.refunded'
+    const refundId = refund && /^re_[a-zA-Z0-9]{1,125}$/.test(body?.refundId ?? '') ? body.refundId : null
+    const expectedKey = event.event_type + ':' + body?.transactionId + (refund ? ':' + refundId : '')
+    if ((!refund && event.event_type !== 'payment.approved') ||
+      (refund && (!refundId || body?.billingSource !== 'stripe_subscription')) ||
+      body?.installation !== workerInstallation || event.event_key !== expectedKey || !body.organizationId) {
       throw new Error('Outbox event has no valid Orbia destination')
     }
     const mappings = await xpay('xpay_orbia_merchants?' + filters({
@@ -52,22 +56,53 @@ function createDelivery({ xpayKey, orbiaKey, fetcher = global.fetch }) {
       throw new Error('Outbox event does not match the seller destination')
     }
 
-    const sales = await xpay('transactions?' + filters({
-      select: 'id',
-      id: 'eq.' + body.transactionId,
-      seller_id: 'eq.' + event.seller_id,
-      status: 'eq.approved',
-      provider: 'eq.stripe',
-      limit: '1',
-    }))
-    if (sales.length !== 1) throw new Error('Outbox event has no approved Stripe transaction')
+    if (body.billingSource === 'stripe_subscription') {
+      const invoiceId = /^stripe-invoice:(in_[a-zA-Z0-9]{1,125})$/.exec(body.transactionId)?.[1]
+      if (!invoiceId) throw new Error('Outbox event has no Stripe invoice reference')
+      const invoices = await xpay('xpay_stripe_subscription_invoices?' + filters({
+        select: 'invoice_id,gross_minor,fee_minor,net_minor,currency',
+        invoice_id: 'eq.' + invoiceId,
+        seller_id: 'eq.' + event.seller_id,
+        limit: '1',
+      }))
+      const invoice = invoices[0]
+      if (invoices.length !== 1 || invoice.currency !== 'EUR' || body.gross?.currency !== invoice.currency) {
+        throw new Error('Outbox event does not match the booked EUR invoice')
+      }
+      if (refund) {
+        const refunds = await xpay('xpay_stripe_subscription_refunds?' + filters({
+          select: 'refund_id,gross_minor',
+          refund_id: 'eq.' + refundId,
+          invoice_id: 'eq.' + invoiceId,
+          limit: '1',
+        }))
+        if (refunds.length !== 1 || body.gross?.minor !== refunds[0].gross_minor) {
+          throw new Error('Outbox event does not match the booked Stripe refund')
+        }
+      } else if (body.gross?.minor !== invoice.gross_minor ||
+        body.fee?.currency !== invoice.currency || body.fee?.minor !== invoice.fee_minor ||
+        body.net?.currency !== invoice.currency || body.net?.minor !== invoice.net_minor ||
+        body.fxFee?.currency !== invoice.currency || body.fxFee?.minor !== 0) {
+        throw new Error('Outbox event does not match the booked EUR invoice')
+      }
+    } else {
+      const sales = await xpay('transactions?' + filters({
+        select: 'id',
+        id: 'eq.' + body.transactionId,
+        seller_id: 'eq.' + event.seller_id,
+        status: 'eq.approved',
+        provider: 'eq.stripe',
+        limit: '1',
+      }))
+      if (sales.length !== 1) throw new Error('Outbox event has no approved Stripe transaction')
+    }
 
-    const saleId = await orbia('rpc/xpay_record_sale', {
+    const saleId = await orbia(refund ? 'rpc/xpay_record_stripe_refund' : 'rpc/xpay_record_sale', {
       method: 'POST',
       body: {
         p_event_key: event.event_key,
         p_seller_id: event.seller_id,
-        p_occurred_at: event.created_at,
+        ...(refund ? {} : { p_occurred_at: event.created_at }),
         p_body: body,
       },
     })
@@ -136,3 +171,4 @@ if (require.main === module) main().catch(error => {
   console.error('[xpay-orbia]', error.message)
   process.exitCode = 1
 })
+
