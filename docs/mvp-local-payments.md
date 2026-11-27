@@ -6,6 +6,17 @@ Checkout alojado com MB WAY como único método e pagamento avulso em EUR. O com
 ## Etapa 2 · Pedido e confirmação
 Uma rota autenticada por chave XPAY cria sessão local, ligada à encomenda e ao comerciante. Isolar produção e sandbox. Preço e moeda validados no servidor. Idempotência por comerciante, pedido e ambiente para evitar pedidos repetidos. Confirmar contra evento Stripe assinado e idempotente antes de entregar. Separar estados pendente, pago, falhado e expirado. Testar a autorização da app com números de teste oficiais e os resultados por webhook antes de publicar.
 
+### Validação direta na Stripe sandbox · 27/11/2026
+
+Dois PaymentIntents de EUR 9,90 foram confirmados com `allowed_payment_method_types[]=mb_way` e o telefone em `payment_method_data[billing_details][phone]`. Ambos começaram em `requires_action`.
+
+| Número de teste | Resultado final | Evento observado na Stripe |
+| --- | --- | --- |
+| `+351911111112` | `succeeded` | `payment_intent.succeeded` |
+| `+351911111115` | `requires_payment_method`, com `payment_intent_payment_attempt_expired` | `payment_intent.payment_failed` |
+
+A Stripe emitiu ambos os eventos. Falta confirmar o processamento pelo webhook XPAY, a atualização da encomenda e a idempotência de pedidos repetidos. O ensaio usou exclusivamente a sandbox e não movimentou dinheiro real.
+
 ## Etapa 3 · Link fixo e checkout embutido
 O link permanente resolve uma oferta ativa e cria sessão nova. A API reutiliza o serviço de sessões para checkout alojado ou Stripe Embedded Checkout / Payment Element. No pagamento avulso mostrar apenas métodos elegíveis. Multibanco fica pendente até pagamento da referência. AtlasClub mantém cartão para renovação automática; métodos locais exigem nova autorização a cada período.
 
