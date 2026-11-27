@@ -1742,7 +1742,7 @@ export class WebhookService {
     // getById NÃO filtra status nem quarentena de propósito: webhook de conta
     // restringida continua chegando e é dinheiro que já entrou. Aliás, é
     // justamente na conta quarentenada que os eventos mais importantes chegam.
-    const livePilot = process.env.XPAY_LIVE_STRIPE_ACCOUNT_ID === accountId
+    const livePilot = process.env.XPAY_DB_SCHEMA === 'xpay_live'
     const account = await this.stripeAccounts.getById(accountId)
     if (!account) {
       if (livePilot) throw new ServiceUnavailableException('XPAY Stripe account not configured')
@@ -1853,7 +1853,7 @@ export class WebhookService {
     // ── 5. Resolve a transação ──
     const tx = await this.resolveStripeTx(object)
 
-    if (process.env.XPAY_LIVE_STRIPE_ACCOUNT_ID === accountId) {
+    if (process.env.XPAY_DB_SCHEMA === 'xpay_live') {
       if (!tx || this.ownStripeTxCheck(accountId, tx, object) === 'retry') {
         throw new ServiceUnavailableException('XPAY Stripe transaction is not ready')
       }

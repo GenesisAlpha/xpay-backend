@@ -29,11 +29,14 @@ async function bootstrap() {
     app.use((req: express.Request, res: express.Response, next: express.NextFunction) => {
       const isHealth = req.method === 'GET' && req.path === '/health';
       const stripePath = `/webhook/stripe/${pilotStripeAccount}`;
-      const isStripeWebhook = req.method === 'POST' && req.path === stripePath;
+      const addedStripeAccount = liveSchema && /^\/webhook\/stripe\/xpay_live_stripe_[a-f0-9]{24}$/.test(req.path);
+      const isStripeWebhook = req.method === 'POST' && (req.path === stripePath || addedStripeAccount);
+      const isStripeAdmin = liveSchema && process.env.XPAY_ENABLE_STRIPE_ACCOUNT_ADMIN === 'true'
+        && req.path === '/crm/admin/xpay/stripe-accounts' && ['GET', 'POST'].includes(req.method);
       if (liveStripeAccount && isStripeWebhook && !req.get('stripe-signature')) {
         return res.sendStatus(400);
       }
-      if (isHealth || isStripeWebhook) return next();
+      if (isHealth || isStripeWebhook || isStripeAdmin) return next();
       return res.sendStatus(404);
     });
   }

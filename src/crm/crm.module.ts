@@ -46,6 +46,8 @@ import { CrmController } from './crm.controller'
 import { CrmService }    from './crm.service'
 import { CrmAdminController } from './crm-admin.controller'
 import { CrmAdminService } from './crm-admin.service'
+import { XpayStripeAdminController, XpayStripeAdminGuard } from './xpay-stripe-admin.controller'
+import { XpayStripeAdminService } from './xpay-stripe-admin.service'
 import { CrmMethodRoutingController } from './crm-method-routing.controller'
 import { ComplianceInternalController } from './compliance-internal.controller'
 import { CrmComplianceController } from './crm-compliance.controller'
@@ -106,8 +108,8 @@ import { KoopfyIntegrationModule } from '../integration/koopfy-integration.modul
   // CrmCheckoutController: sellers e lojas do checkout (só leitura, via canal
   // interno).
   // CrmClipController: contas Clip (modo cartão/SPEI, status, tetos).
-  controllers: [CrmController, CrmAdminController, CrmCheckoutController, CrmTicketsController, WhopConnectController, WhopRfiReviewsController, WhopLinkedController, SellerRoutingCrmController, ActivationRequestsController, AffiliateCrmController, CrmClipController, CrmMethodRoutingController, ComplianceInternalController, CrmComplianceController],
-  providers:   [CrmService, CrmAdminService, CrmCheckoutService, CrmClipService, CrmAuthGuard, StorageService],
+  controllers: [XpayStripeAdminController, CrmController, CrmAdminController, CrmCheckoutController, CrmTicketsController, WhopConnectController, WhopRfiReviewsController, WhopLinkedController, SellerRoutingCrmController, ActivationRequestsController, AffiliateCrmController, CrmClipController, CrmMethodRoutingController, ComplianceInternalController, CrmComplianceController],
+  providers:   [XpayStripeAdminGuard, XpayStripeAdminService, CrmService, CrmAdminService, CrmCheckoutService, CrmClipService, CrmAuthGuard, StorageService],
   exports:     [CrmService, CrmAdminService, CrmCheckoutService],
 })
 export class CrmModule implements NestModule {
