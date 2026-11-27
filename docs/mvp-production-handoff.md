@@ -1,0 +1,21 @@
+# XPAY MVP — entrega e continuidade (27/11/2026)
+
+## Em produção e verificado
+- AWS eu-north-1, EC2 Orbia, Cloudflare. Health de api.xpay.expert, Orbia e cadastro responderam 200. Orbia tem o SaaS EUR 14,90/mês publicado.
+- O AtlasClub tem preço Stripe live EUR 9,90/mês na conta MGJ Expert Ltd. Uma Checkout Session live foi criada e expirada sem pagamento. Não confundir isso com o checkout publicado.
+- XPAY PR #7 (839131142b20) e OrbiaCRM PR #3 (3be4d43d87e0) integrados. Webhook do AtlasClub aceitou um pedido assinado e rejeitou um pedido sem assinatura; worker xpay-orbia-outbox-v2 ativo. Sandbox confirmou pagamento, reembolsos parcial e total. PostgreSQL testou idempotência, fronteira de organizações e marcação no CRM.
+- Venda AtlasClub em EUR, comissão 14,9%, reserva 0%, EUR 8,42 sobre EUR 9,90 antes de ajustes. D+3 úteis e janela do dia útil seguinte às 12h de Lisboa; calendário Inglaterra/País de Gales, PT e ES nacional, até 2027. Checkout AtlasClub permaneceu inativo e as tabelas live estavam vazias na última verificação.
+- /admin/xpay já mostra as contas Stripe atrás do guard administrativo. O código original do painel está no OrbiaCRM PR #1; o deploy isolado é orbia-crm-xpay-admin-v2.
+
+## Decisão operacional
+A equipa efetua as saídas manualmente na data de liquidação. A XPAY regista e concilia o que já foi pago. D+3+1 indica a janela operacional; não envia dinheiro. A conta Stripe apresenta GBP por padrão. A falta de acesso ao IBAN da MGJ não bloqueia o registo contabilístico. Não alterar o calendário de payouts global da Stripe. Depósito de EUR 200 e upgrade por volume de EUR 50 mil estão fora do caminho crítico.
+
+## Ordem de entrega
+1. **Saídas manuais.** Recuperar o código em desenvolvimento nas branches xpay/manual-settlement-admin e orbia/xpay-manual-settlement. Testar em Postgres descartável e validar leitura/escrita protegidas no painel /admin/xpay/saidas. Conferir montante exato, elegibilidade, múltiplas faturas, duplicados, operador, anulação com motivo, reembolso tardio e auditoria. Não lançar transferências. Produção só após validar build e permissões. Usar o build isolado do painel anterior para evitar recompilar todo o CRM na EC2.
+2. **Cobrança piloto e link fixo.** Criar endpoint permanente por oferta que gera uma Stripe Checkout Session nova, com preço/moeda lidos no servidor e marca da oferta na assinatura. Validar expiração/reutilização, desativação e primeiro pagamento/renovação em sandbox. Manter /payments/create legado fechado até provar o isolamento e o fluxo. Publicar primeiro só o link AtlasClub; verificar os termos e a moeda real de reconciliação e que o registo manual está operacional. Não criar cobrança a pessoa real como teste.
+3. **Chaves API de comerciantes.** Portal autenticado com isolamento por comerciante, criação e exibição única, listagem sem segredo, rotação/revogação, escopos e auditoria. Antes de ativar chamadas públicas testar chave de outro comerciante, chave revogada, repetição idempotente e diferença sandbox/produção. Inventariar e reutilizar o esquema api_keys e guards existentes após validar armazenamento, status e escopos. Nenhuma interface de chaves de comerciantes foi verificada em produção.
+4. **Gestão de links fixos.** Permitir criar, listar, pausar e reativar links de ofertas do próprio comerciante. Verificar que pausar corta novas sessões e que o checkout não aceita preço do cliente. Separar URLs permanentes de sessões Stripe e manter estado coerente nos dois ambientes.
+5. **Painel XPAY.** Concluir visão de cobranças, chaves, links e saídas no admin, com escopos administrativo e leitura. Gestão avançada de regras por comerciante/tier/método/volume pode seguir depois do piloto.
+
+## Retoma e verificação
+Trabalhar na base xpay/live-runtime e no OrbiaCRM. Código recorrente em ops/xpay-atlasclub-stripe.cjs, entrega ao CRM em ops/xpay-orbia-outbox.cjs. Dados live em xpay_live; public pertence ao sandbox. Usar segredos existentes sem imprimir valores. Testar mudanças antes de encaminhar o tráfego e manter o container anterior disponível para rollback. Após qualquer ativação, guardar commit, migration aplicada, resultados dos testes e estado explícito do checkout neste documento.
