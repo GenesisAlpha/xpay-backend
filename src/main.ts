@@ -30,6 +30,9 @@ async function bootstrap() {
       const isHealth = req.method === 'GET' && req.path === '/health';
       const stripePath = `/webhook/stripe/${pilotStripeAccount}`;
       const isStripeWebhook = req.method === 'POST' && req.path === stripePath;
+      if (liveStripeAccount && isStripeWebhook && !req.get('stripe-signature')) {
+        return res.sendStatus(400);
+      }
       if (isHealth || isStripeWebhook) return next();
       return res.sendStatus(404);
     });

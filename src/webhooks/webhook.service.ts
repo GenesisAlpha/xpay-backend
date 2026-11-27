@@ -1742,8 +1742,10 @@ export class WebhookService {
     // getById NÃO filtra status nem quarentena de propósito: webhook de conta
     // restringida continua chegando e é dinheiro que já entrou. Aliás, é
     // justamente na conta quarentenada que os eventos mais importantes chegam.
+    const livePilot = process.env.XPAY_LIVE_STRIPE_ACCOUNT_ID === accountId
     const account = await this.stripeAccounts.getById(accountId)
     if (!account) {
+      if (livePilot) throw new ServiceUnavailableException('XPAY Stripe account not configured')
       console.warn('[WebhookService] Stripe: conta desconhecida no path:', accountId)
       return { ignored: true, reason: 'unknown account' }
     }
@@ -1782,6 +1784,17 @@ export class WebhookService {
 
     const eventId = String(event?.id ?? '')
     const eventType = String(event?.type ?? '')
+    if (livePilot) {
+      if (event?.livemode !== true) throw new BadRequestException('expected a live Stripe event')
+      const intent = event?.data?.object
+      const metadata = intent?.metadata
+      const paymentEvent = eventType === 'payment_intent.succeeded' || eventType === 'payment_intent.payment_failed'
+      if (!paymentEvent || intent?.object !== 'payment_intent' || !String(intent?.id ?? '').startsWith('pi_') ||
+          !metadata?.koopfy_transaction_id || metadata.koopfy_account_id !== accountId) {
+        return { ignored: true, reason: 'not an XPAY pilot payment' }
+      }
+    }
+
     console.log('[Stripe webhook]', accountId, eventType, eventId)
 
     // ── 3. Dedupe ──
@@ -1839,6 +1852,29 @@ export class WebhookService {
 
     // ── 5. Resolve a transação ──
     const tx = await this.resolveStripeTx(object)
+
+    if (process.env.XPAY_LIVE_STRIPE_ACCOUNT_ID === accountId) {
+      if (!tx || this.ownStripeTxCheck(accountId, tx, object) === 'retry') {
+        throw new ServiceUnavailableException('XPAY Stripe transaction is not ready')
+      }
+      if (tx.id !== object.metadata.koopfy_transaction_id || tx.seller_id !== object.metadata.koopfy_seller_id ||
+          this.ownStripeTxCheck(accountId, tx, object) !== 'ok') {
+        console.error('[Stripe webhook] XPAY pilot transaction does not match its payment intent', tx.id)
+        return { ignored: true, reason: 'XPAY pilot transaction does not match' }
+      }
+      if (eventType === 'payment_intent.succeeded') {
+        const currency = String(object.currency ?? '').toUpperCase()
+        const raw = Number(object.amount_received)
+        const received = STRIPE_ZERO_DECIMAL.has(currency) ? raw * 100
+          : STRIPE_THREE_DECIMAL.has(currency) ? raw / 10
+            : raw
+        if (currency !== String(tx.currency ?? '').toUpperCase() || !Number.isFinite(received) ||
+            received <= 0 || received !== Number(tx.amount)) {
+          console.error('[Stripe webhook] XPAY pilot capture amount or currency does not match', tx.id)
+          return { ignored: true, reason: 'XPAY pilot capture amount does not match' }
+        }
+      }
+    }
 
     // Conta PRÓPRIA do seller: o webhook traz TODAS as vendas dele, inclusive
     // as de fora da Koopfy — e quem assina é ele. Só vale evento de transação
