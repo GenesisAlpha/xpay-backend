@@ -24,12 +24,18 @@ export class PaymentController {
     @Body() dto: CreatePaymentDto,
     @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.paymentService.createPayment({
+    const payment = await this.paymentService.createPayment({
       ...dto,
       sellerId: req.sellerId,
       // Idempotency-Key do header tem prioridade (dedup obrigatório)
       idempotencyKey: idempotencyKey ?? dto.idempotencyKey,
     });
+    if (process.env.XPAY_DB_SCHEMA !== 'xpay_live') return payment;
+
+    // Upstream routing stays internal to XPAY. Keep the payment session and
+    // publishable key so the authorized merchant can complete the checkout.
+    const { routing, own_account, ...merchantPayment } = payment;
+    return { ...merchantPayment, provider: 'xpay' };
   }
 
   // ─── MB Way por API (seller) ──────────────────────────────────────────────
